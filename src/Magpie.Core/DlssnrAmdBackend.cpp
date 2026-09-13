@@ -51,7 +51,6 @@ constexpr uintptr_t kRvaLocalStructure = 0x76e34;
 constexpr uintptr_t kRvaSkinStructure = 0x76e38;
 constexpr uintptr_t kRvaCharMask = 0x76e40;
 constexpr uintptr_t kRvaToneChannels = 0x76e44;
-constexpr uintptr_t kRvaSpinAllowance = 0x76c44;
 constexpr uintptr_t kRvaJobCounter = 0x76d74;
 constexpr uintptr_t kRvaStatusFlag = 0x767fa;
 constexpr uintptr_t kRvaSyncCounter = 0x76c14;
@@ -714,6 +713,15 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	At<uint8_t>(runtime, kRvaUseDepth) = 0;
 	At<int>(runtime, kRvaTonemap) = -1;
 
+	// Inline mode is what the runtime ships and what every working installation runs.
+	// Both flags are also settable from dlssnr_on_amd.ini under [DlssNrOnAmd], but the ini
+	// is read in the runtime's DllMain and these writes land after that, so anything set
+	// here wins. That was tried the other way round -- leaving them to the ini so Inline=0
+	// could be tested -- and the result was a black frame, so they are pinned again. Do not
+	// unpin them without testing one variable at a time.
+	At<uint8_t>(runtime, kRvaInlineMode) = 1;
+	At<uint8_t>(runtime, kRvaInterop) = 1;
+
 	const std::string weights = weightsPath.string();
 	if (!CallInit(init,
 		reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(runtime) + kRvaInitCtx),
@@ -1041,11 +1049,30 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	At<float>(p.runtime, kRvaSkinStructure) = 1.0f;
 	At<UINT>(p.runtime, kRvaToneChannels) = 0;
 	At<UINT>(p.runtime, kRvaCharMask) = 1;
-	// The build ships a wait loop with a fixed iteration ceiling. At any real resolution
-	// that ceiling expires before inference finishes and the apply stage hands the frame
-	// back untouched, so it has to scale with the pixel count, as it does upstream.
-	At<UINT>(p.runtime, kRvaSpinAllowance) = static_cast<UINT>(std::clamp<uint64_t>(
-		262144 + (uint64_t(p.width) * p.height + 1) / 2, 262144, 2097152));
+	// Deliberately absent: the wait allowance at +0x76c44.
+	//
+	// The working implementation writes `262144 + pixels/2` into that field every pass, and
+	// this backend did the same thing at first. It is a mistake, and the engine's own log
+	// says so plainly. That field is the iteration ceiling the inline wait spins against,
+	// and the engine maintains it itself -- its log shows the ceiling at 13659064, then
+	// 211732559, 191115557, 220213086, 400000000, changing as it measures. Writing the
+	// formula fights it for the field, and the formula's value for 1920x1080 is 1298944:
+	// about 3.5 ms of spinning at the ~370000 iterations/ms the engine reports, against
+	// jobs that take 250-280 ms.
+	//
+	// The log makes the split unmistakable. Every pass where the engine held the field
+	// finished cleanly -- "spin used 404259 iterations for a 63 ms job", no timeout, at a
+	// ceiling in the tens or hundreds of millions. Every one of the thirteen timeouts in
+	// that run reports "iteration cap after 1298944 iterations, cap 1298944", which is the
+	// formula's number, followed by "current input kept" -- the frame handed back
+	// unprocessed. So the intermittent drop-out is not the engine being too slow; it is
+	// this backend lowering the engine's own ceiling and then losing the race to restore it.
+	// The failure feeds itself, because the engine shortens its wait budget after each
+	// timeout, which makes the next expiry likelier under exactly the heavy load where the
+	// user notices it.
+	//
+	// Leaving the field alone lets the engine do what it was already doing: it recovers on
+	// its own, logging "100 clean jobs; wait budget back to 600 ms".
 
 	// The heap, signature and table the reference leaves bound when it hands the frame to
 	// the engine. Slot 0 is the input as a shader resource and slot 1 the same surface as

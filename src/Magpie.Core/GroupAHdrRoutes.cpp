@@ -29,7 +29,17 @@ HdrFormatRoute MakeSdrFallback(
     };
 }
 
-HdrFormatRoute MakeCasFp16() {
+// Held, not forgotten. The CAS branch below deliberately keeps HDR on the paired SDR
+// adapter until a separately compiled FP16 CAS variant exists, because pointing the
+// runtime surface at FP16 on its own would bind a route-incompatible UAV/SRV pair. This
+// route is what that variant will switch to, so it stays here ready.
+//
+// ClangCL compiles with -Werror and reports -Wunused-function, which failed every
+// configuration of the CI matrix through fail-fast -- the ARM64-ClangCL job died on this
+// and cancelled the other three. MSVC's warning for the same thing is C4505. The warning
+// is accurate; [[maybe_unused]] is how the intent is stated rather than by removing code
+// that is waiting for its caller.
+[[maybe_unused]] HdrFormatRoute MakeCasFp16() {
     return HdrFormatRoute{
         .effectId = "CAS",
         .optionId = "fp16-conditional",

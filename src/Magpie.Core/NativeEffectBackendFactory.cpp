@@ -4,6 +4,7 @@
 #include "NgxD3D12Core.h"
 #include "NgxRuntimeGuard.h"
 #include "DLSSNRFilter.h"
+#include "DlssnrAmdBackend.h"
 #include "DLSSSRUpscaler.h"
 #include "FSR2ZeroMVUpscaler.h"
 #include "FSR3ZeroMVUpscaler.h"
@@ -107,6 +108,22 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 		input->GetDesc(&endpoint);
 		const DLSSNRSettings settings = ParseDLSSNRSettings(option,
 			hdrEnabled && endpoint.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+		// The NGX path this effect was written for exists only on NVIDIA hardware. When
+		// the AMD runtime is present the same effect name is served by a backend that
+		// drives the separate AMD port of the same network instead. It is tried first
+		// and only when its files are there; if it declines -- no AMD adapter, no HIP
+		// device matching the render card, a runtime of the wrong build -- the NGX path
+		// runs exactly as before, so nothing changes on a machine that never had it.
+		if (DlssnrAmdBackend::IsAvailable()) {
+			auto amd = std::make_unique<DlssnrAmdBackend>();
+			if (amd->Initialize(resources, input, output, settings)) {
+				Logger::Get().Info("DLSSNR: running on the AMD backend");
+				return { true, std::move(amd) };
+			}
+			Logger::Get().Warn("DLSSNR: AMD runtime present but unusable; trying NGX");
+		}
+
 		auto backend = std::make_unique<DLSSNRFilter>();
 		Logger::DiagnosticCapture diagnostic;
 		if (!backend->Initialize(resources, ngxCore, input, output, settings)) {

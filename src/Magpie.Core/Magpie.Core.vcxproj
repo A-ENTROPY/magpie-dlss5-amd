@@ -115,6 +115,7 @@
     <ClInclude Include="DLSSFrameGenerator.h" />
     <ClInclude Include="GroupBEffectProtocol.h" />
     <ClInclude Include="DLSSNRFilter.h" />
+    <ClInclude Include="DlssnrAmdBackend.h" />
     <ClInclude Include="FrameGuidanceProvider.h" />
     <ClInclude Include="FrameGuidanceService.h" />
     <ClInclude Include="MotionVectorRequest.h" />
@@ -219,6 +220,7 @@
     <ClCompile Include="DLSSSRUpscaler.cpp" />
     <ClCompile Include="DLSSFrameGenerator.cpp" />
     <ClCompile Include="DLSSNRFilter.cpp" />
+    <ClCompile Include="DlssnrAmdBackend.cpp" />
     <ClCompile Include="FrameGuidanceService.cpp" />
     <ClCompile Include="ZeroFrameGuidanceProvider.cpp" />
     <ClCompile Include="NvidiaOpticalFlowProvider.cpp" />

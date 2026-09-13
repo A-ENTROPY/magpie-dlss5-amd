@@ -146,9 +146,88 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )";
 
+// The network's cost is close to linear in the pixels it is handed -- measured here at
+// roughly 30 ms per megapixel plus about 15 ms per job, so 78 ms at 1080p and 266 ms at
+// 4K. In inline mode the game waits for it, which puts the frame rate at 1/cost. Running
+// the network on a smaller frame is therefore the only lever that moves it much, and it is
+// the one the reference exposes too.
+//
+// The two shaders below are that lever. Neither is a plain resize: a naive downscale
+// aliases and a naive upscale softens, and the whole point of the effect is the detail it
+// adds. Both are taken from the reference, which arrived at the same problem.
+constexpr char kDownsampleShader[] = R"(
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+cbuffer Extent : register(b0) { uint w; uint h; uint sourceW; uint sourceH; };
+[numthreads(8, 8, 1)]
+void main(uint3 p : SV_DispatchThreadID)
+{
+	if (p.x >= w || p.y >= h) return;
+	// Integrate the whole source footprint. A single bilinear sample loses narrow
+	// emissive lines once the model runs well below the input resolution.
+	float2 lo = float2(p.xy) * float2(sourceW, sourceH) / float2(w, h);
+	float2 hi = float2(p.xy + 1) * float2(sourceW, sourceH) / float2(w, h);
+	int2 first = int2(floor(lo));
+	float4 sum = 0;
+	float total = 0;
+	[loop] for (int y = first.y; y < int(ceil(hi.y)); ++y)
+	[loop] for (int x = first.x; x < int(ceil(hi.x)); ++x) {
+		float2 coverage = max(0, min(hi, float2(x + 1, y + 1)) - max(lo, float2(x, y)));
+		float weight = coverage.x * coverage.y;
+		sum += src.Load(int3(clamp(int2(x, y), 0, int2(sourceW - 1, sourceH - 1)), 0)) * weight;
+		total += weight;
+	}
+	dst[p.xy] = sum / max(total, 1e-6);
+}
+)";
+
+// Upscales the *edit* rather than the picture: the output starts as the untouched
+// full-resolution frame and gains only the bounded, confidence-weighted difference the
+// network made at low resolution. That is what keeps a reduced model from costing detail.
+constexpr char kResolveShader[] = R"(
+Texture2D<float4> src : register(t0);
+Texture2D<float4> baseline : register(t1);
+Texture2D<float4> edited : register(t2);
+RWTexture2D<float4> dst : register(u0);
+cbuffer Extent : register(b0) { uint w; uint h; uint lowW; uint lowH; };
+float3 delta(int2 p) {
+	p = clamp(p, 0, int2(lowW - 1, lowH - 1));
+	return edited.Load(int3(p, 0)).rgb - baseline.Load(int3(p, 0)).rgb;
+}
+[numthreads(8, 8, 1)]
+void main(uint3 p : SV_DispatchThreadID)
+{
+	if (p.x >= w || p.y >= h) return;
+	float2 q = (float2(p.xy) + .5) * float2(lowW, lowH) / float2(w, h) - .5;
+	int2 a = int2(floor(q));
+	float2 t = frac(q);
+	float3 d = lerp(lerp(delta(a), delta(a + int2(1, 0)), t.x),
+		lerp(delta(a + int2(0, 1)), delta(a + 1), t.x), t.y);
+	float4 c = src.Load(int3(p.xy, 0));
+	// A reduced neural pixel mixes surfaces and small emitters. Suppress its edit where the
+	// original pixel disagrees with that footprint, rather than spreading the edit blindly
+	// across high-contrast edges.
+	int2 hi = int2(lowW - 1, lowH - 1);
+	float3 b = lerp(lerp(baseline.Load(int3(clamp(a, 0, hi), 0)).rgb,
+			baseline.Load(int3(clamp(a + int2(1, 0), 0, hi), 0)).rgb, t.x),
+		lerp(baseline.Load(int3(clamp(a + int2(0, 1), 0, hi), 0)).rgb,
+			baseline.Load(int3(clamp(a + 1, 0, hi), 0)).rgb, t.x), t.y);
+	float3 magnitude = max(max(abs(c.rgb), abs(b)), 1e-5);
+	float mismatch = max(abs(c.r - b.r) / magnitude.r,
+		max(abs(c.g - b.g) / magnitude.g, abs(c.b - b.b) / magnitude.b));
+	float confidence = 1 - smoothstep(.15, .75, mismatch);
+	// Keep extreme low-resolution edits bounded relative to the current footprint.
+	float3 limit = .5 * max(abs(b), abs(c.rgb));
+	d = clamp(d, -limit, limit) * confidence;
+	dst[p.xy] = float4(clamp(c.rgb + d, 0, 65504), c.a);
+}
+)";
+
 std::filesystem::path ExeDirectory() noexcept {
 	return Win32Helper::GetExePath().parent_path();
 }
+
+
 
 bool HashMatches(const std::filesystem::path& file) noexcept {
 	// Two small RAII wrappers rather than wil::unique_bcrypt_*: the WIL in use here does
@@ -403,13 +482,28 @@ struct DlssnrAmdBackend::Impl {
 	// The engine works in place: the texture named in the packet is both what it reads
 	// and what it writes. There is one surface here, not two.
 	winrt::com_ptr<ID3D12Resource> net;
+	// The frame as the engine will not see it: full resolution, and holding the version
+	// from before the engine touched anything. `full` is what the resolve takes detail
+	// from, `baseline` is what it subtracts to isolate the edit.
+	winrt::com_ptr<ID3D12Resource> full;
+	winrt::com_ptr<ID3D12Resource> baseline;
+	winrt::com_ptr<ID3D12Resource> resolved;
 	winrt::com_ptr<ID3D12Resource> motion;
 	winrt::com_ptr<ID3D12Resource> depth;
 	winrt::com_ptr<ID3D12DescriptorHeap> heap;
 	winrt::com_ptr<ID3D12RootSignature> root;
 	winrt::com_ptr<ID3D12PipelineState> convertIn;
 	winrt::com_ptr<ID3D12PipelineState> convertOut;
+	winrt::com_ptr<ID3D12PipelineState> downsample;
+	winrt::com_ptr<ID3D12PipelineState> resolve;
 	uint32_t descriptorStride = 0;
+
+	// The resolution the network runs at, which is the capture size times modelScale.
+	// `scaled` is false at 100%, and then the whole downsample/resolve pair is skipped and
+	// the engine works on `full` directly -- the path that shipped before this existed.
+	uint32_t netWidth = 0, netHeight = 0;
+	float modelScale = 1.0f;
+	bool scaled = false;
 
 	HMODULE runtime = nullptr;
 	HMODULE hip = nullptr;
@@ -453,7 +547,11 @@ struct DlssnrAmdBackend::Impl {
 	bool InitEngine(const std::filesystem::path& weightsPath) noexcept;
 	void Bind(uint32_t slot, ID3D12Resource* srv, DXGI_FORMAT srvFormat,
 		ID3D12Resource* uav, DXGI_FORMAT uavFormat) noexcept;
+	void BindResolve(uint32_t slot, ID3D12Resource* srv, ID3D12Resource* uav,
+		ID3D12Resource* baselineTexture, ID3D12Resource* edited) noexcept;
 	void Dispatch(ID3D12PipelineState* pso, uint32_t slot) noexcept;
+	void DispatchSized(ID3D12PipelineState* pso, uint32_t slot, uint32_t dw, uint32_t dh,
+		bool setResidualTable, const UINT* dims4 = nullptr) noexcept;
 	bool WaitForEngine(uint64_t deadlineMs) noexcept;
 	void DestroySized() noexcept;
 	float Measure(ID3D12Resource* res, DXGI_FORMAT format,
@@ -624,7 +722,10 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 	return compile(kConvertInShader, sizeof(kConvertInShader) - 1, "convert in",
 			convertIn) &&
 		compile(kConvertOutShader, sizeof(kConvertOutShader) - 1, "convert out",
-			convertOut);
+			convertOut) &&
+		compile(kDownsampleShader, sizeof(kDownsampleShader) - 1, "downsample",
+			downsample) &&
+		compile(kResolveShader, sizeof(kResolveShader) - 1, "resolve", resolve);
 }
 
 bool DlssnrAmdBackend::Impl::CreateSized(
@@ -650,18 +751,48 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 		return false;
 	}
 
-	// The engine's surface. One texture, held in RGBA16F: the frame goes in through a
-	// conversion if Magpie's format differs, the engine filters it in place, and another
-	// conversion brings it back out. The reference implementation has exactly one such
-	// texture too, and hands that same pointer over as `Packet::colour`.
-	if (!CreateEngineTexture(device12.get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, net)) {
+	// The network's extent. Everything the engine touches is built at this size, and at
+	// 100% it is the capture size, which is the path that shipped before the scale existed.
+	const uint32_t scaledW = uint32_t(float(w) * modelScale + 0.5f);
+	const uint32_t scaledH = uint32_t(float(h) * modelScale + 0.5f);
+	netWidth = std::clamp(scaledW, 32u, w);
+	netHeight = std::clamp(scaledH, 32u, h);
+	scaled = netWidth != w || netHeight != h;
+
+	// The frame at full resolution, in the engine's own format. It is what the capture is
+	// converted into, what the resolve takes its detail from, and at 100% scale it is also
+	// what the network is handed.
+	if (!CreateEngineTexture(device12.get(), w, h,
+			DXGI_FORMAT_R16G16B16A16_FLOAT, full)) {
 		return false;
+	}
+
+	// The engine's surface. It works in place: the texture named in the packet is both what
+	// it reads and what it writes, so there is one surface there, not two. The reference
+	// hands over exactly one such pointer as `Packet::colour`.
+	if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
+			DXGI_FORMAT_R16G16B16A16_FLOAT, net)) {
+		return false;
+	}
+	if (scaled) {
+		// The network's output for this frame before the engine ran, and where the resolve
+		// writes. The resolve subtracts the first from what the engine produced to isolate
+		// the edit, and needs `full` to put the untouched detail back underneath it.
+		if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
+				DXGI_FORMAT_R16G16B16A16_FLOAT, baseline) ||
+			!CreateEngineTexture(device12.get(), w, h,
+				DXGI_FORMAT_R16G16B16A16_FLOAT, resolved)) {
+			return false;
+		}
 	}
 	// The engine's input contract names motion and depth. This backend has no source for
 	// either, and zero-filled buffers are what the reference feeds when a game offers
-	// neither; depth stays disabled on the engine side to match.
-	if (!CreateEngineTexture(device12.get(), w, h, DXGI_FORMAT_R16G16_FLOAT, motion) ||
-		!CreateEngineTexture(device12.get(), w, h, DXGI_FORMAT_R32_FLOAT, depth)) {
+	// neither; depth stays disabled on the engine side to match. They follow the network's
+	// extent rather than the capture's.
+	if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
+			DXGI_FORMAT_R16G16_FLOAT, motion) ||
+		!CreateEngineTexture(device12.get(), netWidth, netHeight,
+			DXGI_FORMAT_R32_FLOAT, depth)) {
 		return false;
 	}
 	return true;
@@ -673,6 +804,9 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	sharedOut11 = nullptr;
 	sharedOut12 = nullptr;
 	net = nullptr;
+	full = nullptr;
+	baseline = nullptr;
+	resolved = nullptr;
 	// A new extent means the history describes the wrong geometry.
 	resetHistory = true;
 	motion = nullptr;
@@ -697,18 +831,53 @@ void DlssnrAmdBackend::Impl::Bind(
 }
 
 void DlssnrAmdBackend::Impl::Dispatch(ID3D12PipelineState* pso, uint32_t slot) noexcept {
+	DispatchSized(pso, slot, width, height, false);
+}
+
+void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t slot,
+	uint32_t dw, uint32_t dh, bool setResidualTable, const UINT* dims4
+) noexcept {
 	// `slot` matters more than it looks. Descriptors are read when the GPU executes the
 	// list, not when it is recorded, so two stages sharing a slot both end up reading
-	// whichever bind happened last. Each stage therefore gets its own pair, and the root
-	// table is pointed at that pair here.
+	// whichever bind happened last. Each stage therefore gets its own set, and the root
+	// table is pointed at that set here.
 	ID3D12DescriptorHeap* h = heap.get();
 	list->SetComputeRootSignature(root.get());
 	list->SetDescriptorHeaps(1, &h);
 	D3D12_GPU_DESCRIPTOR_HANDLE table = heap->GetGPUDescriptorHandleForHeapStart();
 	table.ptr += UINT64(slot) * descriptorStride;
 	list->SetComputeRootDescriptorTable(0, table);
+	if (setResidualTable) {
+		// The resolve reads its two extra sources from t1/t2, which live in the table two
+		// descriptors along.
+		D3D12_GPU_DESCRIPTOR_HANDLE residual = table;
+		residual.ptr += 2 * descriptorStride;
+		list->SetComputeRootDescriptorTable(2, residual);
+	}
 	list->SetPipelineState(pso);
-	list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+	// The downsample and the resolve are the only stages with an extent to pass, and they
+	// take it in the same four-slot shape the reference uses: destination width and height
+	// followed by the source's.
+	if (dims4) {
+		list->SetComputeRoot32BitConstants(1, 4, dims4, 0);
+	}
+	list->Dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
+}
+
+void DlssnrAmdBackend::Impl::BindResolve(uint32_t slot, ID3D12Resource* srv,
+	ID3D12Resource* uav, ID3D12Resource* baselineTexture, ID3D12Resource* edited
+) noexcept {
+	// t0/u0 through the usual pair, then t1 and t2 sitting immediately after it so the
+	// resolve's second root table finds them two descriptors along.
+	Bind(slot, srv, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+	s.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	s.Texture2D.MipLevels = 1;
+	device12->CreateShaderResourceView(baselineTexture, &s, Cpu(slot + 2));
+	device12->CreateShaderResourceView(edited, &s, Cpu(slot + 3));
 }
 
 bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath) noexcept {
@@ -789,6 +958,19 @@ bool DlssnrAmdBackend::Initialize(
 		settings.skinStructureStrength, settings.useAutoMask ? "on" : "off",
 		settings.intensity, settings.style,
 		settings.enableInputResolutionScaling ? int(settings.inputResolutionPercent) : 100));
+	// The one control that moves the frame rate. The network's cost is close to linear in
+	// the pixels it is handed -- measured at roughly 30 ms per megapixel here -- and in
+	// inline mode the game waits for it, so the frame rate is its reciprocal. Magpie's
+	// parameter surface already carried this knob for the NGX path, where the residual is
+	// composited back at full size; the same idea is done explicitly here.
+	//
+	// This is the only parameter mapped so far. The others are not wired, deliberately:
+	// Magpie's defaults for them are the inverse of the runtime's, so copying them across
+	// switched the engine's own filters off and the visible edit collapsed. See the note
+	// where the engine's state is written.
+	p.modelScale = settings.enableInputResolutionScaling
+		? float(std::clamp<uint32_t>(settings.inputResolutionPercent, 25, 100)) / 100.0f
+		: 1.0f;
 	// The engine module stays loaded across effect rebuilds and keeps its history, so a
 	// new backend instance always starts by invalidating it.
 	p.resetHistory = true;
@@ -859,9 +1041,10 @@ bool DlssnrAmdBackend::Initialize(
 
 	p.ready = true;
 	Logger::Get().Info(fmt::format(
-		"DLSSNR AMD: engine up on HIP device {}; {}x{} {} -> {}",
-		p.hipDevice, inputDesc.Width, inputDesc.Height,
-		(uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format));
+		"DLSSNR AMD: engine up on HIP device {}; {}x{} {} -> {}, network at {}x{} "
+		"(scale {:.2f})", p.hipDevice, inputDesc.Width, inputDesc.Height,
+		(uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format,
+		p.netWidth, p.netHeight, p.modelScale));
 	return true;
 }
 
@@ -994,20 +1177,65 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		return false;
 	}
 
-	// ---- 1. Magpie's frame into the engine's surface ----
+	// ---- 1. Magpie's frame into a full-resolution RGBA16F surface ----
+	// The engine's format is RGBA16F and Magpie's usually is not, so this is where the two
+	// are reconciled. The result is kept at full size whether or not the network will see
+	// it: at a reduced scale the resolve needs the untouched full-resolution frame to put
+	// its detail back.
 	if (p.inputIsFp16) {
 		Barrier(p.list.get(), p.sharedIn12.get(), kCommon, D3D12_RESOURCE_STATE_COPY_SOURCE);
-		p.list->CopyResource(p.net.get(), p.sharedIn12.get());
+		Barrier(p.list.get(), p.full.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		p.list->CopyResource(p.full.get(), p.sharedIn12.get());
 		Barrier(p.list.get(), p.sharedIn12.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, kCommon);
+		Barrier(p.list.get(), p.full.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			kStateShaderRead);
 	} else {
 		Barrier(p.list.get(), p.sharedIn12.get(), kCommon, kStateShaderRead);
-		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+		Barrier(p.list.get(), p.full.get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.Bind(2, p.sharedIn12.get(), p.inputFormat, p.net.get(),
+		p.Bind(2, p.sharedIn12.get(), p.inputFormat, p.full.get(),
 			DXGI_FORMAT_R16G16B16A16_FLOAT);
 		p.Dispatch(p.convertIn.get(), 2);
 		Barrier(p.list.get(), p.sharedIn12.get(), kStateShaderRead, kCommon);
+		Barrier(p.list.get(), p.full.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			kStateShaderRead);
+	}
+
+	// ---- 1b. the frame the network actually sees ----
+	// At a reduced scale this is an area average rather than a bilinear sample, because a
+	// point sample loses narrow bright features once the model runs well below the input --
+	// the reference makes the same choice for the same reason. The copy into `baseline` has
+	// to happen before the engine runs, since the engine edits its surface in place and the
+	// resolve needs the difference.
+	if (p.scaled) {
+		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		p.Bind(2, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, p.net.get(),
+			DXGI_FORMAT_R16G16B16A16_FLOAT);
+		const UINT dims[4]{ p.netWidth, p.netHeight, p.width, p.height };
+		p.DispatchSized(p.downsample.get(), 2, p.netWidth, p.netHeight, false, dims);
 		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			kStateShaderRead);
+
+		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		Barrier(p.list.get(), p.baseline.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		p.list->CopyResource(p.baseline.get(), p.net.get());
+		Barrier(p.list.get(), p.baseline.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			kStateShaderRead);
+		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+			kStateShaderRead);
+	} else {
+		Barrier(p.list.get(), p.full.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		p.list->CopyResource(p.net.get(), p.full.get());
+		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			kStateShaderRead);
+		Barrier(p.list.get(), p.full.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
 			kStateShaderRead);
 	}
 
@@ -1028,7 +1256,9 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		// not the chain.
 		Barrier(p.list.get(), p.sharedOut12.get(), kCommon,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.Bind(4, p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+		// Bypassed: the full-resolution converted frame, not the network's surface, which at
+		// a reduced scale is the wrong size for this and would be a format-sized mismatch.
+		p.Bind(4, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
 		p.Dispatch(p.convertOut.get(), 4);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1048,7 +1278,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			p.probed = true;
 			const float inMean = p.Measure(p.sharedIn12.get(), p.inputFormat,
 				D3D12_RESOURCE_STATE_COMMON);
-			const float netMean = p.Measure(p.net.get(),
+			const float netMean = p.Measure(p.full.get(),
 				DXGI_FORMAT_R16G16B16A16_FLOAT, kStateShaderRead);
 			const float outMean = p.Measure(p.sharedOut12.get(), p.outputFormat,
 				D3D12_RESOURCE_STATE_COMMON);
@@ -1211,17 +1441,35 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		return true;
 	}
 	// The engine leaves its surface readable, which is the state named below.
+	//
+	// At a reduced scale a resolve sits here: only the difference the engine made is
+	// upscaled, bounded, and weighted by how well the full-resolution original agrees with
+	// the low-resolution footprint. The picture is therefore the untouched full-resolution
+	// frame plus that edit -- which is what keeps a smaller model from costing detail. At
+	// 100% there is nothing to resolve and the engine's own surface is the picture.
+	ID3D12Resource* picture = p.net.get();
+	if (p.scaled) {
+		Barrier(p.list.get(), p.resolved.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		p.BindResolve(6, p.full.get(), p.resolved.get(), p.baseline.get(), p.net.get());
+		const UINT dims[4]{ p.width, p.height, p.netWidth, p.netHeight };
+		p.DispatchSized(p.resolve.get(), 6, p.width, p.height, true, dims);
+		Barrier(p.list.get(), p.resolved.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			kStateShaderRead);
+		picture = p.resolved.get();
+	}
+
 	if (p.outputIsFp16) {
-		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+		Barrier(p.list.get(), picture, kStateShaderRead,
 			D3D12_RESOURCE_STATE_COPY_SOURCE);
 		Barrier(p.list.get(), p.sharedOut12.get(), kCommon,
 			D3D12_RESOURCE_STATE_COPY_DEST);
-		p.list->CopyResource(p.sharedOut12.get(), p.net.get());
+		p.list->CopyResource(p.sharedOut12.get(), picture);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_COPY_DEST, kCommon);
 	} else {
 		Barrier(p.list.get(), p.sharedOut12.get(), kCommon,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.Bind(4, p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+		p.Bind(4, picture, DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
 		p.Dispatch(p.convertOut.get(), 4);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

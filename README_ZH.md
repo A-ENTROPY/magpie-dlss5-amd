@@ -7,6 +7,24 @@ Magpie Experimental 是面向 Windows 的窗口画面处理工具，也是 [Blin
 
 程序捕获目标窗口的画面，按用户配置的效果组处理，再以全屏或窗口形式显示。目标应用无需为这些效果单独集成接口。本项目不代表 Magpie 官方，实验分支的问题请在本仓库反馈。
 
+## AMD RDNA3 适配版（Radeon RX 7900 XTX）
+
+本分支为 DLSSNR 效果增加了 **AMD 后端**，让 DLSS Neural Rendering 能在 AMD Radeon 显卡上运行，不再必须依赖 NVIDIA RTX。开发与实测都基于 **Radeon RX 7900 XTX（gfx1100，RDNA3）**，并已在《赛博朋克 2077》中确认生效。
+
+效果本身没有任何改动：仍然是 DLSSNR，仍然是同一个效果组、同一组参数。变的只是**由谁来执行**。在 NVIDIA 显卡上，它由 NVIDIA NGX 的 Feature 18 提供；在这里，只要 AMD runtime 就位，同一个效果名就改由一个 D3D12 + HIP 后端在 Radeon 上跑这个网络。
+
+**如何被选中。** `DlssnrAmdBackend` 会被优先尝试，且仅在它的两个文件与 `Magpie.exe` 同目录时才会被尝试。它还会用 SHA-256 校验 runtime 是否是那些硬编码偏移所属的**确切的**构建，并确认 HIP 设备与 D3D12 正在渲染的适配器是同一块卡。任何一项缺失或不匹配，效果就回落到 NGX 路径，行为与之前完全一致——从未有过这个后端的机器不受任何影响。
+
+**需要你自己准备的物料。** AMD 侧 runtime（`dlssnr_amd_pass1.dll`）与权重（`dlssnr_on_amd_weights.bin`）是**第三方二进制，本仓库与 Release 均不附带、不再分发**。它们带有另一个项目的分发条款以及 NVIDIA 相关的材料，无法在此再分发。请把它们和一个空的 `dlssnr_on_amd.ini` 放到 `Magpie.exe` 同目录。若 runtime 哈希无法识别，后端会直接拒绝挂载，而不是去猜测另一个构建的偏移。
+
+**已知限制。**
+
+- **高渲染压力下效果会间歇性失效。** 引擎走 inline 模式，即同一帧内等待网络返回。当网络无法在引擎的 inline 等待窗口内完成时，该帧会被原样透传，效果就肉眼可见地掉一下。参考的 AMD 实现也有同样的表现。修掉它是本分支接下来的工作。
+- 在 7900 XTX 上，网络本身约 63–78 ms/帧（1080p），效果生效时帧率上限约 13 fps。
+- 只实测过 RDNA3。runtime 里带有其他目标的 kernel，但本仓库未做任何验证。
+
+**致谢。** AMD runtime 的驱动契约——偏移表、packet 布局、逐 pass 状态——是从 [OptiScaler](https://github.com/optiscaler) 的 PreSR-Multipass AMD 路径中读出的，那是该接口的权威描述。runtime 与权重来自 DLSS-NR-on-AMD 项目。本分支是独立的互操作尝试，与 NVIDIA、AMD 以及上述项目均无隶属关系。
+
 ## 主要功能
 
 ### 图像处理与帧生成

@@ -408,3 +408,11 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Local-only runtime files this backend loads from beside the executable.
+# They are third-party binaries and NVIDIA-derived weights; not ours to ship.
+dlssnr_amd_pass1.dll
+dlssnr_on_amd_weights.bin
+dlssnr_on_amd.ini
+dlssnr_on_amd.log
+*.stackdump

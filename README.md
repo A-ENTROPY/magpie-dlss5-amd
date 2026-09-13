@@ -7,6 +7,24 @@ Magpie Experimental is a Windows tool for processing window content and an unoff
 
 The application captures a target window, processes its images through a user-configured effect group, and displays the result fullscreen or in a window. The source application does not need to integrate these effects itself. This is not an official Magpie release; please report experimental-fork issues in this repository.
 
+## AMD RDNA3 Adaptation (Radeon RX 7900 XTX)
+
+This branch adds an **AMD backend for the DLSSNR effect**, so DLSS Neural Rendering runs on an AMD Radeon GPU instead of requiring an NVIDIA RTX card. It is developed and tested against a **Radeon RX 7900 XTX (gfx1100, RDNA3)**, and confirmed working in Cyberpunk 2077.
+
+Nothing about the effect changes: it is still DLSSNR, still the same effect group, still the same controls. What changes is who serves it. On NVIDIA hardware the effect is served by NVIDIA's NGX feature 18. Here, when the AMD runtime is present, the same effect name is served by a D3D12-and-HIP backend that runs the network on the Radeon.
+
+**How it is selected.** `DlssnrAmdBackend` is tried first, and only when its two files sit next to `Magpie.exe`. It also verifies that the runtime is the exact build its hardcoded offsets belong to, by SHA-256, and that the HIP device matches the adapter D3D12 is rendering on. If anything is missing or does not match, the effect falls back to the NGX path and behaves exactly as it did before — a machine that never had this backend is unaffected.
+
+**What you have to supply.** The AMD-side runtime (`dlssnr_amd_pass1.dll`) and its weights (`dlssnr_on_amd_weights.bin`) are **third-party binaries and are not distributed with this repository or its releases.** They carry another project's terms plus NVIDIA-derived material, so they cannot be redistributed here. Place them, and an empty `dlssnr_on_amd.ini`, in the same folder as `Magpie.exe`. The backend refuses to attach to a runtime whose hash it does not recognise rather than guessing at offsets into a different build.
+
+**Known limitations.**
+
+- The effect is applied **intermittently under heavy rendering load**. The engine runs in inline mode, meaning a frame waits for the network on the same submission. When the network cannot finish inside the engine's inline wait window, that frame is passed through unprocessed and the effect visibly drops out. This matches what the reference AMD implementation does. Fixing it is the next piece of work on this branch.
+- The network itself costs roughly 63–78 ms per frame at 1080p on a 7900 XTX, which caps the frame rate around 13 fps while the effect is active.
+- Only RDNA3 has been exercised. The runtime ships kernels for other targets, but nothing else has been tested here.
+
+**Acknowledgements.** The driving contract for the AMD runtime — the offsets, the packet layout and the per-pass state — was read out of [OptiScaler](https://github.com/optiscaler)'s PreSR-Multipass AMD path, which is the authoritative description of that interface. The runtime and weights come from the DLSS-NR-on-AMD project. This branch is an independent interoperability effort and is not affiliated with NVIDIA, AMD or either of those projects.
+
 ## Main Features
 
 ### Image Processing and Frame Generation

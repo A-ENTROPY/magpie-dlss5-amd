@@ -390,10 +390,6 @@ struct DlssnrAmdBackend::Impl {
 	bool inputIsFp16 = false;
 	bool outputIsFp16 = false;
 
-	// The effect's controls, as Magpie's UI presents them. Written into the engine every
-	// pass, which is what the working implementation does.
-	DLSSNRSettings settings{};
-
 	// The engine carries temporal history from frame to frame, and nothing used to tell it
 	// when that history stopped being valid. The working implementation resets on a resize,
 	// a change of settings or guides, an engine timeout, and any gap longer than a quarter
@@ -782,10 +778,19 @@ bool DlssnrAmdBackend::Initialize(
 	const DLSSNRSettings& settings
 ) noexcept {
 	auto& p = *_impl;
-	// The parameters live in the backend rather than being read per frame: Magpie rebuilds
-	// the effect when they change, so this call is how new values arrive. The engine module
-	// itself stays loaded across such rebuilds and keeps its history, hence the reset.
-	p.settings = settings;
+	// Recorded, not yet acted on. The engine's fields are still written from this
+	// backend's own constants because mapping Magpie's parameter names onto them one-to-one
+	// does not work -- see the note in Draw. Printing them means the next attempt starts
+	// from what Magpie actually passes rather than from what the UI claims its defaults are.
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD parameters: tone={:.3f} structure={:.3f} skin={:.3f} autoMask={} "
+		"intensity={:.3f} style={} resolution={}%",
+		settings.localToneStrength, settings.localStructureStrength,
+		settings.skinStructureStrength, settings.useAutoMask ? "on" : "off",
+		settings.intensity, settings.style,
+		settings.enableInputResolutionScaling ? int(settings.inputResolutionPercent) : 100));
+	// The engine module stays loaded across effect rebuilds and keeps its history, so a
+	// new backend instance always starts by invalidating it.
 	p.resetHistory = true;
 	p.device11 = resources.GetD3DDevice();
 	p.context11 = resources.GetD3DDC();
@@ -1072,15 +1077,26 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 
 	At<UINT>(p.runtime, kRvaDepthInverted) = 0;
 	At<uint8_t>(p.runtime, kRvaDepthExplicit) = 1;
-	// Taken from the effect's parameters rather than fixed here. An earlier version
-	// hardcoded all five, which meant every DLSSNR control in Magpie's UI did nothing --
-	// and one of those constants forced skin structure to full strength while the UI
-	// default for it is off, so the filter ran far stronger than the user had asked for.
-	At<float>(p.runtime, kRvaLocalTone) = p.settings.localToneStrength;
-	At<float>(p.runtime, kRvaLocalStructure) = p.settings.localStructureStrength;
-	At<float>(p.runtime, kRvaSkinStructure) = p.settings.skinStructureStrength;
+	// These are the runtime's own defaults, and an attempt to drive them from Magpie's
+	// parameters had to be backed out of. Magpie's UI defaults are the *inverse* of the
+	// runtime's for two of the three: its localToneStrength defaults to 1 where the runtime
+	// starts at 0, its skinStructureStrength defaults to 0 where the runtime starts near 1,
+	// and its useAutoMask defaults to false where the runtime starts at 1. Writing the UI
+	// values straight through therefore switched off the engine's auto mask and skin
+	// structure on every default install, and the visible edit collapsed: the engine log
+	// showed the chain healthy (jobs completing, history on) while the probe read
+	// `frame in 0.5502, engine out 0.5525` -- the filter running but editing almost nothing.
+	//
+	// So the parameter set cannot be mapped one-to-one. Magpie's names and defaults were
+	// chosen for the NGX residual path, where they mean something else. Wiring them up is
+	// still wanted, but it has to be done one field at a time against a real frame, with
+	// the defaults reconciled first -- not all at once on the assumption that the names
+	// line up.
+	At<float>(p.runtime, kRvaLocalTone) = 0.0f;
+	At<float>(p.runtime, kRvaLocalStructure) = 1.0f;
+	At<float>(p.runtime, kRvaSkinStructure) = 1.0f;
 	At<UINT>(p.runtime, kRvaToneChannels) = 0;
-	At<UINT>(p.runtime, kRvaCharMask) = p.settings.useAutoMask ? 1u : 0u;
+	At<UINT>(p.runtime, kRvaCharMask) = 1;
 	// Deliberately absent: the wait allowance at +0x76c44.
 	//
 	// The working implementation writes `262144 + pixels/2` into that field every pass, and

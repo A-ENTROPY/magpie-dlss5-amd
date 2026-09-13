@@ -390,6 +390,19 @@ struct DlssnrAmdBackend::Impl {
 	bool inputIsFp16 = false;
 	bool outputIsFp16 = false;
 
+	// The effect's controls, as Magpie's UI presents them. Written into the engine every
+	// pass, which is what the working implementation does.
+	DLSSNRSettings settings{};
+
+	// The engine carries temporal history from frame to frame, and nothing used to tell it
+	// when that history stopped being valid. The working implementation resets on a resize,
+	// a change of settings or guides, an engine timeout, and any gap longer than a quarter
+	// of a second -- that last one because a loading screen or a paused window leaves
+	// history describing a scene that is no longer on screen. Blending such history forward
+	// is what makes the result look like the filter has been applied several times over.
+	uint64_t lastSubmitTick = 0;
+	bool resetHistory = true;
+
 	// The engine's surfaces.
 	// The engine works in place: the texture named in the packet is both what it reads
 	// and what it writes. There is one surface here, not two.
@@ -664,6 +677,8 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	sharedOut11 = nullptr;
 	sharedOut12 = nullptr;
 	net = nullptr;
+	// A new extent means the history describes the wrong geometry.
+	resetHistory = true;
 	motion = nullptr;
 	depth = nullptr;
 }
@@ -766,8 +781,12 @@ bool DlssnrAmdBackend::Initialize(
 	ID3D11Texture2D* output,
 	const DLSSNRSettings& settings
 ) noexcept {
-	(void)settings;
 	auto& p = *_impl;
+	// The parameters live in the backend rather than being read per frame: Magpie rebuilds
+	// the effect when they change, so this call is how new values arrive. The engine module
+	// itself stays loaded across such rebuilds and keeps its history, hence the reset.
+	p.settings = settings;
+	p.resetHistory = true;
 	p.device11 = resources.GetD3DDevice();
 	p.context11 = resources.GetD3DDC();
 	if (!p.device11 || !p.context11) {
@@ -1038,17 +1057,30 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// ---- 2. the engine's own state, immediately before it records ----
 	// Not set-and-forget: the working implementation rewrites the whole block per pass.
 	At<uint8_t>(p.runtime, kRvaPerPassFlag) = 1;
-	if (At<UINT>(p.runtime, kRvaJobCounter) == 0) {
+
+	// History is only meaningful while consecutive frames agree. The engine's own job
+	// counter cannot be the trigger, for the reason the reference gives: recreating staging
+	// restarts it, so job 1 can follow job 1 and equality says nothing.
+	const uint64_t now = GetTickCount64();
+	const bool gap = p.lastSubmitTick != 0 && now - p.lastSubmitTick > 250;
+	p.lastSubmitTick = now;
+	if (p.resetHistory || gap) {
+		p.resetHistory = false;
 		At<uint8_t>(p.runtime, kRvaWantHistory) = 0;
 		At<void*>(p.runtime, kRvaHistory) = nullptr;
 	}
+
 	At<UINT>(p.runtime, kRvaDepthInverted) = 0;
 	At<uint8_t>(p.runtime, kRvaDepthExplicit) = 1;
-	At<float>(p.runtime, kRvaLocalTone) = 0.0f;
-	At<float>(p.runtime, kRvaLocalStructure) = 1.0f;
-	At<float>(p.runtime, kRvaSkinStructure) = 1.0f;
+	// Taken from the effect's parameters rather than fixed here. An earlier version
+	// hardcoded all five, which meant every DLSSNR control in Magpie's UI did nothing --
+	// and one of those constants forced skin structure to full strength while the UI
+	// default for it is off, so the filter ran far stronger than the user had asked for.
+	At<float>(p.runtime, kRvaLocalTone) = p.settings.localToneStrength;
+	At<float>(p.runtime, kRvaLocalStructure) = p.settings.localStructureStrength;
+	At<float>(p.runtime, kRvaSkinStructure) = p.settings.skinStructureStrength;
 	At<UINT>(p.runtime, kRvaToneChannels) = 0;
-	At<UINT>(p.runtime, kRvaCharMask) = 1;
+	At<UINT>(p.runtime, kRvaCharMask) = p.settings.useAutoMask ? 1u : 0u;
 	// Deliberately absent: the wait allowance at +0x76c44.
 	//
 	// The working implementation writes `262144 + pixels/2` into that field every pass, and
@@ -1142,6 +1174,8 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 				"DLSSNR AMD: engine did not finish within {} ms; frame passed through "
 				"({} so far)", budget, p.timeouts));
 		}
+		// A frame the engine gave up on leaves its history one step behind the scene.
+		p.resetHistory = true;
 		return true;
 	}
 

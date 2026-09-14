@@ -1555,12 +1555,14 @@ bool DlssnrAmdBackend::Initialize(
 	// from what Magpie actually passes rather than from what the UI claims its defaults are.
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD parameters: tone={:.3f} structure={:.3f} skin={:.3f} autoMask={} "
-		"temporal={} toneChannels={} useDepth={} useHostInputs={} resolution={}%",
+		"temporal={} toneChannels={} useDepth={} useHostInputs={} resolution={}% "
+		"style={} intensity={:.2f}",
 		settings.localToneStrength, settings.localStructureStrength,
 		settings.skinStructureStrength, settings.useAutoMask ? "on" : "off",
 		settings.amdTemporal, settings.amdToneChannels, settings.amdUseDepth,
 		settings.amdUseFsrInputs,
-		settings.enableInputResolutionScaling ? int(settings.inputResolutionPercent) : 100));
+		settings.enableInputResolutionScaling ? int(settings.inputResolutionPercent) : 100,
+		settings.style, settings.intensity));
 	// The one control that moves the frame rate. The network's cost is close to linear in
 	// the pixels it is handed -- measured at roughly 30 ms per megapixel here -- and in
 	// inline mode the game waits for it, so the frame rate is its reciprocal. Magpie's
@@ -2092,11 +2094,26 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// The engine's own controls, from the effect's parameters rather than from constants.
 	// Every one of these was a fixed value until now, which is why the controls in Magpie's
 	// UI appeared to do nothing: they were being written over here on every frame.
-	At<float>(p.runtime, kRvaLocalTone) = p.settings.localToneStrength;
-	At<float>(p.runtime, kRvaLocalStructure) = p.settings.localStructureStrength;
-	At<float>(p.runtime, kRvaSkinStructure) = p.settings.skinStructureStrength;
-	At<UINT>(p.runtime, kRvaToneChannels) =
-		static_cast<UINT>(std::clamp(p.settings.amdToneChannels, 0, 2));
+	// NR Style has no engine field to write: the runtime's own UI lists Enabled, Tone
+	// intensity, Structure intensity, Skin structure and Inline, with no style among them,
+	// and its fifteen configuration keys have none either. Style is an NGX parameter, and
+	// this DLL says in its own text that it gates off the broad lighting and colour channels
+	// a style would act on. So the three names scale what the engine does have -- a scale
+	// rather than an override, so the sliders stay authoritative at Default and their effect
+	// stays visible at the other two.
+	const float styleScale = p.settings.style == 1 ? 0.75f
+		: p.settings.style == 2 ? 1.25f : 1.0f;
+	const UINT styleChannels = p.settings.style == 1 ? 0u
+		: p.settings.style == 2 ? std::max(1u, static_cast<UINT>(p.settings.amdToneChannels))
+		: static_cast<UINT>(std::clamp(p.settings.amdToneChannels, 0, 2));
+
+	At<float>(p.runtime, kRvaLocalTone) =
+		std::clamp(p.settings.localToneStrength, 0.0f, 2.0f);
+	At<float>(p.runtime, kRvaLocalStructure) =
+		std::clamp(p.settings.localStructureStrength * styleScale, 0.0f, 2.0f);
+	At<float>(p.runtime, kRvaSkinStructure) =
+		std::clamp(p.settings.skinStructureStrength * styleScale, 0.0f, 2.0f);
+	At<UINT>(p.runtime, kRvaToneChannels) = styleChannels;
 	At<UINT>(p.runtime, kRvaCharMask) = p.settings.useAutoMask ? 1u : 0u;
 	At<uint8_t>(p.runtime, kRvaUseDepth) = p.settings.amdUseDepth ? 1 : 0;
 	At<uint8_t>(p.runtime, kRvaUseFsrInputs) = p.settings.amdUseFsrInputs ? 1 : 0;
@@ -2237,8 +2254,13 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		p.BindResolve(8, p.full.get(), p.resolved.get(), p.baseline.get(),
 			p.historyResidual[p.historyIndex].get());
-		const UINT dims[5]{ p.width, p.height, p.netWidth, p.netHeight,
-			p.editBoundMilli };
+		// NR Intensity scales the edit the resolve applies -- the same idea as NGX's
+		// residual intensity, and what a strength control on this effect should do. The
+		// bound is the cap; the multiplier is what the slider moves.
+		const uint32_t boundMilli = static_cast<uint32_t>(std::clamp(
+			float(p.editBoundMilli) * std::clamp(p.settings.intensity, 0.0f, 2.0f),
+			0.0f, 1000.0f));
+		const UINT dims[5]{ p.width, p.height, p.netWidth, p.netHeight, boundMilli };
 		p.DispatchSized(p.resolve.get(), 8, p.width, p.height, 10, dims, 5);
 		Barrier(p.list.get(), p.resolved.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);

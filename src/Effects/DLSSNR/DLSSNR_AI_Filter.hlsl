@@ -117,7 +117,7 @@ float intensity;
 //!PARAMETER
 //!GROUP DLSSNR · Pass 1
 //!LABEL Local Tone Strength
-//!DEFAULT 1
+//!DEFAULT 0
 //!MIN 0
 //!MAX 2
 //!STEP 0.05
@@ -135,7 +135,7 @@ float localStructureStrength;
 //!PARAMETER
 //!GROUP DLSSNR · Pass 1
 //!LABEL Skin Structure Strength
-//!DEFAULT 0
+//!DEFAULT 1
 //!MIN 0
 //!MAX 2
 //!STEP 0.05
@@ -144,7 +144,7 @@ float skinStructureStrength;
 //!PARAMETER
 //!GROUP DLSSNR · Pass 1
 //!LABEL Automatic Mask
-//!DEFAULT 0
+//!DEFAULT 1
 //!MIN 0
 //!MAX 1
 //!STEP 1
@@ -180,7 +180,44 @@ int multiPass;
 int antiFlicker;
 
 //!PARAMETER
+//!GROUP DLSSNR · Pass 1
+//!LABEL Temporal History
+//!DEFAULT 1
+//!MIN 0
+//!MAX 1
+//!STEP 1
+int amdTemporal;
+
+//!PARAMETER
+//!GROUP DLSSNR · Pass 1
+//!LABEL Tone Channels
+//!DEFAULT 0
+//!MIN 0
+//!MAX 2
+//!STEP 1
+int amdToneChannels;
+
+//!PARAMETER
+//!GROUP DLSSNR · Pass 1
+//!LABEL Use Depth Guide
+//!DEFAULT 0
+//!MIN 0
+//!MAX 1
+//!STEP 1
+int amdUseDepth;
+
+//!PARAMETER
+//!GROUP DLSSNR · Pass 1
+//!LABEL Use Host Inputs
+//!DEFAULT 1
+//!MIN 0
+//!MAX 1
+//!STEP 1
+int amdUseFsrInputs;
+
+//!PARAMETER
 //!GROUP DLSSNR · Pass 2
+
 //!LABEL NR Style\n(0 Default, 1 Natural, 2 Cinematic)
 //!DEFAULT 0
 //!MIN 0

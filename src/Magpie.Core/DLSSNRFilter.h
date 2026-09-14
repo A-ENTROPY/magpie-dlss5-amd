@@ -22,6 +22,13 @@ struct DLSSNRSettings {
 	float skinStructureStrength = 0.0f;
 	bool useAutoMask = false;
 	bool uiCorrection = false;
+	// The AMD engine's own switches. They have no NGX counterpart -- the NGX path has no
+	// temporal-history or depth-guide toggle of its own -- so they are named for the engine
+	// rather than reusing a name that would mean something else.
+	int amdTemporal = 1;
+	int amdToneChannels = 0;
+	int amdUseDepth = 0;
+	int amdUseFsrInputs = 1;
 	MotionVectorRequest motionRequest{};
 	// Experimental FP16 path. SDR RGBA8 remains the default.
 	DlssnrExperimentProtocol experimentalHdr{};

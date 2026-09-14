@@ -1675,4 +1675,8 @@
   <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_4" xml:space="preserve"><value>Low-frequency Temporal Reconstruction</value></data>
   <data name="EffectParam_DLSSFG_DLSS_FrameGeneration_duplicateFrameFiltering_Label" xml:space="preserve"><value>Duplicate Frame Filtering</value></data>
   <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_duplicateFrameFiltering_Label" xml:space="preserve"><value>Duplicate Frame Filtering</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_amdTemporal_Label" xml:space="preserve"><value>Temporal History</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_amdToneChannels_Label" xml:space="preserve"><value>Tone Channels</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_amdUseDepth_Label" xml:space="preserve"><value>Use Depth Guide</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_amdUseFsrInputs_Label" xml:space="preserve"><value>Use Host Inputs</value></data>
 </root>

@@ -1642,4 +1642,8 @@
   <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_4" xml:space="preserve"><value>低頻時域重建</value></data>
   <data name="EffectParam_DLSSFG_DLSS_FrameGeneration_duplicateFrameFiltering_Label" xml:space="preserve"><value>重複影格過濾</value></data>
   <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_duplicateFrameFiltering_Label" xml:space="preserve"><value>重複影格過濾</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_amdTemporal_Label" xml:space="preserve"><value>時域歷史</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_amdToneChannels_Label" xml:space="preserve"><value>色調通道</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_amdUseDepth_Label" xml:space="preserve"><value>使用深度引導</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_amdUseFsrInputs_Label" xml:space="preserve"><value>使用宿主輸入</value></data>
 </root>

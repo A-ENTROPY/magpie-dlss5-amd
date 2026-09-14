@@ -769,6 +769,10 @@ struct DlssnrAmdBackend::Impl {
 	uint64_t lastTimestamp = 0;
 	bool temporalValid = false;
 
+	// The effect's own parameters, kept so the per-pass block can drive the engine from
+	// them. Magpie rebuilds the effect when they change, so this is how new values arrive.
+	DLSSNRSettings settings{};
+
 	// What the effect asked for. Zero leaves the residual pass subtracting and nothing else,
 	// which is exactly what ran before any of this existed. One is static accumulation, two
 	// and above reproject the history with optical flow.
@@ -1353,10 +1357,15 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	queue.get()->AddRef();
 	At<int>(runtime, kRvaHipDevice) = hipDevice;
 	At<uint8_t>(runtime, kRvaInlineMode) = 1;
-	At<uint8_t>(runtime, kRvaInterop) = 1;
 	At<uint8_t>(runtime, kRvaEnabled) = 1;
-	At<uint8_t>(runtime, kRvaUseFsrInputs) = 1;
-	At<uint8_t>(runtime, kRvaUseDepth) = 0;
+	// Interop is the runtime's own key and is left to dlssnr_on_amd.ini, the way Tonemap is;
+	// setting it here would override whatever the file says. UseFsrInputs and UseDepth are
+	// written per pass from the effect's parameters instead.
+	//
+	// Inline stays pinned, and it is the one engine key this backend does not expose. The
+	// engine in inline mode completes the job on the frame it was given, which is what the
+	// rest of this backend assumes when it converts the result out; the asynchronous mode
+	// hands back the previous frame instead and the chain has no such path.
 
 	// Deliberately *not* written: the tonemap mode at +0x76e20.
 	//
@@ -1546,10 +1555,11 @@ bool DlssnrAmdBackend::Initialize(
 	// from what Magpie actually passes rather than from what the UI claims its defaults are.
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD parameters: tone={:.3f} structure={:.3f} skin={:.3f} autoMask={} "
-		"intensity={:.3f} style={} resolution={}%",
+		"temporal={} toneChannels={} useDepth={} useHostInputs={} resolution={}%",
 		settings.localToneStrength, settings.localStructureStrength,
 		settings.skinStructureStrength, settings.useAutoMask ? "on" : "off",
-		settings.intensity, settings.style,
+		settings.amdTemporal, settings.amdToneChannels, settings.amdUseDepth,
+		settings.amdUseFsrInputs,
 		settings.enableInputResolutionScaling ? int(settings.inputResolutionPercent) : 100));
 	// The one control that moves the frame rate. The network's cost is close to linear in
 	// the pixels it is handed -- measured at roughly 30 ms per megapixel here -- and in
@@ -1668,6 +1678,7 @@ bool DlssnrAmdBackend::Initialize(
 	p.wantMotion = false;
 #endif
 	p.motionRequest = settings.motionRequest;
+	p.settings = settings;
 	p.guidanceInterop = std::make_unique<FrameGuidanceD3D12Interop>();
 	if (!p.guidanceInterop->Initialize(p.device12.get(), p.fence.get())) {
 		Logger::Get().Error("DLSSNR AMD: guidance interop failed to initialise");
@@ -2043,7 +2054,9 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 
 	// ---- 2. the engine's own state, immediately before it records ----
 	// Not set-and-forget: the working implementation rewrites the whole block per pass.
-	At<uint8_t>(p.runtime, kRvaPerPassFlag) = 1;
+	// 0x76e1d is the engine's `Temporal` key as well as the per-pass flag the reference
+	// asserts; the control drives it directly.
+	At<uint8_t>(p.runtime, kRvaPerPassFlag) = p.settings.amdTemporal ? 1 : 0;
 
 	// History is only meaningful while consecutive frames agree. The engine's own job
 	// counter cannot be the trigger, for the reason the reference gives: recreating staging
@@ -2076,11 +2089,17 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// still wanted, but it has to be done one field at a time against a real frame, with
 	// the defaults reconciled first -- not all at once on the assumption that the names
 	// line up.
-	At<float>(p.runtime, kRvaLocalTone) = 0.0f;
-	At<float>(p.runtime, kRvaLocalStructure) = 1.0f;
-	At<float>(p.runtime, kRvaSkinStructure) = 1.0f;
-	At<UINT>(p.runtime, kRvaToneChannels) = 0;
-	At<UINT>(p.runtime, kRvaCharMask) = 1;
+	// The engine's own controls, from the effect's parameters rather than from constants.
+	// Every one of these was a fixed value until now, which is why the controls in Magpie's
+	// UI appeared to do nothing: they were being written over here on every frame.
+	At<float>(p.runtime, kRvaLocalTone) = p.settings.localToneStrength;
+	At<float>(p.runtime, kRvaLocalStructure) = p.settings.localStructureStrength;
+	At<float>(p.runtime, kRvaSkinStructure) = p.settings.skinStructureStrength;
+	At<UINT>(p.runtime, kRvaToneChannels) =
+		static_cast<UINT>(std::clamp(p.settings.amdToneChannels, 0, 2));
+	At<UINT>(p.runtime, kRvaCharMask) = p.settings.useAutoMask ? 1u : 0u;
+	At<uint8_t>(p.runtime, kRvaUseDepth) = p.settings.amdUseDepth ? 1 : 0;
+	At<uint8_t>(p.runtime, kRvaUseFsrInputs) = p.settings.amdUseFsrInputs ? 1 : 0;
 	// Deliberately absent: the wait allowance at +0x76c44.
 	//
 	// The working implementation writes `262144 + pixels/2` into that field every pass, and

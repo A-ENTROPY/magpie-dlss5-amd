@@ -40,13 +40,18 @@ DLSSNRSettings ParseDLSSNRSettings(const EffectOption& option, bool hdrEnabled) 
 		.style = std::clamp(static_cast<int>(std::lround(
 			getParameter("style", 0.0f))), 0, 2),
 		.intensity = getClamped("intensity", 1.0f, 0.0f, 2.0f),
-		.localToneStrength = getClamped("localToneStrength", 1.0f, 0.0f, 2.0f),
+		.localToneStrength = getClamped("localToneStrength", 0.0f, 0.0f, 2.0f),
 		.localStructureStrength = getClamped(
 			"localStructureStrength", 1.0f, 0.0f, 2.0f),
 		.skinStructureStrength = getClamped(
-			"skinStructureStrength", 0.0f, 0.0f, 2.0f),
-		.useAutoMask = getParameter("useAutoMask", 0.0f) >= 0.5f,
+			"skinStructureStrength", 1.0f, 0.0f, 2.0f),
+		.useAutoMask = getParameter("useAutoMask", 1.0f) >= 0.5f,
 		.uiCorrection = getParameter("uiCorrection", 0.0f) >= 0.5f,
+		.amdTemporal = getParameter("amdTemporal", 1.0f) >= 0.5f ? 1 : 0,
+		.amdToneChannels = std::clamp(static_cast<int>(std::lround(
+			getParameter("amdToneChannels", 0.0f))), 0, 2),
+		.amdUseDepth = getParameter("amdUseDepth", 0.0f) >= 0.5f ? 1 : 0,
+		.amdUseFsrInputs = getParameter("amdUseFsrInputs", 1.0f) >= 0.5f ? 1 : 0,
 		.motionRequest = ParseDlssOpticalFlowRequest(option),
 		.experimentalHdr = DlssnrExperimentProtocol{ .enabled = hdrEnabled, .scale = 1.0f }
 	};

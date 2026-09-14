@@ -747,6 +747,10 @@ struct DlssnrAmdBackend::Impl {
 	// setting rather than a constant is on the conversion shader.
 	uint32_t shoulderMilli = 850;
 
+	// Only so the engine-value line is printed when something changes rather than per frame.
+	int loggedStyle = -1;
+	float loggedIntensity = -1.0f;
+
 	// How large an edit the resolve will apply, in thousandths of the local magnitude.
 	// Lower is calmer; the reason it is a setting rather than a constant is on the shader.
 	uint32_t editBoundMilli = 500;
@@ -2094,26 +2098,54 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// The engine's own controls, from the effect's parameters rather than from constants.
 	// Every one of these was a fixed value until now, which is why the controls in Magpie's
 	// UI appeared to do nothing: they were being written over here on every frame.
-	// NR Style has no engine field to write: the runtime's own UI lists Enabled, Tone
-	// intensity, Structure intensity, Skin structure and Inline, with no style among them,
-	// and its fifteen configuration keys have none either. Style is an NGX parameter, and
-	// this DLL says in its own text that it gates off the broad lighting and colour channels
-	// a style would act on. So the three names scale what the engine does have -- a scale
-	// rather than an override, so the sliders stay authoritative at Default and their effect
+	// NR Style has no engine field to write. The runtime's own UI lists exactly what it
+	// exposes -- Enabled, Tone intensity, Structure intensity, Skin structure and Inline --
+	// with no style among them, its fifteen configuration keys have none either, and the
+	// name the NGX path uses is an extension key of its own (`DLSSNR.Style`). The runtime
+	// also states in its own text that it gates off the broad lighting and colour channels a
+	// style would act on, so there is nothing here for a style to reach directly.
+	//
+	// What the three are given instead is the engine's content controls, chosen by what the
+	// network's own description says they do rather than by what the names suggest. Its
+	// Structure control adds ambient occlusion, contact shadows, reflections and subsurface
+	// scattering, and its skin channel routes structure through a semantic character mask;
+	// both are wrong for flat colour and hard edges, which is exactly what makes Default
+	// unusable on stylised and animated content. So:
+	//
+	//   Default    the sliders govern, unchanged
+	//   Natural    a light touch: less of the added detail, little of the character channel,
+	//              no tone channels -- for animation, cel shading and stylised rendering
+	//   Cinematic  more of both, with the tone channels on, for photographic content
+	//
+	// A scale, not an override, so the sliders stay authoritative at Default and their effect
 	// stays visible at the other two.
-	const float styleScale = p.settings.style == 1 ? 0.75f
+	const float styleDetail = p.settings.style == 1 ? 0.6f
 		: p.settings.style == 2 ? 1.25f : 1.0f;
+	const float styleSkin = p.settings.style == 1 ? 0.3f
+		: p.settings.style == 2 ? 1.2f : 1.0f;
 	const UINT styleChannels = p.settings.style == 1 ? 0u
 		: p.settings.style == 2 ? std::max(1u, static_cast<UINT>(p.settings.amdToneChannels))
 		: static_cast<UINT>(std::clamp(p.settings.amdToneChannels, 0, 2));
 
 	At<float>(p.runtime, kRvaLocalTone) =
 		std::clamp(p.settings.localToneStrength, 0.0f, 2.0f);
-	At<float>(p.runtime, kRvaLocalStructure) =
-		std::clamp(p.settings.localStructureStrength * styleScale, 0.0f, 2.0f);
-	At<float>(p.runtime, kRvaSkinStructure) =
-		std::clamp(p.settings.skinStructureStrength * styleScale, 0.0f, 2.0f);
+	const float engineStructure =
+		std::clamp(p.settings.localStructureStrength * styleDetail, 0.0f, 2.0f);
+	const float engineSkin =
+		std::clamp(p.settings.skinStructureStrength * styleSkin, 0.0f, 2.0f);
+	At<float>(p.runtime, kRvaLocalStructure) = engineStructure;
+	At<float>(p.runtime, kRvaSkinStructure) = engineSkin;
 	At<UINT>(p.runtime, kRvaToneChannels) = styleChannels;
+	// The values the engine actually receives, so a style that is supposed to change them
+	// can be seen doing so rather than inferred.
+	if (p.settings.style != p.loggedStyle || p.settings.intensity != p.loggedIntensity) {
+		p.loggedStyle = p.settings.style;
+		p.loggedIntensity = p.settings.intensity;
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD engine values: style={} -> structure={:.3f} skin={:.3f} "
+			"toneChannels={} intensity={:.2f}", p.settings.style, engineStructure,
+			engineSkin, styleChannels, p.settings.intensity));
+	}
 	At<UINT>(p.runtime, kRvaCharMask) = p.settings.useAutoMask ? 1u : 0u;
 	At<uint8_t>(p.runtime, kRvaUseDepth) = p.settings.amdUseDepth ? 1 : 0;
 	At<uint8_t>(p.runtime, kRvaUseFsrInputs) = p.settings.amdUseFsrInputs ? 1 : 0;

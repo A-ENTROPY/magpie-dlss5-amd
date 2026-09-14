@@ -206,37 +206,69 @@ Texture2D<float4> src : register(t0);
 Texture2D<float4> baseline : register(t1);
 Texture2D<float4> edited : register(t2);
 RWTexture2D<float4> dst : register(u0);
-cbuffer Extent : register(b0) { uint w; uint h; uint lowW; uint lowH; };
-float3 delta(int2 p) {
-	p = clamp(p, 0, int2(lowW - 1, lowH - 1));
-	return edited.Load(int3(p, 0)).rgb - baseline.Load(int3(p, 0)).rgb;
+cbuffer Extent : register(b0) { uint w; uint h; uint lowW; uint lowH; uint boundMilli; };
+
+// Comparisons happen in a compressed domain, so a threshold means the same thing at any
+// brightness. This is the upstream temporal filter's own choice for the same reason.
+float3 Guide(float3 c) { return c / (1 + abs(c)); }
+float MaxAbs(float3 v) { return max(abs(v.r), max(abs(v.g), abs(v.b))); }
+
+// The edit, taken from the reduced frame and accepted only where that frame agrees with
+// this pixel. Three things here come from the upstream anti-flicker filter, which works
+// the same problem from the other side:
+//
+//   the agreement is judged over the whole bilinear footprint and by its worst sample, not
+//   by one sample -- a single comparison is noisy, and a noisy weight is a weight that
+//   wobbles every frame, which is what the flicker was;
+//
+//   the band is tight (.02 to .10) rather than wide and gentle (.15 to .75). A wide band
+//   makes the weight vary continuously with tiny changes in the input, which is exactly
+//   the instability; a tight one is near-binary and therefore steady;
+//
+//   and when the footprint does not support an answer the call reports failure and the
+//   caller leaves the pixel alone, rather than publishing a half-weighted edit. The
+//   upstream filter does the same (`if (mass < .05) return false`).
+bool SampleEdit(int2 p, out float3 edit) {
+	float3 c = Guide(src.Load(int3(p, 0)).rgb);
+	float2 q = (float2(p) + .5) * float2(lowW, lowH) / float2(w, h) - .5;
+	int2 a = int2(floor(q));
+	float2 t = frac(q);
+	float3 sum = 0;
+	float mass = 0;
+	float worst = 0;
+	[unroll] for (int y = 0; y < 2; ++y)
+	[unroll] for (int x = 0; x < 2; ++x) {
+		int2 n = clamp(a + int2(x, y), 0, int2(lowW - 1, lowH - 1));
+		float4 e = edited.Load(int3(n, 0));
+		float4 b = baseline.Load(int3(n, 0));
+		if (!all(isfinite(e.rgb)) || !all(isfinite(b.rgb))) continue;
+		worst = max(worst, MaxAbs(c - Guide(b.rgb)));
+		float weight = (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y);
+		sum += weight * (e.rgb - b.rgb);
+		mass += weight;
+	}
+	if (mass < .05) return false;
+	float accept = 1 - smoothstep(.02, .10, worst);
+	if (accept <= .001) return false;
+	edit = (sum / mass) * accept;
+	return true;
 }
+
 [numthreads(8, 8, 1)]
 void main(uint3 p : SV_DispatchThreadID)
 {
 	if (p.x >= w || p.y >= h) return;
-	float2 q = (float2(p.xy) + .5) * float2(lowW, lowH) / float2(w, h) - .5;
-	int2 a = int2(floor(q));
-	float2 t = frac(q);
-	float3 d = lerp(lerp(delta(a), delta(a + int2(1, 0)), t.x),
-		lerp(delta(a + int2(0, 1)), delta(a + 1), t.x), t.y);
 	float4 c = src.Load(int3(p.xy, 0));
-	// A reduced neural pixel mixes surfaces and small emitters. Suppress its edit where the
-	// original pixel disagrees with that footprint, rather than spreading the edit blindly
-	// across high-contrast edges.
-	int2 hi = int2(lowW - 1, lowH - 1);
-	float3 b = lerp(lerp(baseline.Load(int3(clamp(a, 0, hi), 0)).rgb,
-			baseline.Load(int3(clamp(a + int2(1, 0), 0, hi), 0)).rgb, t.x),
-		lerp(baseline.Load(int3(clamp(a + int2(0, 1), 0, hi), 0)).rgb,
-			baseline.Load(int3(clamp(a + 1, 0, hi), 0)).rgb, t.x), t.y);
-	float3 magnitude = max(max(abs(c.rgb), abs(b)), 1e-5);
-	float mismatch = max(abs(c.r - b.r) / magnitude.r,
-		max(abs(c.g - b.g) / magnitude.g, abs(c.b - b.b) / magnitude.b));
-	float confidence = 1 - smoothstep(.15, .75, mismatch);
-	// Keep extreme low-resolution edits bounded relative to the current footprint.
-	float3 limit = .5 * max(abs(b), abs(c.rgb));
-	d = clamp(d, -limit, limit) * confidence;
-	dst[p.xy] = float4(clamp(c.rgb + d, 0, 65504), c.a);
+	float3 edit;
+	float3 result = c.rgb;
+	// The bound is a safety net for extremes, not the mechanism; the acceptance above is
+	// what decides whether an edit is applied at all.
+	if (SampleEdit(int2(p.xy), edit)) {
+		const float3 limit = (boundMilli / 1000.0) * max(abs(c.rgb), 1e-4);
+		result = c.rgb + clamp(edit, -limit, limit);
+	}
+	if (!all(isfinite(result))) result = c.rgb;
+	dst[p.xy] = float4(clamp(result, 0, 65504), c.a);
 }
 )";
 
@@ -535,6 +567,10 @@ struct DlssnrAmdBackend::Impl {
 	// Whether Magpie's frame is handed to the engine as linear values rather than as the
 	// sRGB-encoded ones it arrives in. Read from the ini so it can be A/B'd without a build.
 	bool srgbInput = true;
+
+	// How large an edit the resolve will apply, in thousandths of the local magnitude.
+	// Lower is calmer; the reason it is a setting rather than a constant is on the shader.
+	uint32_t editBoundMilli = 500;
 	winrt::com_ptr<ID3D12PipelineState> downsample;
 	winrt::com_ptr<ID3D12PipelineState> resolve;
 	uint32_t descriptorStride = 0;
@@ -595,7 +631,8 @@ struct DlssnrAmdBackend::Impl {
 		ID3D12Resource* baselineTexture, ID3D12Resource* edited) noexcept;
 	void Dispatch(ID3D12PipelineState* pso, uint32_t slot) noexcept;
 	void DispatchSized(ID3D12PipelineState* pso, uint32_t slot, uint32_t dw, uint32_t dh,
-		bool setResidualTable, const UINT* dims4 = nullptr) noexcept;
+		bool setResidualTable, const UINT* constants = nullptr,
+		uint32_t constantCount = 4) noexcept;
 	bool WaitForEngine(uint64_t deadlineMs) noexcept;
 	void DestroySized() noexcept;
 	float Measure(ID3D12Resource* res, DXGI_FORMAT format,
@@ -915,7 +952,8 @@ void DlssnrAmdBackend::Impl::Dispatch(ID3D12PipelineState* pso, uint32_t slot) n
 }
 
 void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t slot,
-	uint32_t dw, uint32_t dh, bool setResidualTable, const UINT* dims4
+	uint32_t dw, uint32_t dh, bool setResidualTable, const UINT* constants,
+	uint32_t constantCount
 ) noexcept {
 	// `slot` matters more than it looks. Descriptors are read when the GPU executes the
 	// list, not when it is recorded, so two stages sharing a slot both end up reading
@@ -938,8 +976,8 @@ void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t sl
 	// The downsample and the resolve are the only stages with an extent to pass, and they
 	// take it in the same four-slot shape the reference uses: destination width and height
 	// followed by the source's.
-	if (dims4) {
-		list->SetComputeRoot32BitConstants(1, 4, dims4, 0);
+	if (constants) {
+		list->SetComputeRoot32BitConstants(1, constantCount, constants, 0);
 	}
 	list->Dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
 }
@@ -1182,6 +1220,17 @@ bool DlssnrAmdBackend::Initialize(
 	}
 	Logger::Get().Info(fmt::format("DLSSNR AMD: srgb input {}",
 		p.srgbInput ? "yes" : "no"));
+
+	// How much of the network's edit to apply, in thousandths. Read from the same ini; the
+	// working implementation attenuates the edit to stop flicker at reduced scale and lists
+	// that as a known quality reduction, so the amount is a judgement to be made on a frame.
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		const int bound = GetPrivateProfileIntW(L"DlssNrOnAmd", L"EditBound", 500,
+			iniPath.c_str());
+		p.editBoundMilli = static_cast<uint32_t>(std::clamp(bound, 5, 1000));
+	}
+	Logger::Get().Info(fmt::format("DLSSNR AMD: edit bound {} / 1000", p.editBoundMilli));
 	// The engine module stays loaded across effect rebuilds and keeps its history, so a
 	// new backend instance always starts by invalidating it.
 	p.resetHistory = true;
@@ -1690,8 +1739,9 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		Barrier(p.list.get(), p.resolved.get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		p.BindResolve(8, p.full.get(), p.resolved.get(), p.baseline.get(), p.net.get());
-		const UINT dims[4]{ p.width, p.height, p.netWidth, p.netHeight };
-		p.DispatchSized(p.resolve.get(), 8, p.width, p.height, true, dims);
+		const UINT dims[5]{ p.width, p.height, p.netWidth, p.netHeight,
+			p.editBoundMilli };
+		p.DispatchSized(p.resolve.get(), 8, p.width, p.height, true, dims, 5);
 		Barrier(p.list.get(), p.resolved.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
 		picture = p.resolved.get();

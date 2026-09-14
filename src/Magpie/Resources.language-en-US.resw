@@ -1127,9 +1127,10 @@
   <data name="Message_AmdOpticalFlowUnsupported" xml:space="preserve"><value>AMD optical flow did not start. Open the effects listed in details, disable optical flow and enable the group again. If you need optical flow, try another method offered by the effect. See details and logs for the capability check results.</value></data>
   <data name="Message_OpticalFlowInteropFailed" xml:space="preserve"><value>Optical flow shared resources could not be created. Open the effects listed in details, disable optical flow and enable the group again. If you need optical flow, try another method offered by the effect.</value></data>
   <data name="Message_ConflictingFrameGenerationEffects" xml:space="preserve"><value>The effect group below contains multiple frame generation effects. Check the conflicting entries in details, open this group and keep the one you want to use. Remove the other frame generation entries, then enable the group again.</value></data>
-  <data name="Message_XeSSMfgRequiresIntel" xml:space="preserve"><value>XeSS Multi-Frame Generation x3/x4 requires a supported Intel Arc GPU. Use XeSS Frame Generation x2 on this GPU.</value></data>
-  <data name="Message_XeSSMfgUnsupported" xml:space="preserve"><value>The selected Intel GPU or driver cannot initialize XeSS Multi-Frame Generation. Update the driver or use XeSS Frame Generation x2.</value></data>
-  <data name="Message_XeSSMfgMultiplierUnsupported" xml:space="preserve"><value>The selected XeSS Multi-Frame Generation multiplier is not supported by this GPU or driver. Select a lower MFG multiplier, or use XeSS Frame Generation x2.</value></data>
+  <data name="Message_XeSSMfgOpticalFlowUnsupported" xml:space="preserve"><value>XeSSFG 3×/4× currently supports None or AMD optical flow. Select either method, or use 2× with NVIDIA optical flow.</value></data>
+  <data name="Message_XeSSMfgCompatibilityUnavailable" xml:space="preserve"><value>XeSSFG compatibility could not be enabled for this runtime. Check the log for version or initialization details.</value></data>
+  <data name="Message_XeSSMfgUnsupported" xml:space="preserve"><value>XeSSFG could not initialize on this adapter or driver. Check the log for details.</value></data>
+  <data name="Message_XeSSMfgMultiplierUnsupported" xml:space="preserve"><value>The XeSSFG runtime does not support the requested multiplier on this path.</value></data>
   <data name="Home_Toolbar_Profiler.Header" xml:space="preserve"><value>Performance monitor</value></data>
   <data name="Home_Toolbar_Profiler_ShortcutControl.Title" xml:space="preserve"><value>Performance monitor</value></data>
   <data name="Home_Toolbar_EffectParameters.Header" xml:space="preserve"><value>Open / close parameter panel</value></data>
@@ -1282,25 +1283,19 @@
   <data name="EffectParam_Sharpen_LumaSharpen_pattern_Label" xml:space="preserve"><value>Sample Pattern</value></data>
   <data name="EffectParam_Sharpen_LumaSharpen_sharpClamp_Label" xml:space="preserve"><value>Sharpening Limit</value></data>
   <data name="EffectParam_Sharpen_LumaSharpen_sharpStrength_Label" xml:space="preserve"><value>Sharpening Strength</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_amdOpticalFlowMode_Label" xml:space="preserve"><value>OF Quality</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_amdOpticalFlowMode_Option_0" xml:space="preserve"><value>Performance</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_amdOpticalFlowMode_Option_1" xml:space="preserve"><value>Quality</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Label" xml:space="preserve"><value>OF Quality</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_1" xml:space="preserve"><value>Performance</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_2" xml:space="preserve"><value>Balanced (Recommended)</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_3" xml:space="preserve"><value>Quality</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_4" xml:space="preserve"><value>High Quality (High Cost)</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_opticalFlowMethod_Label" xml:space="preserve"><value>Optical Flow Method</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_opticalFlowMethod_Option_0" xml:space="preserve"><value>None</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_opticalFlowMethod_Option_1" xml:space="preserve"><value>AMDOF</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_opticalFlowMethod_Option_2" xml:space="preserve"><value>NVOF</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_amdOpticalFlowMode_Label" xml:space="preserve"><value>OF Quality</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_amdOpticalFlowMode_Option_0" xml:space="preserve"><value>Performance</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_amdOpticalFlowMode_Option_1" xml:space="preserve"><value>Quality</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_multiplier_Label" xml:space="preserve"><value>Frame Multiplier</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_opticalFlowMethod_Label" xml:space="preserve"><value>Optical Flow Method</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_opticalFlowMethod_Option_0" xml:space="preserve"><value>None</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_opticalFlowMethod_Option_1" xml:space="preserve"><value>AMDOF</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_amdOpticalFlowMode_Label" xml:space="preserve"><value>OF Quality</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_amdOpticalFlowMode_Option_0" xml:space="preserve"><value>Performance</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_amdOpticalFlowMode_Option_1" xml:space="preserve"><value>Quality</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Label" xml:space="preserve"><value>OF Quality</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_1" xml:space="preserve"><value>Performance</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_2" xml:space="preserve"><value>Balanced (Recommended)</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_3" xml:space="preserve"><value>Quality</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_4" xml:space="preserve"><value>High Quality (High Cost)</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_opticalFlowMethod_Label" xml:space="preserve"><value>Optical Flow Method</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_opticalFlowMethod_Option_0" xml:space="preserve"><value>None</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_opticalFlowMethod_Option_1" xml:space="preserve"><value>AMDOF</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_opticalFlowMethod_Option_2" xml:space="preserve"><value>NVOF</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_multiplier_Label" xml:space="preserve"><value>Frame Multiplier</value></data>
   <data name="Home_RecentIssue.Title" xml:space="preserve"><value>Most recent issue</value></data>
   <data name="Home_RecentIssue_Details.Content" xml:space="preserve"><value>View details</value></data>
   <data name="ErrorDetails_Title" xml:space="preserve"><value>Issue details</value></data>
@@ -1442,7 +1437,7 @@
   <data name="EffectParam_FSR3_FSR3_SR_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>Highest Quality (Very High Cost)</value></data>
   <data name="EffectParam_FSR4_FSR4_SR_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>Highest Quality (Very High Cost)</value></data>
   <data name="EffectParam_XeSS_XeSS_SR_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>Highest Quality (Very High Cost)</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>Highest Quality (Very High Cost)</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>Highest Quality (Very High Cost)</value></data>
   <data name="Motion_Nvidia_5" xml:space="preserve"><value>Highest Quality</value></data>
   <data name="Home_FrameSync.Header" xml:space="preserve"><value>Frame synchronization</value></data>
   <data name="Home_FrameSync.Description" xml:space="preserve"><value>Saved automatically. Restart scaling to apply.</value></data>
@@ -1640,8 +1635,8 @@
   <data name="Overlay_Parameters_Preview" xml:space="preserve"><value>Preview</value></data>
   <data name="Overlay_Parameters_InputHint" xml:space="preserve"><value>Ctrl+click a slider to enter its value. Esc: Edit → Preview → Closed. Click the preview panel to edit. Open / close shortcut:</value></data>
   <data name="Overlay_Parameters_FocusFailed" xml:space="preserve"><value>Click the game window to restore control</value></data>
-  <data name="Profile_General_ParameterFocusSwitching.Header" xml:space="preserve"><value>Switch focus for parameter adjustment</value></data>
-  <data name="Profile_General_ParameterFocusSwitching.Description" xml:space="preserve"><value>Enable focus switching during live parameter adjustment. This may be unstable with some windows.</value></data>
+  <data name="Profile_Advanced_ParameterFocusSwitching.Header" xml:space="preserve"><value>Switch focus for parameter adjustment</value></data>
+  <data name="Profile_Advanced_ParameterFocusSwitching.Description" xml:space="preserve"><value>Enable focus switching during live parameter adjustment. This may be unstable with some windows.</value></data>
   <data name="Home_Advanced_StopEffectsOnTaskSwitch.Header" xml:space="preserve"><value>Disable active effects when switching tasks</value></data>
   <data name="Home_Advanced_StopEffectsOnTaskSwitch.Description" xml:space="preserve"><value>If switching tasks while using DLSSNR makes you feel like you have eaten poisonous mushrooms, try enabling this.</value></data>
   <data name="EffectPicker_CustomSummary" xml:space="preserve"><value>Custom effect; see the author's documentation.</value></data>
@@ -1668,4 +1663,16 @@
   <data name="EffectPicker_SearchAllCategories" xml:space="preserve"><value>Searching all categories</value></data>
   <data name="EffectPicker_NoMatches" xml:space="preserve"><value>No matching effects</value></data>
   <data name="EffectPicker_NoMatchesDescription" xml:space="preserve"><value>Try a shorter keyword, search for an algorithm family, or choose “All” to browse installed effects.</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_multiPass_Label" xml:space="preserve"><value>Multi Pass</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_Group_DLSSNR____Pass_1" xml:space="preserve"><value>DLSSNR · Pass 1</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_Group_DLSSNR____Pass_2" xml:space="preserve"><value>DLSSNR · Pass 2</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_Group_DLSSNR____Pass_3" xml:space="preserve"><value>DLSSNR · Pass 3</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Label" xml:space="preserve"><value>Anti-flicker</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_0" xml:space="preserve"><value>None</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_1" xml:space="preserve"><value>Static Accumulation</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_2" xml:space="preserve"><value>Optical Flow Accumulation</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_3" xml:space="preserve"><value>Optical Flow Accumulation+</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_4" xml:space="preserve"><value>Low-frequency Temporal Reconstruction</value></data>
+  <data name="EffectParam_DLSSFG_DLSS_FrameGeneration_duplicateFrameFiltering_Label" xml:space="preserve"><value>Duplicate Frame Filtering</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_duplicateFrameFiltering_Label" xml:space="preserve"><value>Duplicate Frame Filtering</value></data>
 </root>

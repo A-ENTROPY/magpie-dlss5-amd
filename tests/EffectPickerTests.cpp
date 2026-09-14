@@ -38,7 +38,7 @@ int main() {
 		advancedEntries.push_back(entry);
 	}
 	const auto advancedTree = BuildEffectPickerTree(advancedEntries, L"advanced", L"", L"", {}, {});
-	assert(advancedTree.effectCount == 6 && advancedTree.rows.size() == 6);
+	assert(advancedTree.effectCount == 5 && advancedTree.rows.size() == 5);
 	for (int family = 0; family < 2; ++family) {
 		const auto canonical = RTXVideoCanonicalId<wchar_t>(family);
 		assert(RTXVideoFamily(canonical) == family);
@@ -52,8 +52,7 @@ int main() {
 	}
 	assert(RTXVideoFamily(L"custom\\RTXVideo_VSR_High") == -1);
 	assert(RTXVideoFamily(L"RTXVideo\\RTXVideo_VSR_High_Custom") == -1);
-	assert(EffectHelper::GetDisplayName(L"XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV") == L"XeSS_FrameGeneration_x2");
-	assert(EffectHelper::GetDisplayName(L"XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV") == L"XeSS_MultiFrameGeneration");
+	assert(EffectHelper::GetDisplayName(L"XeSSFG\\XeSS_FrameGeneration") == L"XeSS_FrameGeneration");
 	std::vector<EffectPickerEntry> entries;
 	for (const auto& [id, name] : std::vector<std::pair<std::wstring, std::wstring>>{
 		{L"old/16", L"CuNNy-16"}, {L"old/2", L"CuNNy-2"}, {L"v2/4", L"CuNNy2-4"},

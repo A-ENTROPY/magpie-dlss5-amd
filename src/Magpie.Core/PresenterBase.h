@@ -36,6 +36,8 @@ public:
 
 	// Supplies motion that belongs to the next real base frame. Presenters that
 	// do not consume frame guidance intentionally ignore this call.
+	virtual void SetSourceTiming(uint64_t, uint64_t, uint64_t, int64_t) noexcept {}
+
 	virtual void SetFrameGuidance(
 		ID3D11Texture2D*,
 		FrameGuidanceFrameId,

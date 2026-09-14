@@ -109,6 +109,11 @@
     <ClInclude Include="StepTimer.h" />
     <ClInclude Include="AdaptivePresenter.h" />
     <ClInclude Include="XeSSFGPresenter.h" />
+    <ClInclude Include="XeSSFGCompatibility.h" />
+    <ClInclude Include="XeSSFGPatchTransaction.h" />
+    <ClInclude Include="XeSSFGPacing.h" />
+    <ClInclude Include="XeSSFGTiming.h" />
+    <ClInclude Include="include\XeSSFGParameters.h" />
     <ClInclude Include="TextureHelper.h" />
     <ClInclude Include="YasHelper.h" />
     <ClInclude Include="DLSSSRUpscaler.h" />
@@ -116,6 +121,11 @@
     <ClInclude Include="GroupBEffectProtocol.h" />
     <ClInclude Include="DLSSNRFilter.h" />
     <ClInclude Include="DlssnrAmdBackend.h" />
+    <ClInclude Include="DLSSNRMultiPass.h" />
+    <ClInclude Include="DLSSNRTemporal.h" />
+    <ClInclude Include="DLSSNRTemporalShader.h" />
+    <ClInclude Include="include\DLSSNRTemporalState.h" />
+    <ClInclude Include="include\DLSSNRParameters.h" />
     <ClInclude Include="FrameGuidanceProvider.h" />
     <ClInclude Include="FrameGuidanceService.h" />
     <ClInclude Include="MotionVectorRequest.h" />
@@ -221,6 +231,7 @@
     <ClCompile Include="DLSSFrameGenerator.cpp" />
     <ClCompile Include="DLSSNRFilter.cpp" />
     <ClCompile Include="DlssnrAmdBackend.cpp" />
+    <ClCompile Include="DLSSNRTemporal.cpp" />
     <ClCompile Include="FrameGuidanceService.cpp" />
     <ClCompile Include="ZeroFrameGuidanceProvider.cpp" />
     <ClCompile Include="NvidiaOpticalFlowProvider.cpp" />

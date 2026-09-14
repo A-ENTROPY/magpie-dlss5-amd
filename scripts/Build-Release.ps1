@@ -152,8 +152,9 @@ $releaseContainer = [System.IO.Path]::GetFullPath((Join-Path $releaseRoot $Relea
 $stagingDir = [System.IO.Path]::GetFullPath((Join-Path $releaseContainer $PackageName))
 $buildOutput = $stagingDir
 $intermediateRoot = Join-Path $releaseContainer "obj/$Platform/$Configuration"
-if ($releaseContainer.TrimEnd('\', '/') -eq (Join-Path $releaseRoot 'v0.6.7-local')) {
-    throw "Use scripts/Deploy-Local067.ps1 to preserve the local runtime and user settings."
+if ($releaseContainer.TrimEnd('\', '/') -in @(
+    (Join-Path $releaseRoot 'v0.6.7-local'), (Join-Path $releaseRoot 'v0.6.8-local'))) {
+    throw "Use the matching Deploy-Local script to preserve the local runtime and user settings."
 }
 $symbolsDir = [System.IO.Path]::GetFullPath((Join-Path $releaseContainer "$PackageName-symbols"))
 $zipPath = [System.IO.Path]::GetFullPath((Join-Path $releaseContainer "$PackageName.zip"))
@@ -197,8 +198,17 @@ function Stop-RunningMagpie {
 # application before Rebuild so MSBuild never falls back to deploying a lone
 # replacement executable around a locked output directory.
 if ($RequireMagpieClosed) {
-    if (Get-Process -Name 'Magpie' -ErrorAction SilentlyContinue) {
-        throw 'Magpie is running. Exit it normally before deploying; no process was terminated.'
+    # Only the package being rebuilt must be closed. A different local release
+    # may remain running while a new distribution is prepared in its own folder.
+    $targetExecutable = Join-Path $buildOutput 'Magpie.exe'
+    if (Test-Path -LiteralPath $targetExecutable) {
+        try {
+            $probe = [IO.File]::Open($targetExecutable, [IO.FileMode]::Open,
+                [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $probe.Dispose()
+        } catch {
+            throw "Close the Magpie instance using $targetExecutable before rebuilding; no process was terminated."
+        }
     }
 } else {
     Stop-RunningMagpie
@@ -341,6 +351,14 @@ if (Test-Path -LiteralPath $frameSyncGuide) {
 $parameterInputGuide = Join-Path $sourceRoot "docs\experimental\testing\PARAMETER-INPUT.md"
 if (Test-Path -LiteralPath $parameterInputGuide) {
     Copy-Item -LiteralPath $parameterInputGuide -Destination (Join-Path $stagingDir "PARAMETER-INPUT.md")
+}
+
+foreach ($guide in @(
+    @{ source = 'docs/experimental/effects/DLSSNR-MULTIPASS.md'; target = 'DLSSNR-MULTIPASS.md' },
+    @{ source = 'docs/experimental/effects/XESSFG.md'; target = 'XESSFG.md' },
+    @{ source = 'docs/experimental/design/XESSFG-COMPATIBILITY-NOTICE.md'; target = 'XESSFG-COMPATIBILITY-NOTICE.md' }
+)) {
+    Copy-Item -LiteralPath (Join-Path $sourceRoot $guide.source) -Destination (Join-Path $stagingDir $guide.target)
 }
 
 $featureOptions = [ordered]@{}

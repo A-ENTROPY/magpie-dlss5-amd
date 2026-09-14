@@ -65,7 +65,8 @@ constexpr IssueAction GetIssueAction(ScalingError error) noexcept {
 	case ScalingError::NvidiaOpticalFlowQualityUnsupported:
 	case ScalingError::AmdOpticalFlowUnsupported:
 	case ScalingError::OpticalFlowInteropFailed:
-	case ScalingError::XeSSMfgRequiresIntel:
+	case ScalingError::XeSSMfgOpticalFlowUnsupported:
+	case ScalingError::XeSSMfgCompatibilityUnavailable:
 	case ScalingError::XeSSMfgUnsupported:
 	case ScalingError::XeSSMfgMultiplierUnsupported: return IssueAction::Effects;
 	case ScalingError::ScalingModeNotSelected:

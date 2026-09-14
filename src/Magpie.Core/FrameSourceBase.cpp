@@ -132,10 +132,12 @@ FrameSourceState FrameSourceBase::Update() noexcept {
 	}
 
 	const ScalingOptions& options = ScalingWindow::Get().Options();
-	const auto duplicateFrameDetectionMode = options.duplicateFrameDetectionMode;
-	if (state != FrameSourceState::NewFrame || (newSequence && _prevFrame) || (!_forceDuplicateFrameDetection &&
-		(options.Is3DGameMode() ||
-			duplicateFrameDetectionMode == DuplicateFrameDetectionMode::Never))) {
+	const auto duplicateFrameDetectionMode = _duplicateFrameDetectionOverride.has_value()
+		? (*_duplicateFrameDetectionOverride ? DuplicateFrameDetectionMode::Always : DuplicateFrameDetectionMode::Never)
+		: options.duplicateFrameDetectionMode;
+	if (state != FrameSourceState::NewFrame || (newSequence && _prevFrame) ||
+		duplicateFrameDetectionMode == DuplicateFrameDetectionMode::Never ||
+		(!_duplicateFrameDetectionOverride.has_value() && options.Is3DGameMode())) {
 		return state;
 	}
 
@@ -153,8 +155,7 @@ FrameSourceState FrameSourceBase::Update() noexcept {
 		return FrameSourceState::NewFrame;
 	}
 
-	if (_forceDuplicateFrameDetection ||
-		duplicateFrameDetectionMode == DuplicateFrameDetectionMode::Always) {
+	if (duplicateFrameDetectionMode == DuplicateFrameDetectionMode::Always) {
 		// 总是检查重复帧
 		if (_IsDuplicateFrame()) {
 			return FrameSourceState::Waiting;

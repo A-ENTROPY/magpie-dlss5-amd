@@ -58,4 +58,4 @@ $cunny = @($catalog.effects | Where-Object { $_.family.id -eq 'cunny' })
 if ($cunny.Count -ne 29 -or @($cunny.subfamily.id | Sort-Object -Unique).Count -ne 2) { throw 'CuNNy generation grouping regression' }
 if (@($catalog.effects | Where-Object { $_.family.id -eq 'nnedi3' }).Count -ne 10) { throw 'NNEDI3 family regression' }
 if (@($catalog.effects | Where-Object { $_.id -match '^(CRT|Sharpen|Diagnostics|RTXVideo)\\' -and $_.family }).Count) { throw 'Mixed algorithms were merged into a family' }
-"Catalog validated: $($ids.Count) source effects, 158 built-in picker entries; eight RTX names retained as aliases."
+"Catalog validated: $($ids.Count) source effects, $($catalog.effects.Count) built-in picker entries; eight RTX names retained as aliases."

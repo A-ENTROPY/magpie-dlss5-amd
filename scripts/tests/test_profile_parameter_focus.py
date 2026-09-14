@@ -18,7 +18,7 @@ save=re.search(r'writer.Key\("parameterFocusSwitching"\);\s+writer.Bool\(profile
 select=re.search(r'options.isParameterFocusSwitchingEnabled = profile.isParameterFocusSwitchingEnabled;',read('src/Magpie/ScalingService.cpp')).group()
 assert 'writer.Bool(data._isParameterFocusSwitchingEnabled)' not in settings
 assert 'Home_ParameterFocusSwitching' not in read('src/Magpie/HomePage.xaml')
-assert 'Profile_General_ParameterFocusSwitching' in read('src/Magpie/ProfilePage.xaml')
+assert 'Profile_Advanced_ParameterFocusSwitching' in read('src/Magpie/ProfilePage.xaml')
 
 harness=r'''
 #include <rapidjson/document.h>

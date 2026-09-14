@@ -96,6 +96,18 @@ foreach ($family in @('Denoise', 'VSR')) {
     $entry.search = $entry.id + ' ' + (($aliases | ForEach-Object { $_.search }) -join ' ')
     $effects += $entry
 }
+# 068 merges the two historical XeSSFG entries; retain the original review as evidence.
+$effects = @($effects | Where-Object { $_.id -ne 'XeSSFG\XeSS_MultiFrameGeneration_ZeroMV' })
+$xess = $effects | Where-Object { $_.id -eq 'XeSSFG\XeSS_FrameGeneration_x2_ZeroMV' }
+$xess.id = 'XeSSFG\XeSS_FrameGeneration'
+$xess.name = 'XeSS_FrameGeneration'
+$xess.summary = '在捕获的真实帧之间生成帧，可选 2×～4×。'
+$xess.details = '默认 2×、AMD 光流、质量。旧 x2/MFG 配置自动合并到 XeSSFG，保留光流选择。' + "`n`n" +
+    '2×使用原生路径；非 Intel 显卡上的 3×/4×自动启用多帧兼容，需要随附的匹配运行库。兼容路径仍处于实验验证阶段。' + "`n`n" +
+    '3×/4×支持无光流或 AMD 光流；NVIDIA 光流目前用于 2×。同一效果组只使用一个补帧器。' + "`n`n" +
+    '补帧由呈现端处理，列表位置不改变执行阶段。实际流畅度、延迟、遮挡边缘和游戏 HUD 需要结合目标画面比较。'
+$xess.search = $xess.id + ' XeSSFG XeSS x2 MFG 补帧 多帧 AMD NVIDIA 光流 ' + $xess.summary
+$xess.family.summary = '统一 XeSSFG，支持 2×～4×及可选光流；多帧兼容自动启用。'
 $hdrComponents = Get-Content -LiteralPath (Join-Path $repoRoot 'src/Magpie/EffectCatalog/hdr-components.json') -Raw | ConvertFrom-Json
 $categories += $hdrComponents.category
 $effects += @($hdrComponents.effects)

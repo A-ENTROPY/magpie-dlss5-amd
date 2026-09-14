@@ -648,6 +648,8 @@ struct DLSSNRFilter::Impl {
 	uint64_t timestampFrequency = 0;
 	NVSDK_NGX_Parameter* parameters = nullptr;
 	NVSDK_NGX_Handle* feature = nullptr;
+	// Shared runtime/hook owner survives until the last feature is released.
+	std::shared_ptr<Impl> snippetSession;
 	HMODULE snippetModule = nullptr;
 	SnippetInitExtFn snippetInitExt = nullptr;
 	CreateFeatureFn snippetCreateFeature = nullptr;
@@ -1036,6 +1038,7 @@ DLSSNRFilter::Impl::~Impl() {
 		}
 		parameters = nullptr;
 	}
+	snippetSession.reset();
 	if (snippetInitialized && snippetShutdown && device12) {
 		DWORD sehCode = 0;
 		const NVSDK_NGX_Result result =
@@ -1374,7 +1377,7 @@ static bool SetCreateParametersSafely(
 	}, false, sehCode);
 }
 
-static bool InitializeSignedSnippet(
+static bool InitializeSignedSnippetSession(
 	DLSSNRFilter::Impl& impl,
 	const std::filesystem::path& applicationDirectory
 ) noexcept {
@@ -1422,6 +1425,32 @@ static bool InitializeSignedSnippet(
 	}
 	impl.snippetInitialized = true;
 	impl.useSignedSnippet = true;
+	return true;
+}
+
+// Creation and destruction are serialized on the renderer backend thread.
+// Init/Shutdown and the DLL caller hook belong to the runtime, not each feature.
+static bool InitializeSignedSnippet(
+	DLSSNRFilter::Impl& impl,
+	const std::filesystem::path& applicationDirectory
+) noexcept {
+	static std::weak_ptr<DLSSNRFilter::Impl> sharedSession;
+	auto session = sharedSession.lock();
+	if (session && session->device12.get() != impl.device12.get()) {
+		Logger::Get().Error("DLSSNR snippet runtime is active on another device");
+		return false;
+	}
+	if (!session) {
+		session = std::make_shared<DLSSNRFilter::Impl>();
+		session->device12 = impl.device12;
+		if (!InitializeSignedSnippetSession(*session, applicationDirectory)) return false;
+		sharedSession = session;
+	}
+	impl.snippetCreateFeature = session->snippetCreateFeature;
+	impl.snippetEvaluateFeature = session->snippetEvaluateFeature;
+	impl.snippetReleaseFeature = session->snippetReleaseFeature;
+	impl.useSignedSnippet = true;
+	impl.snippetSession = std::move(session);
 	return true;
 }
 
@@ -2450,6 +2479,10 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 	return true;
 }
 
+bool DLSSNRFilter::IsHealthy() const noexcept {
+	return _impl && !_impl->disabled;
+}
+
 }
 
 #else
@@ -2457,6 +2490,7 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 namespace Magpie {
 
 struct DLSSNRFilter::Impl {};
+bool DLSSNRFilter::IsHealthy() const noexcept { return false; }
 DLSSNRFilter::DLSSNRFilter() = default;
 DLSSNRFilter::~DLSSNRFilter() = default;
 FrameGuidanceRequirements

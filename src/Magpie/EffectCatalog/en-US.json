@@ -3134,42 +3134,22 @@
       "subfamily": null
     },
     {
-      "id": "XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV",
-      "name": "XeSS_FrameGeneration_x2",
+      "id": "XeSSFG\\XeSS_FrameGeneration",
+      "name": "XeSS_FrameGeneration",
       "category": "frame",
       "subcategory": "Frame generation",
       "purposes": [
         "frame"
       ],
-      "summary": "Frames are generated between captured real frames via the XeSS native rendering backend.",
-      "details": "Frame generation and frame rate › Frame generation\n\nThe list item is an identity marker; the generated frame is published independently by the rendering side, not by the shader output at that list position. The motion information captured externally is limited, and the UI, cursor and occlusion scenes need to be measured in practice.\n\nVariant differences: fixed 2× request frame filling mark; the same group can only have one frame filling effect, and should be used in conjunction with the global Frame Rate Filter to understand the input/output frame rate.\n\nAdvanced/Experimental: Native render-side frame padding changes latency and release cadence, and is limited by capture motion estimation.\n\nFirst try: Select only one framer in the same group; check UI, cursor, screen switching and fast movement\n\nCombination guidance: Present terminal; after \"all normal screen effects\". Generated frames are published independently by the rendering side.\n\nExecution position: Filling frames are processed on the rendering side, and frame limiting is scanned by the runtime effect group; dragging the entry does not change the actual scheduling stage.\n\nOutput size: keep input size\n\nCombination note: The same effect group can only have one frame-filling effect; the list position of the identity marker is not equal to the native backend execution position\n\nRequirements: Supports GPU/driver corresponding to XeSS function; can load corresponding XeSS runtime library\n\nPerformance cost: Hardware/runtime related; specific frame rate needs to be measured on the target screen.\n\nHDR note: HDR frame filling uses the terminal HDR10/R10 rendering protocol, and the external capture chain still needs to be measured on the monitor.",
+      "summary": "Generate intermediate frames between captured frames, with 2×–4× output.",
+      "details": "Defaults to 2×, AMD optical flow, Quality. Legacy x2/MFG configurations migrate while preserving optical-flow choices.\n\n2× uses the native path. On non-Intel adapters, 3×/4× automatically uses experimental compatibility with the matching bundled runtime.\n\n3×/4× supports None or AMD optical flow; NVIDIA optical flow is currently available at 2×. Use one frame generator per effect group.\n\nGeneration runs at presentation time regardless of effect ordering. Compare smoothness, latency, occlusion edges and game HUDs on the target content.",
       "level": "advanced",
       "recommendation": "Advanced/Experimental",
-      "search": "XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV XeSS_FrameGeneration_x2 XeSSFG     XeSSFG XeSS FrameGeneration x2 ZeroMV XeSSFG XeSS_FrameGeneration_x2_ZeroMV XeSS_FrameGeneration_x2     XeSS     identity marker UI      XeSS Frame Generation XeSS_FrameGeneration_x2 Frames are generated between captured real frames via the XeSS native rendering backend. Advanced/Experimental Frame generation and frame rate Frame generation XeSS Frame Generation XeSS patching: x2 is a universal path, multi-frame generation requires Intel Arc. Motion estimation can be selected in the parameters. See each entry for specific restrictions.",
+      "search": "XeSSFG\\XeSS_FrameGeneration XeSSFG XeSS x2 MFG frame generation AMD NVIDIA optical flow Generate intermediate frames between captured frames, with 2×–4× output.",
       "family": {
         "id": "xessfg",
         "name": "XeSS Frame Generation",
-        "summary": "XeSS patching: x2 is a universal path, multi-frame generation requires Intel Arc. Motion estimation can be selected in the parameters. See each entry for specific restrictions."
-      },
-      "subfamily": null
-    },
-    {
-      "id": "XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV",
-      "name": "XeSS_MultiFrameGeneration",
-      "category": "frame",
-      "subcategory": "Frame generation",
-      "purposes": [
-        "frame"
-      ],
-      "summary": "Frames are generated between captured real frames via the XeSS native rendering backend.",
-      "details": "Frame generation and frame rate › Frame generation\n\nThe list item is an identity marker; the generated frame is published independently by the rendering side, not by the shader output at that list position. The motion information captured externally is limited, and the UI, cursor and occlusion scenes need to be measured in practice.\n\nVariant differences: 2–4× request (the actual accepted value is determined by the backend capability) frame-filling mark; there can only be one frame-filling effect in the same group, and it is recommended to cooperate with the global Frame Rate Filter to understand the input/output frame rate.\n\nAdvanced/Experimental: Native render-side frame padding changes latency and release cadence, and is limited by capture motion estimation.\n\nFirst try: Select only one framer in the same group; check UI, cursor, screen switching and fast movement\n\nCombination guidance: Present terminal; after \"all normal screen effects\". Generated frames are published independently by the rendering side.\n\nExecution position: Filling frames are processed on the rendering side, and frame limiting is scanned by the runtime effect group; dragging the entry does not change the actual scheduling stage.\n\nOutput size: keep input size\n\nCombination note: The same effect group can only have one frame-filling effect; the list position of the identity marker is not equal to the native backend execution position\n\nRequirements: Supports GPU/driver corresponding to XeSS function; can load corresponding XeSS runtime library\n\nPerformance cost: Hardware/runtime related; specific frame rate needs to be measured on the target screen.\n\nHDR note: HDR frame filling uses the terminal HDR10/R10 rendering protocol, and the external capture chain still needs to be measured on the monitor.",
-      "level": "advanced",
-      "recommendation": "Advanced/Experimental",
-      "search": "XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV XeSS_MultiFrameGeneration XeSSFG     XeSSFG XeSS MultiFrameGeneration ZeroMV XeSSFG XeSS_MultiFrameGeneration_ZeroMV XeSS_MultiFrameGeneration     XeSS     identity marker UI      XeSS Frame Generation XeSS_MultiFrameGeneration Frames are generated between captured real frames via the XeSS native rendering backend. Advanced/Experimental Frame generation and frame rate Frame generation XeSS Frame Generation XeSS patching: x2 is a universal path, multi-frame generation requires Intel Arc. Motion estimation can be selected in the parameters. See each entry for specific restrictions.",
-      "family": {
-        "id": "xessfg",
-        "name": "XeSS Frame Generation",
-        "summary": "XeSS patching: x2 is a universal path, multi-frame generation requires Intel Arc. Motion estimation can be selected in the parameters. See each entry for specific restrictions."
+        "summary": "Unified XeSSFG with 2×–4× output and selectable optical flow. Multi-frame compatibility is automatic."
       },
       "subfamily": null
     },

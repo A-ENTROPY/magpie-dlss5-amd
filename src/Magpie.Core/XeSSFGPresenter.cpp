@@ -2,6 +2,7 @@
 #include "FramePacingWait.h"
 #include "FrameTrace.h"
 #include "XeSSFGPresenter.h"
+#include "XeSSFGTiming.h"
 #include "DeviceResources.h"
 #include "Logger.h"
 #include "ScalingWindow.h"
@@ -9,6 +10,7 @@
 #include <dcomp.h>
 
 #ifdef MP_ENABLE_XESS_FRAME_GENERATION
+#include "XeSSFGCompatibility.h"
 #include <d3d12.h>
 #include <xell/xell_d3d12.h>
 #include <xess_fg/xefg_swapchain_d3d12.h>
@@ -76,6 +78,15 @@ static void XeFGLogCallback(
 
 struct XeSSFGPresenter::Impl {
 	~Impl();
+	XeSSFGCompatibility::Lease compatibility;
+	XeSSFGTiming timing;
+	XeSSFGSourceSample sourceSample;
+	XeSSFGTiming::Estimate timingEstimate;
+	double extraWaitMs = 0, xellWaitMs = 0, presentMs = 0;
+	double sourceReceivedAtMs = 0, sourceReceiveIntervalMs = 0, sourceQueueMs = 0;
+	uint64_t sdkFrames = 0, sdkSamples = 0, partialBursts = 0;
+	// Opt-in startup diagnostics; normal runs keep the existing log cadence.
+	bool startupTrace = GetEnvironmentVariableW(L"MAGPIE_XESS_STARTUP_TRACE", nullptr, 0) != 0;
 
 	HWND hwnd = NULL;
 	ID3D11Device5* device11 = nullptr;
@@ -121,6 +132,7 @@ struct XeSSFGPresenter::Impl {
 	uint32_t multiplier = 2;
 	uint32_t limiterIntervalUs = 0;
 	uint32_t consecutiveFailures = 0;
+	uint64_t sdkMotionSamples = 0;
 	bool frameGenerationEnabled = false;
 	bool externalMotionEnabled = false;
 	bool externalMotionValid = false;
@@ -147,8 +159,9 @@ static bool WaitForQueue(XeSSFGPresenter::Impl& impl) noexcept {
 }
 
 XeSSFGPresenter::Impl::~Impl() {
+	bool stopped = true;
 	if (queue12 && fence12) {
-		WaitForQueue(*this);
+		stopped = WaitForQueue(*this);
 	}
 
 	backBuffers = {};
@@ -158,14 +171,16 @@ XeSSFGPresenter::Impl::~Impl() {
 		xefgSwapChainSetEnabled(xefg, false);
 		const xefg_swapchain_result_t result = xefgSwapChainDestroy(xefg);
 		if (!XeFGSucceeded(result)) {
+			stopped = false;
 			LogXeFGResult("destroy failed", result);
 		}
 		xefg = nullptr;
 	}
 	if (xell) {
-		xellDestroyContext(xell);
+		stopped &= XeLLSucceeded(xellDestroyContext(xell));
 		xell = nullptr;
 	}
+	if (!compatibility.Release(stopped)) Logger::Get().Error("XeSSFG context cleanup or patch restoration failed; further XeSSFG sessions require restarting Magpie");
 }
 
 static bool CreateSharedColor(XeSSFGPresenter::Impl& impl) noexcept {
@@ -525,6 +540,16 @@ bool XeSSFGPresenter::_Initialize(HWND hwndAttach) noexcept {
 		return false;
 	}
 
+	DXGI_ADAPTER_DESC1 adapter{};
+	if (FAILED(_deviceResources->GetGraphicsAdapter()->GetDesc1(&adapter))) return false;
+	const bool compatibility = _requestedMultiplier > 2 && adapter.VendorId != 0x8086;
+	if (!impl->compatibility.Acquire(compatibility, _requestedMultiplier,
+		reinterpret_cast<const void*>(&xefgSwapChainD3D12CreateContext))) {
+		Logger::Get().Error(fmt::format("XeSSFG compatibility unavailable: {}", impl->compatibility.Failure()));
+		_initializationError = ScalingError::XeSSMfgCompatibilityUnavailable;
+		return false;
+	}
+	Logger::Get().Info(compatibility ? "XeSSFG: verified 1.3.1.78 compatibility and pacing active (experimental)" : "XeSSFG: native runtime path");
 	xefg_swapchain_result_t result = xefgSwapChainD3D12CreateContext(
 		impl->device12.get(), &impl->xefg);
 	if (!XeFGSucceeded(result)) {
@@ -552,7 +577,7 @@ bool XeSSFGPresenter::_Initialize(HWND hwndAttach) noexcept {
 		_requestedMultiplier, properties.maxSupportedInterpolations));
 	if (properties.maxSupportedInterpolations < requestedInterpolations) {
 		Logger::Get().Error(fmt::format(
-			"XeSSFG {}x is unsupported: hardware supports at most {}x",
+			"XeSSFG {}x is unsupported: selected runtime path reports at most {}x",
 			_requestedMultiplier, properties.maxSupportedInterpolations + 1));
 		_initializationError = _requestedMultiplier > 2 ?
 			ScalingError::XeSSMfgMultiplierUnsupported :
@@ -712,6 +737,18 @@ bool XeSSFGPresenter::SetBaseFrameRateLimit(double baseFPS) noexcept {
 	return true;
 }
 
+void XeSSFGPresenter::SetSourceTiming(uint64_t frameId, uint64_t sequence,
+	uint64_t generation, int64_t timestamp100ns) noexcept {
+	if (!_impl) return;
+	if (frameId != _impl->sourceSample.frameId || generation != _impl->sourceSample.generation) {
+		const double now = std::chrono::duration<double, std::milli>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		_impl->sourceReceiveIntervalMs = _impl->sourceReceivedAtMs > 0 ? now - _impl->sourceReceivedAtMs : 0;
+		_impl->sourceReceivedAtMs = now;
+	}
+	_impl->sourceSample = {frameId, sequence, generation, timestamp100ns};
+}
+
 bool XeSSFGPresenter::BeginFrame(
 	winrt::com_ptr<ID3D11Texture2D>& frameTex,
 	winrt::com_ptr<ID3D11RenderTargetView>& frameRtv,
@@ -729,7 +766,9 @@ bool XeSSFGPresenter::BeginFrame(
 		Logger::Get().Win32Error("XeSSFG frame latency wait failed");
 		return false;
 	}
+	const auto sleepStart = std::chrono::steady_clock::now();
 	xellSleep(impl.xell, impl.frameId);
+	impl.xellWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sleepStart).count();
 	xellAddMarkerData(impl.xell, impl.frameId, XELL_INPUT_SAMPLE);
 	xellAddMarkerData(impl.xell, impl.frameId, XELL_SIMULATION_START);
 	drawOffset = {};
@@ -899,6 +938,18 @@ bool XeSSFGPresenter::EndFrame(bool waitForGpu) noexcept {
 			constants.frameRenderTime = static_cast<float>(
 				std::chrono::duration<double, std::milli>(now - impl.lastPresent).count());
 		}
+		if (impl.compatibility.Patched()) {
+			impl.sourceQueueMs = impl.sourceReceivedAtMs > 0 ?
+				std::chrono::duration<double, std::milli>(now.time_since_epoch()).count() - impl.sourceReceivedAtMs : 0;
+			impl.timingEstimate = impl.timing.Submit(impl.sourceSample,
+				std::chrono::duration<double, std::milli>(now.time_since_epoch()).count(), impl.extraWaitMs);
+			if (impl.timingEstimate.reset || constants.resetHistory) impl.compatibility.Reset();
+			constants.resetHistory |= impl.timingEstimate.reset ? 1u : 0u;
+			constants.frameRenderTime = static_cast<float>(impl.timingEstimate.fedMs);
+			XeSSFGCompatibility::Pacing::sourcePeriodNs.store(
+				static_cast<int64_t>(impl.timingEstimate.fedMs * 1000000),
+				std::memory_order_relaxed);
+		}
 		if (XeFGSucceeded(result)) {
 			result = xefgSwapChainTagFrameConstants(
 				impl.xefg, impl.frameId, &constants);
@@ -921,7 +972,10 @@ bool XeSSFGPresenter::EndFrame(bool waitForGpu) noexcept {
 		? DXGI_PRESENT_ALLOW_TEARING : 0;
 	const auto presentStart = std::chrono::steady_clock::now();
 	const auto tracePresent = FrameTrace::Tick();
+	const auto extraBefore = XeSSFGCompatibility::Pacing::extraWaitNs.load(std::memory_order_relaxed);
 	hr = impl.swapChain->Present(0, flags);
+	impl.presentMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count();
+	impl.extraWaitMs = static_cast<double>(XeSSFGCompatibility::Pacing::extraWaitNs.load(std::memory_order_relaxed) - extraBefore) / 1000000.0;
 	FrameTrace::Presentation(tracePresent, FrameTrace::Tick(), hr,
 		reinterpret_cast<uintptr_t>(impl.swapChain.get()));
 	_lastPresentedFrameCount = hr == S_OK ? std::optional<uint32_t>(1) : std::optional<uint32_t>(0);
@@ -937,6 +991,37 @@ bool XeSSFGPresenter::EndFrame(bool waitForGpu) noexcept {
 			xefgSwapChainGetLastPresentStatus(impl.xefg, &status);
 		_lastPresentedFrameCount = statusResult == XEFG_SWAPCHAIN_RESULT_SUCCESS ?
 			std::optional<uint32_t>(status.framesPresented) : std::nullopt;
+		if (statusResult == XEFG_SWAPCHAIN_RESULT_SUCCESS) {
+			impl.sdkFrames += status.framesPresented;
+			++impl.sdkSamples;
+			impl.sdkMotionSamples += impl.externalMotionValid && !impl.externalMotionReset;
+			impl.partialBursts += status.framesPresented != impl.multiplier;
+		}
+		const bool traceStartup = impl.startupTrace && impl.frameId <= 240;
+		if (traceStartup) {
+			Logger::Get().Info(fmt::format("XeSSFG startup: frame={} rtss={} medianNs={} unitNs={} deadlineShiftNs={} (latest worker snapshot)",
+				impl.frameId, GetModuleHandleW(L"RTSSHooks64.dll") != nullptr,
+				XeSSFGCompatibility::Pacing::diagnosticMedianNs.load(), XeSSFGCompatibility::Pacing::diagnosticUnitNs.load(),
+				XeSSFGCompatibility::Pacing::diagnosticDeadlineShiftNs.load()));
+		}
+		if (traceStartup || impl.frameId % 120 == 0) {
+			Logger::Get().Info(fmt::format(
+				"XeSSFG SDK output: requested={}x frames={} submissions={} partialBursts={} lastFrames={} lastFGResult={} motionFrames={} (not display events)",
+				impl.multiplier, impl.sdkFrames, impl.sdkSamples, impl.partialBursts,
+				status.framesPresented, static_cast<int>(status.frameGenResult), impl.sdkMotionSamples));
+		}
+		if (impl.compatibility.Patched() && (traceStartup || impl.frameId % 120 == 0)) {
+			const auto outputs = XeSSFGCompatibility::Pacing::ReadOutputStats();
+			Logger::Get().Info(fmt::format("XeSSFG provider submission gaps: samples={} P50={:.3f} P95={:.3f} P99={:.3f} ms; receiveIntervalMs={:.3f} frontendQueueMs={:.3f} (not display events)",
+				outputs.count, outputs.p50, outputs.p95, outputs.p99, impl.sourceReceiveIntervalMs, impl.sourceQueueMs));
+			Logger::Get().Info(fmt::format(
+				"XeSSFG experimental: sourceFrame={} captureSeq={} generation={} timingReset={} sourceMs={:.3f} submitMs={:.3f} fedEstimateMs={:.3f} captureEstimate={} XeLLms={:.3f} PresentMs={:.3f} extraWaitMs={:.3f} SDKframes={}/{} partialBursts={} providerCalls={} schedulerCalls={} (not display events)",
+				impl.sourceSample.frameId, impl.sourceSample.sequence, impl.sourceSample.generation,
+				impl.timingEstimate.reset, impl.timingEstimate.sourceMs, impl.timingEstimate.submitMs,
+				impl.timingEstimate.fedMs, impl.timingEstimate.captured, impl.xellWaitMs, impl.presentMs,
+				impl.extraWaitMs, impl.sdkFrames, impl.sdkSamples, impl.partialBursts,
+				XeSSFGCompatibility::Pacing::outputCalls.load(), XeSSFGCompatibility::Pacing::schedulerCalls.load()));
+		}
 		if (!XeFGSucceeded(statusResult) || status.frameGenResult < 0) {
 			++impl.consecutiveFailures;
 			if (impl.consecutiveFailures == 1 || impl.consecutiveFailures == 3) {
@@ -991,6 +1076,8 @@ bool XeSSFGPresenter::OnResize() noexcept {
 
 	xefgSwapChainSetEnabled(impl.xefg, false);
 	impl.frameGenerationEnabled = false;
+	impl.timing.Reset();
+	if (impl.compatibility.Patched()) impl.compatibility.Reset();
 	if (!WaitForQueue(impl)) {
 		return false;
 	}
@@ -1054,6 +1141,8 @@ bool XeSSFGPresenter::_Initialize(HWND) noexcept {
 	Logger::Get().Error("XeSS Frame Generation is disabled at build time");
 	return false;
 }
+void XeSSFGPresenter::SetSourceTiming(uint64_t, uint64_t, uint64_t, int64_t) noexcept {}
+
 bool XeSSFGPresenter::BeginFrame(
 	winrt::com_ptr<ID3D11Texture2D>&,
 	winrt::com_ptr<ID3D11RenderTargetView>&,

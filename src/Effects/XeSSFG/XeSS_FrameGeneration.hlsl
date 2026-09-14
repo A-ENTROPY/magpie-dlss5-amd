@@ -4,11 +4,27 @@
 
 //!MAGPIE EFFECT
 //!VERSION 4
-//!SORT_NAME XeSS Frame Generation x2
+//!SORT_NAME XeSS_FrameGeneration
+
+//!PARAMETER
+//!LABEL Frame Multiplier
+//!DEFAULT 2
+//!MIN 2
+//!MAX 4
+//!STEP 1
+int multiplier;
+
+//!PARAMETER
+//!LABEL Duplicate Frame Filtering
+//!DEFAULT 1
+//!MIN 0
+//!MAX 1
+//!STEP 1
+int duplicateFrameFiltering;
 
 //!PARAMETER
 //!LABEL Optical Flow Method
-//!DEFAULT 0
+//!DEFAULT 1
 //!OPTION 0 None
 //!OPTION 1 AMDOF
 //!OPTION 2 NVOF

@@ -1,5 +1,6 @@
 #pragma once
 #include "HdrCaptureProcessor.h"
+#include <optional>
 
 namespace Magpie {
 
@@ -44,8 +45,10 @@ public:
 	const char* CaptureErrorContext() const noexcept { return _captureErrorContext; }
 	HRESULT CaptureErrorCode() const noexcept { return _captureErrorCode; }
 
-	void ForceDuplicateFrameDetection(bool value) noexcept {
-		_forceDuplicateFrameDetection = value;
+	// nullopt follows global settings; FG explicitly chooses on or off.
+	// Configure before capture starts; changes take effect after scaling restarts.
+	void DuplicateFrameDetectionOverride(std::optional<bool> value) noexcept {
+		_duplicateFrameDetectionOverride = value;
 	}
 
 	// Compatibility getter. HDR callers must use GetCanonicalFrame(); SDR keeps
@@ -148,7 +151,7 @@ private:
 	uint16_t _framesLeft;
 	
 	bool _isCheckingForDuplicateFrame = true;
-	bool _forceDuplicateFrameDetection = false;
+	std::optional<bool> _duplicateFrameDetectionOverride;
 
 protected:
 	bool _roundCornerDisabled = false;

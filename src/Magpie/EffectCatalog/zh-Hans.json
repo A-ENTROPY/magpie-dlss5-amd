@@ -3134,42 +3134,22 @@
       "subfamily": null
     },
     {
-      "id": "XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV",
-      "name": "XeSS_FrameGeneration_x2",
+      "id": "XeSSFG\\XeSS_FrameGeneration",
+      "name": "XeSS_FrameGeneration",
       "category": "frame",
       "subcategory": "补帧",
       "purposes": [
         "frame"
       ],
-      "summary": "通过 XeSS 原生呈现后端在捕获的真实帧之间生成帧。",
-      "details": "补帧与帧率 › 补帧\n\n列表项是 identity marker；生成帧由呈现端独立发布，不是着色器在该列表位置输出。外部捕获的运动信息有限，UI、光标与遮挡场景需实测。\n\n变体差异：固定 2× 请求补帧标记；同组只能有一个补帧效果，宜配合全局 Frame Rate Filter 理解输入/输出帧率。\n\n进阶／实验：原生呈现端补帧会改变延迟与发布节奏，并受捕获运动估计限制。\n\n尝试建议：同组只选一个补帧器；检查 UI、光标、切屏和快速运动\n\n组合建议：呈现终端；在「全部普通画面效果」之后。生成帧由呈现端独立发布。\n\n执行位置：补帧在呈现端处理，限帧由运行时扫描效果组；拖动条目不改变实际调度阶段。\n\n输出尺寸：保持输入尺寸\n\n组合注意：同一效果组只能有一个补帧效果；identity marker 的列表位置不等于原生后端执行位置\n\n使用条件：支持对应 XeSS 功能的 GPU/驱动；可加载对应 XeSS 运行库\n\n性能成本：硬件/运行时相关；具体帧率需在目标画面实测。\n\nHDR 注意：HDR 补帧使用终端 HDR10/R10 呈现协议，外部捕获链仍需显示器实测。",
+      "summary": "在捕获的真实帧之间生成帧，可选 2×～4×。",
+      "details": "默认 2×、AMD 光流、质量。旧 x2/MFG 配置自动合并到 XeSSFG，保留光流选择。\n\n2×使用原生路径；非 Intel 显卡上的 3×/4×自动启用多帧兼容，需要随附的匹配运行库。兼容路径仍处于实验验证阶段。\n\n3×/4×支持无光流或 AMD 光流；NVIDIA 光流目前用于 2×。同一效果组只使用一个补帧器。\n\n补帧由呈现端处理，列表位置不改变执行阶段。实际流畅度、延迟、遮挡边缘和游戏 HUD 需要结合目标画面比较。",
       "level": "advanced",
       "recommendation": "进阶／实验",
-      "search": "XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV XeSS_FrameGeneration_x2 XeSSFG 补帧与帧率 补帧 XeSSFG XeSS FrameGeneration x2 ZeroMV XeSSFG XeSS_FrameGeneration_x2_ZeroMV XeSS_FrameGeneration_x2 可选估算运动 通过 XeSS 原生呈现后端在捕获的真实帧之间生成帧。 列表项是 identity marker；生成帧由呈现端独立发布，不是着色器在该列表位置输出。外部捕获的运动信息有限，UI、光标与遮挡场景需实测。 补帧与帧率 补帧 XeSS Frame Generation",
+      "search": "XeSSFG\\XeSS_FrameGeneration XeSSFG XeSS x2 MFG 补帧 多帧 AMD NVIDIA 光流 在捕获的真实帧之间生成帧，可选 2×～4×。",
       "family": {
         "id": "xessfg",
         "name": "XeSS Frame Generation",
-        "summary": "XeSS 补帧：x2 为通用路径，多帧生成需要 Intel Arc。运动估算可在参数中选择，具体限制见各条目。"
-      },
-      "subfamily": null
-    },
-    {
-      "id": "XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV",
-      "name": "XeSS_MultiFrameGeneration",
-      "category": "frame",
-      "subcategory": "补帧",
-      "purposes": [
-        "frame"
-      ],
-      "summary": "通过 XeSS 原生呈现后端在捕获的真实帧之间生成帧。",
-      "details": "补帧与帧率 › 补帧\n\n列表项是 identity marker；生成帧由呈现端独立发布，不是着色器在该列表位置输出。外部捕获的运动信息有限，UI、光标与遮挡场景需实测。\n\n变体差异：2–4× 请求（实际接受值由后端能力决定）补帧标记；同组只能有一个补帧效果，宜配合全局 Frame Rate Filter 理解输入/输出帧率。\n\n进阶／实验：原生呈现端补帧会改变延迟与发布节奏，并受捕获运动估计限制。\n\n尝试建议：同组只选一个补帧器；检查 UI、光标、切屏和快速运动\n\n组合建议：呈现终端；在「全部普通画面效果」之后。生成帧由呈现端独立发布。\n\n执行位置：补帧在呈现端处理，限帧由运行时扫描效果组；拖动条目不改变实际调度阶段。\n\n输出尺寸：保持输入尺寸\n\n组合注意：同一效果组只能有一个补帧效果；identity marker 的列表位置不等于原生后端执行位置\n\n使用条件：支持对应 XeSS 功能的 GPU/驱动；可加载对应 XeSS 运行库\n\n性能成本：硬件/运行时相关；具体帧率需在目标画面实测。\n\nHDR 注意：HDR 补帧使用终端 HDR10/R10 呈现协议，外部捕获链仍需显示器实测。",
-      "level": "advanced",
-      "recommendation": "进阶／实验",
-      "search": "XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV XeSS_MultiFrameGeneration XeSSFG 补帧与帧率 补帧 XeSSFG XeSS MultiFrameGeneration ZeroMV XeSSFG XeSS_MultiFrameGeneration_ZeroMV XeSS_MultiFrameGeneration 可选估算运动 通过 XeSS 原生呈现后端在捕获的真实帧之间生成帧。 列表项是 identity marker；生成帧由呈现端独立发布，不是着色器在该列表位置输出。外部捕获的运动信息有限，UI、光标与遮挡场景需实测。 补帧与帧率 补帧 XeSS Frame Generation",
-      "family": {
-        "id": "xessfg",
-        "name": "XeSS Frame Generation",
-        "summary": "XeSS 补帧：x2 为通用路径，多帧生成需要 Intel Arc。运动估算可在参数中选择，具体限制见各条目。"
+        "summary": "统一 XeSSFG，支持 2×～4×及可选光流；多帧兼容自动启用。"
       },
       "subfamily": null
     },

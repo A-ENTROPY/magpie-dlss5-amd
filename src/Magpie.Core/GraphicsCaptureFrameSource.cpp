@@ -166,7 +166,7 @@ FrameSourceState GraphicsCaptureFrameSource::_Update() noexcept {
 				_frameBox.right <= UINT(content.Width) && _frameBox.bottom <= UINT(content.Height) &&
 				_frameBox.right <= desc.Width && _frameBox.bottom <= desc.Height;
 			const bool staleTimestamp = timestamp <= 0 ||
-				(_lastFrameTimestamp100ns && timestamp <= _lastFrameTimestamp100ns);
+				(_lastFrameTimestamp100ns && timestamp < _lastFrameTimestamp100ns);
 			if (!valid || staleTimestamp) {
 				FrameTrace::Mark(FrameTrace::Event::WgcRejected, !valid ? 1 : 2, timestamp);
 				_InterruptCapture(!valid ? "invalid content bounds" : "non-advancing capture timestamp");
@@ -182,6 +182,11 @@ FrameSourceState GraphicsCaptureFrameSource::_Update() noexcept {
 						CommonSharedConstants::WM_FRONTEND_RENDER, 0, 0);
 					_lastRecoveryGeometryCheck = std::chrono::steady_clock::now();
 				}
+				frame.Close();
+			} else if (timestamp == _lastFrameTimestamp100ns) {
+				// WGC may repeat a timestamp, including after a screenshot. This is
+				// not a discontinuity: preserve temporal history and wait for new input.
+				// Fall through so an existing recovery still checks its deadline.
 				frame.Close();
 			} else {
 				// Preserve the long-pause optimization, with a 5-second debounce.

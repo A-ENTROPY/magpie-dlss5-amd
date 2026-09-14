@@ -835,6 +835,8 @@ std::string AppSettings::_Serialize(const _AppSettingsData& data) {
 	writer.Uint(data._experimentalDlssSrSettingsVersion);
 	writer.Key("experimentalDepthRemovalVersion");
 	writer.Uint(data._experimentalDepthRemovalVersion);
+	writer.Key("experimentalXeSSFGSettingsVersion");
+	writer.Uint(data._experimentalXeSSFGSettingsVersion);
 	writer.Key("experimentalOpticalFlowDefaultsVersion");
 	writer.Uint(data._experimentalOpticalFlowDefaultsVersion);
 
@@ -891,6 +893,12 @@ void AppSettings::_LoadSettings(const rapidjson::GenericObject<true, rapidjson::
 	_experimentalDlssSrSettingsVersion = 0;
 	JsonHelper::ReadUInt(root, "experimentalDlssSrSettingsVersion",
 		_experimentalDlssSrSettingsVersion);
+	_experimentalXeSSFGSettingsVersion = 0;
+	JsonHelper::ReadUInt(root, "experimentalXeSSFGSettingsVersion", _experimentalXeSSFGSettingsVersion);
+	if (_experimentalXeSSFGSettingsVersion < 1) {
+		_experimentalXeSSFGSettingsVersion = 1;
+		_isConfigMigrationNeeded = true;
+	}
 	_experimentalOpticalFlowDefaultsVersion = 0;
 	JsonHelper::ReadUInt(root, "experimentalOpticalFlowDefaultsVersion",
 		_experimentalOpticalFlowDefaultsVersion);
@@ -1573,7 +1581,7 @@ void AppSettings::_SetDefaultScalingModes() noexcept {
 		xessFg.name = L"XeSSFG";
 		xessFg.effects.resize(2);
 		xessFg.effects[0].name = L"FrameRate_Filter";
-		xessFg.effects[1].name = L"XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV";
+		xessFg.effects[1].name = L"XeSSFG\\XeSS_FrameGeneration";
 	}
 	// DLSS Ray Reconstruction
 	{

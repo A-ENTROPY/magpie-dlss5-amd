@@ -105,8 +105,8 @@
 		<DataTemplate x:Key="EffectParametersFlyout"
 		              x:DataType="local:EffectParametersViewModel">
 			<ScrollViewer Width="{x:Bind ContentWidth, Mode=OneWay}"
-			              HorizontalScrollBarVisibility="Disabled"
-			              HorizontalScrollMode="Disabled"
+			              HorizontalScrollBarVisibility="Auto"
+			              HorizontalScrollMode="Enabled"
 			              VerticalScrollBarVisibility="Auto"
 			              VerticalScrollMode="Enabled">
 				<ItemsControl IsTabStop="False"

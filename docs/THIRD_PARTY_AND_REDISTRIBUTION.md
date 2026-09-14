@@ -27,7 +27,7 @@ This document is an engineering inventory, not legal advice. A component being d
 | NVIDIA DLSSNR experimental runtime | Locally supplied NVIDIA proprietary runtime; the tested file may be official or community-modified, and there is no public DLSSNR SDK contract | Do not commit `nvngx_dlssnr.dll`; configure it as a local build input | **Internal testing only until NVIDIA redistribution permission and GPL compatibility are reviewed** |
 | NVIDIA Optical Flow driver API | NVIDIA driver component plus locally supplied SDK-compatible headers | Do not commit or package `nvofapi64.dll`; load the installed display driver's copy from System32 | The driver DLL is not redistributed by this project; review any header provenance before publishing source |
 | NVIDIA Video Effects / Maxine runtime and models | NVIDIA proprietary and AI-product terms, plus bundled third-party notices | Do not commit wheel, models, SDK, or runtime binaries | **Unresolved/high risk; review the exact runtime/model terms and GPL compatibility before release** |
-| OptiScaler reference checkout | Reference only; not linked into Magpie | Do not copy its source or binaries without a separate review | Not part of the package |
+| OptiScaler-derived XeSSFG compatibility code | GPLv3 source adaptation from Coldwood1026/OptiScaler | Adapted source and attribution included; see XESSFG-COMPATIBILITY-NOTICE.md | Magpie binary includes the adapted code; retain GPLv3 and source attribution. OptiScaler DLLs are not bundled. |
 | Microsoft/Windows redistributable runtime files | Per Microsoft redistribution terms | Do not vendor development SDKs | Ship only files Microsoft marks redistributable and retain required notices |
 
 The controlling texts are the exact license files supplied with each SDK/runtime. The local development cache currently contains, among others:
@@ -81,3 +81,9 @@ The safe default for this experimental fork is:
 - [ ] 对该二进制履行 GPLv3 对应源码义务。
 - [ ] 含 NVIDIA 后端或 FSR4 绕过逻辑的包已经单独完成兼容性/权限审核。
 - [ ] 本地 SHA256SUMS.txt 记录各 Release 附件的准确哈希。
+
+## 0.6.8 XeSSFG source attribution / 源码来源
+
+The adapted compatibility code and pinned upstream source are recorded in [XESSFG-COMPATIBILITY-NOTICE.md](experimental/design/XESSFG-COMPATIBILITY-NOTICE.md), also included in the binary package. The shipped Intel runtime DLL remains unmodified on disk; compatibility changes occur in process memory. This inventory does not replace the separate vendor-term review required before public release.
+
+XeSSFG 兼容代码的固定来源、修改范围及 GPLv3 声明见上述文档，分发包同时携带该声明。Intel 运行库文件保持原始字节，兼容修改仅发生在进程内存中。此来源记录不替代正式发布前的厂商条款审核。

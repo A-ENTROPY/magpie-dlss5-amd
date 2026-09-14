@@ -4,7 +4,7 @@
 
 HDR 当前状态：旧配置页入口保持隐藏，新旧配置中的旧开关保持关闭；效果器选择器新增「HDR 组件」分类，仅显式转换链按节点启用 HDR 捕获／输出。见 [HDR 组件实施记录](reviews/20260908-v0.6.7-hdr-conversion-effects-plan.md)。
 
-当前 `0.6.7` 分支已合并到 `experimental` 开发主线，正在准备 [0.6.7 正式分发说明](../RELEASE_NOTES_v0.6.7-experimental.md)。主包、DLSSNR DLL 可选包和 NGX OTA 工具沿用 0.6.6 的附件结构；本地准备不包含上传或发布。见 [分发准备记录](reviews/20260910-v0.6.7-release-preparation.md)。
+`068` 已合并到 `experimental`，正在准备 [0.6.8 更新说明（Draft 待审核）](../RELEASE_NOTES_v0.6.8-experimental.md)。分发沿用 067 的完整主包、DLSSNR DLL 选项包和 NGX OTA 工具；本轮授权推送源码及创建 Draft，不发布。构建、附件及远端检查见 [0.6.8 分发准备记录](reviews/20260914-v0.6.8-release-preparation.md)。
 
 当前功能已包含 Beta 1–6 的全部迭代，见 [Beta 6 TODO](todos/20260910-v0.6.7-beta6-TODO.md)、[Reflex 驱动限帧](reviews/20260910-beta6-reflex-pacing.md)、[HDR 组件](reviews/20260908-v0.6.7-hdr-conversion-effects-plan.md) 与 [参数输入验证](testing/PARAMETER-INPUT.md)。历史 [Beta 6 说明](../RELEASE_NOTES_v0.6.7-beta6.md)、[Beta 1 说明](../RELEASE_NOTES_v0.6.7-beta1.md)、[0.6.6 说明](../RELEASE_NOTES_v0.6.6-experimental.md) 保留。
 
@@ -20,6 +20,7 @@ HDR 当前状态：旧配置页入口保持隐藏，新旧配置中的旧开关�
 
 ## 当前工作
 
+- [DLSSNR Multi Pass 残差时域稳定路线](design/20260914-dlssnr-temporal-stabilization-routes.md)：比较无光流／光流累积、快慢历史、稳健统计、分频与联合升采样，说明当前 068 串联实现的接入边界和验证顺序。
 - [v0.6.5 r8：参数状态、光流降级与 SR 入口收敛](todos/20260905-v0.6.5-r8-TODO.md)。
 - [r8 本地版本说明](../RELEASE_NOTES_v0.6.5-r8-local.md)。
 

@@ -1127,9 +1127,10 @@
   <data name="Message_AmdOpticalFlowUnsupported" xml:space="preserve"><value>AMD 光流暂未启动。请打开详情所列效果器，将光流设为“无”或“不使用”后重新启用；需要光流时，可尝试该效果器提供的其他方法。具体能力检查结果见详情和日志。</value></data>
   <data name="Message_OpticalFlowInteropFailed" xml:space="preserve"><value>光流所需的共享资源创建失败。请打开详情所列效果器，将光流设为“无”或“不使用”后重新启用；需要光流时，可尝试该效果器提供的其他方法。</value></data>
   <data name="Message_ConflictingFrameGenerationEffects" xml:space="preserve"><value>下方效果组包含多个补帧效果器。请在详情中查看实际冲突项，再打开该效果组，保留要使用的一项并移除其余补帧项，然后重新启用。</value></data>
-  <data name="Message_XeSSMfgRequiresIntel" xml:space="preserve"><value>XeSS 多帧生成 x3/x4 需要受支持的 Intel Arc 显卡。请在当前显卡上改用 XeSS 帧生成 x2。</value></data>
-  <data name="Message_XeSSMfgUnsupported" xml:space="preserve"><value>当前 Intel 显卡或驱动无法初始化 XeSS 多帧生成。请更新驱动，或改用 XeSS 帧生成 x2。</value></data>
-  <data name="Message_XeSSMfgMultiplierUnsupported" xml:space="preserve"><value>当前显卡或驱动不支持所选 XeSS 多帧生成倍率。请选择较低的 MFG 倍率，或改用 XeSS 帧生成 x2。</value></data>
+  <data name="Message_XeSSMfgOpticalFlowUnsupported" xml:space="preserve"><value>XeSSFG 3×/4×目前支持无光流或 AMD 光流。请选择对应光流方法，或在 NVIDIA 光流下使用 2×。</value></data>
+  <data name="Message_XeSSMfgCompatibilityUnavailable" xml:space="preserve"><value>当前运行库无法启用 XeSSFG 多帧兼容。请查看日志中的版本校验或初始化错误。</value></data>
+  <data name="Message_XeSSMfgUnsupported" xml:space="preserve"><value>当前显卡或驱动无法初始化 XeSSFG。请查看日志中的详细原因。</value></data>
+  <data name="Message_XeSSMfgMultiplierUnsupported" xml:space="preserve"><value>当前 XeSSFG 运行路径不支持所选倍率。</value></data>
   <data name="Home_Toolbar_Profiler.Header" xml:space="preserve"><value>性能监测</value></data>
   <data name="Home_Toolbar_Profiler_ShortcutControl.Title" xml:space="preserve"><value>性能监测</value></data>
   <data name="Home_Toolbar_EffectParameters.Header" xml:space="preserve"><value>打开／关闭实时参数面板</value></data>
@@ -1282,25 +1283,19 @@
   <data name="EffectParam_Sharpen_LumaSharpen_pattern_Label" xml:space="preserve"><value>采样模式</value></data>
   <data name="EffectParam_Sharpen_LumaSharpen_sharpClamp_Label" xml:space="preserve"><value>锐化限制</value></data>
   <data name="EffectParam_Sharpen_LumaSharpen_sharpStrength_Label" xml:space="preserve"><value>锐化强度</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_amdOpticalFlowMode_Label" xml:space="preserve"><value>光流质量</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_amdOpticalFlowMode_Option_0" xml:space="preserve"><value>性能</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_amdOpticalFlowMode_Option_1" xml:space="preserve"><value>质量</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Label" xml:space="preserve"><value>光流质量</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_1" xml:space="preserve"><value>性能</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_2" xml:space="preserve"><value>均衡（推荐）</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_3" xml:space="preserve"><value>质量</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_4" xml:space="preserve"><value>高质量（高开销）</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_opticalFlowMethod_Label" xml:space="preserve"><value>光流方法</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_opticalFlowMethod_Option_0" xml:space="preserve"><value>无</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_opticalFlowMethod_Option_1" xml:space="preserve"><value>AMD 光流</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_opticalFlowMethod_Option_2" xml:space="preserve"><value>NVIDIA 光流</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_amdOpticalFlowMode_Label" xml:space="preserve"><value>光流质量</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_amdOpticalFlowMode_Option_0" xml:space="preserve"><value>性能</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_amdOpticalFlowMode_Option_1" xml:space="preserve"><value>质量</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_multiplier_Label" xml:space="preserve"><value>帧数倍率</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_opticalFlowMethod_Label" xml:space="preserve"><value>光流方法</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_opticalFlowMethod_Option_0" xml:space="preserve"><value>无</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_MultiFrameGeneration_ZeroMV_opticalFlowMethod_Option_1" xml:space="preserve"><value>AMD 光流</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_amdOpticalFlowMode_Label" xml:space="preserve"><value>光流质量</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_amdOpticalFlowMode_Option_0" xml:space="preserve"><value>性能</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_amdOpticalFlowMode_Option_1" xml:space="preserve"><value>质量</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Label" xml:space="preserve"><value>光流质量</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_1" xml:space="preserve"><value>性能</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_2" xml:space="preserve"><value>均衡（推荐）</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_3" xml:space="preserve"><value>质量</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_4" xml:space="preserve"><value>高质量（高开销）</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_opticalFlowMethod_Label" xml:space="preserve"><value>光流方法</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_opticalFlowMethod_Option_0" xml:space="preserve"><value>无</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_opticalFlowMethod_Option_1" xml:space="preserve"><value>AMD 光流</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_opticalFlowMethod_Option_2" xml:space="preserve"><value>NVIDIA 光流</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_multiplier_Label" xml:space="preserve"><value>帧数倍率</value></data>
   <data name="Home_RecentIssue.Title" xml:space="preserve"><value>最近一次问题</value></data>
   <data name="Home_RecentIssue_Details.Content" xml:space="preserve"><value>查看详情</value></data>
   <data name="ErrorDetails_Title" xml:space="preserve"><value>问题详情</value></data>
@@ -1442,7 +1437,7 @@
   <data name="EffectParam_FSR3_FSR3_SR_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>最高质量（极高开销）</value></data>
   <data name="EffectParam_FSR4_FSR4_SR_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>最高质量（极高开销）</value></data>
   <data name="EffectParam_XeSS_XeSS_SR_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>最高质量（极高开销）</value></data>
-  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_x2_ZeroMV_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>最高质量（极高开销）</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_nvidiaOpticalFlowQuality_Option_5" xml:space="preserve"><value>最高质量（极高开销）</value></data>
   <data name="Motion_Nvidia_5" xml:space="preserve"><value>最高质量</value></data>
   <data name="Home_FrameSync.Header" xml:space="preserve"><value>帧同步</value></data>
   <data name="Home_FrameSync.Description" xml:space="preserve"><value>自动保存，重新启用缩放后生效。</value></data>
@@ -1640,8 +1635,8 @@
   <data name="Overlay_Parameters_Preview" xml:space="preserve"><value>预览</value></data>
   <data name="Overlay_Parameters_InputHint" xml:space="preserve"><value>Ctrl+单击滑条输入数值。Esc：编辑→预览→关闭；点击预览面板继续编辑。面板开关快捷键：</value></data>
   <data name="Overlay_Parameters_FocusFailed" xml:space="preserve"><value>请点击游戏窗口恢复控制</value></data>
-  <data name="Profile_General_ParameterFocusSwitching.Header" xml:space="preserve"><value>参数调整焦点切换</value></data>
-  <data name="Profile_General_ParameterFocusSwitching.Description" xml:space="preserve"><value>参数实时调整时启用焦点切换，但在部分窗口上运行时可能不稳定。</value></data>
+  <data name="Profile_Advanced_ParameterFocusSwitching.Header" xml:space="preserve"><value>参数调整焦点切换</value></data>
+  <data name="Profile_Advanced_ParameterFocusSwitching.Description" xml:space="preserve"><value>参数实时调整时启用焦点切换，但在部分窗口上运行时可能不稳定。</value></data>
   <data name="Home_Advanced_StopEffectsOnTaskSwitch.Header" xml:space="preserve"><value>切屏时自动停用生效效果组</value></data>
   <data name="Home_Advanced_StopEffectsOnTaskSwitch.Description" xml:space="preserve"><value>如果在使用 DLSSNR 时进行切屏，会让你感觉像吃了毒蘑菇，你可以尝试启用它。</value></data>
   <data name="EffectPicker_CustomSummary" xml:space="preserve"><value>自定义效果器；请参考作者说明。</value></data>
@@ -1668,4 +1663,16 @@
   <data name="EffectPicker_SearchAllCategories" xml:space="preserve"><value>搜索全部分类</value></data>
   <data name="EffectPicker_NoMatches" xml:space="preserve"><value>没有匹配的效果器</value></data>
   <data name="EffectPicker_NoMatchesDescription" xml:space="preserve"><value>尝试缩短关键词、搜索算法家族名，或选择“全部”查看已安装效果器。</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_multiPass_Label" xml:space="preserve"><value>Multi Pass</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_Group_DLSSNR____Pass_1" xml:space="preserve"><value>DLSSNR · Pass 1</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_Group_DLSSNR____Pass_2" xml:space="preserve"><value>DLSSNR · Pass 2</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_Group_DLSSNR____Pass_3" xml:space="preserve"><value>DLSSNR · Pass 3</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Label" xml:space="preserve"><value>抗闪烁</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_0" xml:space="preserve"><value>无</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_1" xml:space="preserve"><value>静态累积</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_2" xml:space="preserve"><value>光流累积</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_3" xml:space="preserve"><value>光流累积+</value></data>
+  <data name="EffectParam_DLSSNR_DLSSNR_AI_Filter_antiFlicker_Option_4" xml:space="preserve"><value>低频时域重建</value></data>
+  <data name="EffectParam_DLSSFG_DLSS_FrameGeneration_duplicateFrameFiltering_Label" xml:space="preserve"><value>重复帧过滤</value></data>
+  <data name="EffectParam_XeSSFG_XeSS_FrameGeneration_duplicateFrameFiltering_Label" xml:space="preserve"><value>重复帧过滤</value></data>
 </root>

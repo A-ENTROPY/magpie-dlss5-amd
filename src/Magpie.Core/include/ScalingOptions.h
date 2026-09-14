@@ -112,7 +112,7 @@ inline FrameGenerationEffectKind ClassifyFrameGenerationEffect(
 	if (name == "XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV") {
 		return FrameGenerationEffectKind::XeSSX2;
 	}
-	if (name == "XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV") {
+	if (name == "XeSSFG\\XeSS_FrameGeneration" || name == "XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV") {
 		return FrameGenerationEffectKind::XeSSMultiFrame;
 	}
 	return FrameGenerationEffectKind::None;
@@ -127,7 +127,7 @@ inline FrameGenerationEffectKind ClassifyFrameGenerationEffect(
 	if (name == L"XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV") {
 		return FrameGenerationEffectKind::XeSSX2;
 	}
-	if (name == L"XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV") {
+	if (name == L"XeSSFG\\XeSS_FrameGeneration" || name == L"XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV") {
 		return FrameGenerationEffectKind::XeSSMultiFrame;
 	}
 	return FrameGenerationEffectKind::None;
@@ -351,7 +351,8 @@ enum class ScalingError {
 	AmdOpticalFlowUnsupported,
 	OpticalFlowInteropFailed,
 	ConflictingFrameGenerationEffects,
-	XeSSMfgRequiresIntel,
+	XeSSMfgOpticalFlowUnsupported,
+	XeSSMfgCompatibilityUnavailable,
 	XeSSMfgUnsupported,
 	XeSSMfgMultiplierUnsupported,
 	ScalingModeNotSelected,

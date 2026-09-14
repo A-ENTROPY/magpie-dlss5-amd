@@ -44,7 +44,8 @@ static const wchar_t* MessageKey(ScalingError error) noexcept {
 	case ScalingError::AmdOpticalFlowUnsupported: return L"Message_AmdOpticalFlowUnsupported";
 	case ScalingError::OpticalFlowInteropFailed: return L"Message_OpticalFlowInteropFailed";
 	case ScalingError::ConflictingFrameGenerationEffects: return L"Message_ConflictingFrameGenerationEffects";
-	case ScalingError::XeSSMfgRequiresIntel: return L"Message_XeSSMfgRequiresIntel";
+	case ScalingError::XeSSMfgOpticalFlowUnsupported: return L"Message_XeSSMfgOpticalFlowUnsupported";
+	case ScalingError::XeSSMfgCompatibilityUnavailable: return L"Message_XeSSMfgCompatibilityUnavailable";
 	case ScalingError::XeSSMfgUnsupported: return L"Message_XeSSMfgUnsupported";
 	case ScalingError::XeSSMfgMultiplierUnsupported: return L"Message_XeSSMfgMultiplierUnsupported";
 	case ScalingError::ScalingModeNotSelected: return L"Message_ScalingModeNotSelected";

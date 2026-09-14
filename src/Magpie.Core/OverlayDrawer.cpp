@@ -632,8 +632,7 @@ void OverlayDrawer::_BuildFontIcons(const char* fontPath) noexcept {
 
 static std::string_view GetEffectDisplayName(const EffectDesc& effectDesc) noexcept {
 	// Match the picker aliases without changing saved IDs or effect filenames.
-	if (effectDesc.name == "XeSSFG\\XeSS_FrameGeneration_x2_ZeroMV") return "XeSS_FrameGeneration_x2";
-	if (effectDesc.name == "XeSSFG\\XeSS_MultiFrameGeneration_ZeroMV") return "XeSS_MultiFrameGeneration";
+	if (effectDesc.name == "XeSSFG\\XeSS_FrameGeneration") return "XeSS_FrameGeneration";
 	if (!effectDesc.sortName.empty()) {
 		return effectDesc.sortName;
 	}

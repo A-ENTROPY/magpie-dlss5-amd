@@ -69,6 +69,9 @@ public:
 	) noexcept override;
 
 	bool Draw(const NativeEffectDrawContext& context) noexcept override;
+	// A failed evaluation may retain legacy pass-through behavior for one pass.
+	// Serial chains must detect it and reject the entire frame.
+	bool IsHealthy() const noexcept;
 
 private:
 	// 仅在 MP_ENABLE_DLSSNR 构建中使用；无 SDK 的 CI 构建里 ClangCL -Werror 会报未使用

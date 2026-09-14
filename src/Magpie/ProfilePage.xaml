@@ -49,11 +49,6 @@
 						<ComboBoxItem x:Uid="Profile_General_AutoScale_Windowed" />
 					</ComboBox>
 				</local:SettingsCard>
-				<local:SettingsCard x:Uid="Profile_General_ParameterFocusSwitching" IsWrapEnabled="True">
-					<local:SettingsCard.HeaderIcon><FontIcon Glyph="&#xE9E9;" /></local:SettingsCard.HeaderIcon>
-					<ToggleSwitch x:Uid="ToggleSwitch"
-					              IsOn="{x:Bind ViewModel.IsParameterFocusSwitchingEnabled, Mode=TwoWay}" />
-				</local:SettingsCard>
 				<local:SettingsCard x:Uid="Profile_General_3DGameMode">
 					<local:SettingsCard.HeaderIcon>
 						<FontIcon Glyph="&#xE7FC;" />
@@ -392,6 +387,11 @@
 					</local:SettingsCard.HeaderIcon>
 					<ToggleSwitch x:Uid="ToggleSwitch"
 					              IsOn="{x:Bind ViewModel.IsDirectFlipDisabled, Mode=TwoWay}" />
+				</local:SettingsCard>
+				<local:SettingsCard x:Uid="Profile_Advanced_ParameterFocusSwitching" IsWrapEnabled="True">
+					<local:SettingsCard.HeaderIcon><FontIcon Glyph="&#xE9E9;" /></local:SettingsCard.HeaderIcon>
+					<ToggleSwitch x:Uid="ToggleSwitch"
+					              IsOn="{x:Bind ViewModel.IsParameterFocusSwitchingEnabled, Mode=TwoWay}" />
 				</local:SettingsCard>
 			</local:SettingsGroup>
 		</local:SimpleStackPanel>

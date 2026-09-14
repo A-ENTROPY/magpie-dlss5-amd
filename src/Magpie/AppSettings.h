@@ -37,6 +37,7 @@ struct _AppSettingsData {
 	uint32_t _experimentalDlssSrSettingsVersion = 1;
 	uint32_t _experimentalDepthRemovalVersion = 1;
 	uint32_t _experimentalOpticalFlowDefaultsVersion = 1;
+	uint32_t _experimentalXeSSFGSettingsVersion = 1;
 
 	// LocalizationService::SupportedLanguages 索引
 	// -1 表示使用系统设置

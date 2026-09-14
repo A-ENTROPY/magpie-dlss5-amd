@@ -5,6 +5,7 @@
 #include "NgxRuntimeGuard.h"
 #include "DLSSNRFilter.h"
 #include "DlssnrAmdBackend.h"
+#include "DLSSNRMultiPass.h"
 #include "DLSSSRUpscaler.h"
 #include "FSR2ZeroMVUpscaler.h"
 #include "FSR3ZeroMVUpscaler.h"
@@ -124,18 +125,25 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 			Logger::Get().Warn("DLSSNR: AMD runtime present but unusable; trying NGX");
 		}
 
-		auto backend = std::make_unique<DLSSNRFilter>();
+		// Upstream's own backend, which now carries the multipass and temporal work rather
+		// than the single-pass filter this used to construct.
+		auto backend = std::make_unique<DLSSNRMultiPass>();
 		Logger::DiagnosticCapture diagnostic;
-		if (!backend->Initialize(resources, ngxCore, input, output, settings)) {
+		if (!backend->Initialize(resources, ngxCore, input, output, option,
+			hdrEnabled && endpoint.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)) {
 			if (NgxRuntimeGuard::IsFaulted()) {
 				return { true, nullptr, ScalingError::NgxRestartRequired };
 			}
-			const char status[] =
-				"DLSSNR STATUS: Feature=18 created=false path=unavailable "
-				"fallback=pass-through\n";
+			const bool multiPass = DLSSNRPassCount([&](std::string_view name, float fallback) {
+				const auto it = option.parameters.find(std::string(name));
+				return it == option.parameters.end() ? fallback : it->second;
+			}) > 1;
+			const std::string status = fmt::format(
+				"DLSSNR STATUS: Feature=18 created=false path=unavailable fallback={}\n",
+				multiPass ? "none-multipass-rejected" : "pass-through");
 			Logger::Get().Warn(status);
-			OutputDebugStringA(status);
-			return { false, nullptr, ScalingError::NoError,
+			OutputDebugStringA(status.c_str());
+			return { multiPass, nullptr, ScalingError::NoError,
 				DescribeNativeFailure(resources, input, output, diagnostic), diagnostic.SystemError() };
 		}
 		return { true, std::move(backend) };

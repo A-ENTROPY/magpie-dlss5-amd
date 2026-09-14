@@ -1,5 +1,6 @@
 #pragma once
 #include "EffectDesc.h"
+#include "DLSSNRParameters.h"
 #include "CommonSharedConstants.h"
 #include <winrt/Windows.ApplicationModel.Resources.h>
 #include <winrt/Windows.ApplicationModel.Resources.Core.h>
@@ -36,7 +37,8 @@ struct EffectParameterLocalization {
 				} catch (...) { /* Missing third-party translations keep their source text. */ }
 			};
 			for (auto& parameter : parameters) {
-				const std::wstring key = prefix + KeyPart(parameter.name);
+				const std::wstring key = prefix + KeyPart(effect == "DLSSNR\\DLSSNR_AI_Filter"
+					? DLSSNRBaseParameter(parameter.name) : std::string_view(parameter.name));
 				translate(key + L"_Label", parameter.label);
 				if (!parameter.group.empty()) {
 					translate(prefix + L"Group_" + KeyPart(parameter.group), parameter.group);

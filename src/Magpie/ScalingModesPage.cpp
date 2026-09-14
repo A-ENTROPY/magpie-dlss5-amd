@@ -177,8 +177,8 @@ void ScalingModesPage::EffectParametersFlyout_Opening(
 	if (!parameters || !XamlRoot()) return;
 
 	// Leave room for presenter chrome and the root-bound popup margins. The
-	// view model keeps every visible group on screen by shrinking all columns
-	// together when the ideal 260-DIP layout cannot fit.
+	// view model sizes the viewport to the root. DLSSNR columns retain a
+	// readable minimum width and scroll horizontally when they cannot fit.
 	constexpr double FLYOUT_CHROME_AND_MARGIN = 72.0;
 	get_self<EffectParametersViewModel>(parameters)->UpdateLayoutWidth(
 		std::max(0.0, XamlRoot().Size().Width - FLYOUT_CHROME_AND_MARGIN));

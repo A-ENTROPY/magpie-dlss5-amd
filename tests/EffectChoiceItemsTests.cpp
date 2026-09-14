@@ -164,7 +164,7 @@ int main(int argc, char**) {
 		std::ifstream input("src/Magpie/EffectCatalog/zh-Hans.json", std::ios::binary);
 		const std::string bytes{std::istreambuf_iterator<char>(input), {}};
 		const auto entries = Windows::Data::Json::JsonObject::Parse(to_hstring(bytes)).GetNamedArray(L"effects");
-		assert(entries.Size() == 158);
+		assert(entries.Size() == 157);
 		size_t overflowing = 0;
 		for (const auto value : entries) {
 			const auto entry = value.GetObject();
@@ -194,7 +194,7 @@ int main(int argc, char**) {
 		assert(Magpie::EffectPickerDetailsWheelOffset(0, 200, 120) == 0);
 		assert(Magpie::EffectPickerDetailsWheelOffset(0, 0, -120) == 0);
 		assert(Magpie::EffectPickerDetailsWheelOffset(0, 200, -30) == 12);
-		std::cout << "Fixed details: 158 catalog entries at two widths, bottom-right overflow hint, short-content reset, Ctrl wheel routing and scroll boundaries passed.\n";
+		std::cout << "Fixed details: 157 catalog entries at two widths, bottom-right overflow hint, short-content reset, Ctrl wheel routing and scroll boundaries passed.\n";
 		manager.Close();
 		std::cout << "Real XAML: old ItemsSource throws E_INVALIDARG; fixed choices accept four values; production layout passes at four sizes, with 800-DIP height and fixed 200-DIP details.\n";
 	}

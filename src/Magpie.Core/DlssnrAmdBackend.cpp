@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "DlssnrAmdBackend.h"
+#include "FrameGuidanceD3D12Interop.h"
 #include "DeviceResources.h"
 #include "Logger.h"
 #include "Win32Helper.h"
@@ -319,9 +320,13 @@ Texture2D<float4> edited : register(t0);
 Texture2D<float4> baseline : register(t1);
 Texture2D<float4> historyResidual : register(t2);
 Texture2D<float4> historyGuide : register(t3);
+Texture2D<float2> motionField : register(t4);
 RWTexture2D<float4> nextResidual : register(u0);
 RWTexture2D<float4> nextGuide : register(u1);
-cbuffer Settings : register(b0) { uint w; uint h; float weight; uint historyValid; };
+cbuffer Settings : register(b0) {
+	uint w; uint h; float weight; uint historyValid;
+	uint useMotion; uint motionScaleXMilli; uint motionScaleYMilli;
+};
 
 float3 Guide(float3 c) { return c / (1 + abs(c)); }
 float MaxAbs(float3 v) { return max(abs(v.r), max(abs(v.g), abs(v.b))); }
@@ -338,27 +343,18 @@ void main(uint3 id : SV_DispatchThreadID)
 	bool finiteInput = all(isfinite(raw.rgb)) && all(isfinite(base.rgb));
 	float3 guide = finiteInput ? Guide(base.rgb) : 0;
 	nextGuide[p] = float4(guide, finiteInput ? 1 : 0);
-	if (!finiteInput) {
-		nextResidual[p] = 0;
-		return;
-	}
+	if (!finiteInput) { nextResidual[p] = 0; return; }
 
 	float3 current = raw.rgb - base.rgb;
 	float3 result = current;
 
 	if (historyValid != 0 && weight > 0) {
-		float error = 0;
-		float worst = 0;
-		bool valid = true;
+		// The range this frame's own neighbourhood spans; a carried edit may only persist as
+		// far as the picture allows it to.
 		float3 lo = current, hi = current;
 		[unroll] for (int y = -1; y <= 1; ++y)
 		[unroll] for (int x = -1; x <= 1; ++x) {
 			int2 n = clamp(p + int2(x, y), int2(0, 0), last);
-			float4 oldGuide = historyGuide.Load(int3(n, 0));
-			if (!all(isfinite(oldGuide.rgb)) || oldGuide.a < .999) { valid = false; continue; }
-			float e = MaxAbs(guide - oldGuide.rgb);
-			error += e / 9.0;
-			worst = max(worst, e);
 			float4 neighbour = edited.Load(int3(n, 0));
 			float4 neighbourBase = baseline.Load(int3(n, 0));
 			if (all(isfinite(neighbour.rgb)) && all(isfinite(neighbourBase.rgb))) {
@@ -367,22 +363,88 @@ void main(uint3 id : SV_DispatchThreadID)
 				hi = max(hi, residualN);
 			}
 		}
-		// Two tests, tight, as upstream has them: the mean disagreement over the patch and
-		// its worst sample. A single loose test lets the blend follow noise.
-		float q = (1 - smoothstep(.008, .04, error)) * (1 - smoothstep(.025, .10, worst));
-		float4 old = historyResidual.Load(int3(p, 0));
-		if (valid && q > 0 && all(isfinite(old.rgb)) && old.a >= .999) {
-			// The clamp is the whole point: an edit may only persist as far as this frame's
-			// own neighbourhood allows it to.
-			float3 margin = .02 + q * abs(old.rgb);
-			float3 safe = clamp(old.rgb, lo - margin, hi + margin);
-			result = lerp(current, safe, weight * q);
+
+		float3 old = 0;
+		float trust = 0;
+		bool haveHistory = false;
+		if (useMotion != 0) {
+			// Where was this pixel last frame, by the flow. Every tap is validated against
+			// the guide it was measured against before it counts: a tap whose neighbourhood
+			// has moved on must not leak into the blend. Upstream's own history gather.
+			float2 mv = motionField.Load(int3(p, 0));
+			float2 prev = float2(p) + (all(isfinite(mv)) ? mv : 0) *
+				float2(motionScaleXMilli, motionScaleYMilli) / 1000.0;
+			int2 baseP = int2(floor(prev));
+			float2 f = frac(prev);
+			[unroll] for (int y = 0; y < 2; ++y)
+			[unroll] for (int x = 0; x < 2; ++x) {
+				int2 n = clamp(baseP + int2(x, y), int2(0, 0), last);
+				float4 hg = historyGuide.Load(int3(n, 0));
+				float4 hr = historyResidual.Load(int3(n, 0));
+				if (!all(isfinite(hg.rgb)) || !all(isfinite(hr.rgb)) ||
+					hg.a < .999 || hr.a < .999) continue;
+				float wgt = (x ? f.x : 1 - f.x) * (y ? f.y : 1 - f.y);
+				float accept = 1 - smoothstep(.025, .10, MaxAbs(guide - hg.rgb));
+				old += wgt * accept * hr.rgb;
+				trust += wgt * accept;
+			}
+			haveHistory = trust >= .25;
+			if (haveHistory) {
+				old /= trust;
+				trust = min(trust, 1);
+			}
+		} else {
+			// No motion: the history is read where it is and trusted only where the guide
+			// still agrees, judged by the mean and the worst of the neighbourhood.
+			float error = 0, worst = 0;
+			bool valid = true;
+			[unroll] for (int y = -1; y <= 1; ++y)
+			[unroll] for (int x = -1; x <= 1; ++x) {
+				int2 n = clamp(p + int2(x, y), int2(0, 0), last);
+				float4 hg = historyGuide.Load(int3(n, 0));
+				if (!all(isfinite(hg.rgb)) || hg.a < .999) { valid = false; continue; }
+				float e = MaxAbs(guide - hg.rgb);
+				error += e / 9.0;
+				worst = max(worst, e);
+			}
+			float4 h = historyResidual.Load(int3(p, 0));
+			if (valid && all(isfinite(h.rgb)) && h.a >= .999) {
+				trust = (1 - smoothstep(.008, .04, error)) *
+					(1 - smoothstep(.025, .10, worst));
+				if (trust > 0) {
+					old = h.rgb;
+					haveHistory = true;
+				}
+			}
+		}
+
+		if (haveHistory) {
+			float3 margin = .02 + trust * abs(old);
+			float3 safe = clamp(old, lo - margin, hi + margin);
+			result = lerp(current, safe, weight * trust);
 		}
 	}
 
-	// Alpha carries validity, not opacity: a value nobody could trust must not be read as
-	// history next frame.
 	nextResidual[p] = float4(clamp(result, -65504, 65504), 1);
+}
+)";
+
+
+// The optical-flow resample. The vectors themselves are left unchanged; the packet's scale
+// fields convert their pixel scale, which is the convention the reference uses for exactly
+// this hand-off. The guide Magpie produces is in source pixels, current-to-previous.
+constexpr char kMotionShader[] = R"(
+Texture2D<float2> src : register(t0);
+RWTexture2D<float2> dst : register(u0);
+cbuffer Extent : register(b0) { uint w; uint h; uint sourceW; uint sourceH; };
+[numthreads(8, 8, 1)]
+void main(uint3 p : SV_DispatchThreadID)
+{
+	if (p.x >= w || p.y >= h) return;
+	if (sourceW == 0 || sourceH == 0) return;
+	uint2 q = min(uint2((float2(p.xy) + 0.5) * float2(sourceW, sourceH) / float2(w, h)),
+		uint2(sourceW - 1, sourceH - 1));
+	dst[p.xy] = src.Load(int3(q, 0));
 }
 )";
 
@@ -689,8 +751,22 @@ struct DlssnrAmdBackend::Impl {
 	bool temporalValid = false;
 
 	// What the effect asked for. Zero leaves the residual pass subtracting and nothing else,
-	// which is exactly what ran before any of this existed.
+	// which is exactly what ran before any of this existed. One is static accumulation, two
+	// and above reproject the history with optical flow.
 	int antiFlickerMode = 0;
+
+	// Optical flow, supplied by Magpie's provider and opened into this device through the
+	// same interop the NGX path uses. The engine is a temporal network: with no motion it
+	// aligns its history blindly wherever anything moves, which is what the residual flicker
+	// looked like before any of this existed.
+	std::unique_ptr<FrameGuidanceD3D12Interop> guidanceInterop;
+	winrt::com_ptr<ID3D12PipelineState> motionResample;
+	bool motionReady = false;
+	float motionScaleX = 1.0f, motionScaleY = 1.0f;
+	bool wantMotion = false;
+	// What this backend asks the renderer's guidance service for, mirrored back at it so the
+	// optical-flow provider actually runs for us.
+	MotionVectorRequest motionRequest{};
 
 	// Whether the network runs below the capture size. Not the same as the resolve path
 	// being in use: anti-flicker needs the resolve even at 100%.
@@ -759,7 +835,7 @@ struct DlssnrAmdBackend::Impl {
 	void BindTemporal(uint32_t slot, ID3D12Resource* edited, ID3D12Resource* nextResidual,
 		ID3D12Resource* nextGuide, ID3D12Resource* baselineTexture,
 		ID3D12Resource* historyResidualTexture,
-		ID3D12Resource* historyGuideTexture) noexcept;
+		ID3D12Resource* historyGuideTexture, ID3D12Resource* motionTexture) noexcept;
 	void CreateSrv(ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE where) noexcept;
 	bool RunTemporal(const NativeEffectDrawContext& context) noexcept;
 	void Dispatch(ID3D12PipelineState* pso, uint32_t slot) noexcept;
@@ -901,7 +977,8 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 	// Three, not two: the temporal pass reads a current guide and the guide it was
 	// accumulated against, so the second table carries t1 through t3. The conversions and
 	// the resolve declare only t1 and t2 and are unaffected.
-	D3D12_DESCRIPTOR_RANGE residualRange{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 1, 0, 0 };
+	// Four, not three: the temporal pass also reads the motion field it reprojects with.
+	D3D12_DESCRIPTOR_RANGE residualRange{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 1, 0, 0 };
 	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[2].DescriptorTable = { 1, &residualRange };
 	params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -974,7 +1051,9 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 		compile(kResolveShader, sizeof(kResolveShader) - 1, "resolve",
 			nullptr, resolve) &&
 		compile(kTemporalShader, sizeof(kTemporalShader) - 1, "temporal",
-			nullptr, temporal);
+			nullptr, temporal) &&
+		compile(kMotionShader, sizeof(kMotionShader) - 1, "motion resample",
+			nullptr, motionResample);
 }
 
 bool DlssnrAmdBackend::Impl::CreateSized(
@@ -1003,30 +1082,20 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 	// The network's extent. Everything the engine touches is built at this size, and at
 	// 100% it is the capture size, which is the path that shipped before the scale existed.
 	//
-	// The short side is held at 540 pixels, and that floor is measured rather than assumed.
-	// At 480x270 -- 25% of a 1080p capture -- two things go wrong at once. The engine's
-	// output falls to about a sixteenth of its input (probe: `frame in 0.4905, engine out
-	// 0.0312`, against 0.5873/0.5908 at full size), so the filter is not filtering. And its
-	// auto-exposure starts hunting: on a scene whose input mean sat between 0.490 and 0.502
-	// the exposure the engine chose swung between 0.645 and 0.925, a fifth of its own value,
-	// frame to frame. That is what reads as an old projector lamp breathing.
-	//
-	// 540 is the convention for the smallest frame this class of model is built for, and it
-	// has the useful property of landing both common captures inside the range that works:
-	// a 1080p capture stops at 50%, a 4K capture can reach 25% and still be 960x540.
-	constexpr uint32_t kMinimumNetworkShortSide = 540;
+	// The range is the reference's own: it clamps its model scale to a quarter at the least.
+	// This backend held the short side at 540 pixels for a while, which is stricter than the
+	// reference and was justified by two things that are both gone. One was a probe reading
+	// showing the engine's output collapsing to a sixteenth of its input at 480x270 -- that
+	// figure came from a readback sized for the capture rather than for the surface being
+	// read, so it measured uninitialised memory and meant nothing. The other was the engine's
+	// exposure hunting, which stopped when the host began supplying an exposure. Left in
+	// place it silently raised every request below half, which is what the user saw: 25%
+	// asked for, 50% applied, and a frame rate to match.
 	const uint32_t scaledW = uint32_t(float(w) * modelScale + 0.5f);
 	const uint32_t scaledH = uint32_t(float(h) * modelScale + 0.5f);
-	// The scale that would put the short side exactly on the floor, in ten-thousandths, so
-	// the two dimensions keep their aspect. The request is raised to meet it rather than
-	// being rejected, so asking for too small a frame still gives the smallest usable one.
-	const uint32_t shortSide = std::min(w, h);
-	const uint32_t floorScale = shortSide <= kMinimumNetworkShortSide ? 10000u
-		: uint32_t(uint64_t(kMinimumNetworkShortSide) * 10000u / shortSide);
-	netWidth = std::max(std::clamp(scaledW, 32u, w),
-		uint32_t(uint64_t(w) * floorScale / 10000u));
-	netHeight = std::max(std::clamp(scaledH, 32u, h),
-		uint32_t(uint64_t(h) * floorScale / 10000u));
+	netWidth = std::clamp(scaledW, 32u, w);
+	netHeight = std::clamp(scaledH, 32u, h);
+
 	downscaling = netWidth != w || netHeight != h;
 	// The resolve path runs whenever the network is smaller than the capture, and also when
 	// anti-flicker is on: the residual has to be extracted and composited somewhere, and that
@@ -1185,9 +1254,9 @@ void DlssnrAmdBackend::Impl::BindResolve(uint32_t slot, ID3D12Resource* srv,
 void DlssnrAmdBackend::Impl::BindTemporal(uint32_t slot, ID3D12Resource* edited,
 	ID3D12Resource* nextResidual, ID3D12Resource* nextGuide,
 	ID3D12Resource* baselineTexture, ID3D12Resource* historyResidualTexture,
-	ID3D12Resource* historyGuideTexture
+	ID3D12Resource* historyGuideTexture, ID3D12Resource* motionTexture
 ) noexcept {
-	// t0 and u0 through the usual pair, then u1 immediately after it, and the three sources
+	// t0 and u0 through the usual pair, then u1 immediately after it, and the four sources
 	// from t1 in the table that follows -- which is why this pass's second table starts at
 	// slot + 3 while the resolve's starts at slot + 2.
 	Bind(slot, edited, DXGI_FORMAT_R16G16B16A16_FLOAT, nextResidual,
@@ -1201,6 +1270,13 @@ void DlssnrAmdBackend::Impl::BindTemporal(uint32_t slot, ID3D12Resource* edited,
 	CreateSrv(baselineTexture, Cpu(slot + 3));
 	CreateSrv(historyResidualTexture, Cpu(slot + 4));
 	CreateSrv(historyGuideTexture, Cpu(slot + 5));
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC m{};
+	m.Format = DXGI_FORMAT_R16G16_FLOAT;
+	m.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	m.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	m.Texture2D.MipLevels = 1;
+	device12->CreateShaderResourceView(motionTexture, &m, Cpu(slot + 6));
 }
 
 // The residual for this frame: what the network changed, at the resolution it ran at, with
@@ -1229,9 +1305,15 @@ bool DlssnrAmdBackend::Impl::RunTemporal(const NativeEffectDrawContext& context)
 	Barrier(list.get(), historyGuide[to].get(), kStateShaderRead,
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	BindTemporal(12, net.get(), historyResidual[to].get(), historyGuide[to].get(),
-		baseline.get(), historyResidual[from].get(), historyGuide[from].get());
-	const UINT constants[4]{ netWidth, netHeight, weightMilli, hasHistory ? 1u : 0u };
-	DispatchSized(temporal.get(), 12, netWidth, netHeight, 15, constants, 4);
+		baseline.get(), historyResidual[from].get(), historyGuide[from].get(),
+		motion.get());
+	// Modes two and above reproject the history with the flow; one is static accumulation.
+	const uint32_t useMotion =
+		antiFlickerMode >= 2 && motionReady ? 1u : 0u;
+	const UINT constants[7]{ netWidth, netHeight, weightMilli, hasHistory ? 1u : 0u,
+		useMotion,
+		uint32_t(motionScaleX * 1000.0f), uint32_t(motionScaleY * 1000.0f) };
+	DispatchSized(temporal.get(), 12, netWidth, netHeight, 15, constants, 7);
 	Barrier(list.get(), historyResidual[to].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 		kStateShaderRead);
 	Barrier(list.get(), historyGuide[to].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1430,11 +1512,14 @@ bool DlssnrAmdBackend::Initialize(
 	// so every non-zero request is served as mode 1 -- static accumulation, the route
 	// upstream's design document names as needing no motion. Said out loud, because a
 	// setting that quietly does something else is worse than one that says so.
-	p.antiFlickerMode = antiFlickerMode != 0 ? 1 : 0;
-	if (antiFlickerMode > 1) {
-		Logger::Get().Warn(fmt::format(
-			"DLSSNR AMD: anti-flicker mode {} needs optical flow; serving it as static "
-			"accumulation", antiFlickerMode));
+	// One is static accumulation; two and above reproject the carried residual with optical
+	// flow, which now exists here. The route is kept as asked rather than collapsed to one,
+	// and the pass branches on it.
+	p.antiFlickerMode = std::clamp(antiFlickerMode, 0, 4);
+	if (p.antiFlickerMode >= 2 && !p.wantMotion) {
+		Logger::Get().Warn(
+			"DLSSNR AMD: anti-flicker uses optical flow but no motion was requested; "
+			"serving it as static accumulation");
 	}
 	// Recorded, not yet acted on. The engine's fields are still written from this
 	// backend's own constants because mapping Magpie's parameter names onto them one-to-one
@@ -1547,6 +1632,23 @@ bool DlssnrAmdBackend::Initialize(
 		return false;
 	}
 
+	// The motion guide's crossing from D3D11 to this device, the same boundary the NGX path
+	// uses. It is created once; each frame either updates it with this frame's guidance or
+	// leaves the engine on a zero field.
+#ifdef MP_ENABLE_AMD_OPTICAL_FLOW
+	p.wantMotion = settings.motionRequest.method != OpticalFlowMethod::None;
+#else
+	// The provider is compiled out of this build; the guidance service would fail the whole
+	// session if asked for it.
+	p.wantMotion = false;
+#endif
+	p.motionRequest = settings.motionRequest;
+	p.guidanceInterop = std::make_unique<FrameGuidanceD3D12Interop>();
+	if (!p.guidanceInterop->Initialize(p.device12.get(), p.fence.get())) {
+		Logger::Get().Error("DLSSNR AMD: guidance interop failed to initialise");
+		return false;
+	}
+
 	if (!p.LoadRuntime() || !p.CreateHip() || !p.CreatePipeline()) {
 		return false;
 	}
@@ -1564,11 +1666,11 @@ bool DlssnrAmdBackend::Initialize(
 	const float appliedScale = float(p.netWidth) / float(inputDesc.Width);
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD: engine up on HIP device {}; {}x{} {} -> {}, network at {}x{} "
-		"(requested {:.2f}, applied {:.2f}), anti-flicker {}",
+		"(requested {:.2f}, applied {:.2f}), anti-flicker={}, motion={}",
 		p.hipDevice, inputDesc.Width, inputDesc.Height,
 		(uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format,
-		p.netWidth, p.netHeight, p.modelScale, appliedScale,
-		p.antiFlickerMode ? "static accumulation" : "off"));
+		p.netWidth, p.netHeight, p.modelScale, appliedScale, p.antiFlickerMode,
+		p.wantMotion ? "optical-flow" : "none"));
 	return true;
 }
 
@@ -1727,6 +1829,25 @@ float DlssnrAmdBackend::Impl::Measure(
 	return count ? float(sum / double(count)) : -1.0f;
 }
 
+FrameGuidanceRequirements DlssnrAmdBackend::GetFrameGuidanceRequirements() const noexcept {
+	if (!_impl || _impl->failed) {
+		return {};
+	}
+#ifdef MP_ENABLE_AMD_OPTICAL_FLOW
+	// The zero view too, the way upstream asks for it: the temporal pass wants a valid zero
+	// field to fall back to when the real one is not produced for a frame.
+	FrameGuidanceRequirements result{ .zero = true };
+	result.Add(_impl->motionRequest);
+	return result;
+#else
+	// This build compiles the AMD optical flow provider as a stub, so asking for motion
+	// makes the renderer's guidance service fail its initialization and abort the whole
+	// scaling session. Asking for nothing keeps the session running exactly as it did
+	// before any of this existed.
+	return {};
+#endif
+}
+
 bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	auto& p = *_impl;
 	if (!p.ready || p.failed || !context.input || !context.output) {
@@ -1806,6 +1927,42 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			kStateShaderRead);
 		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
 			kStateShaderRead);
+	}
+
+	// ---- 1c. the motion guide ----
+	// Magpie's frame guidance carries motion vectors in source pixels from its optical-flow
+	// provider, and the engine's temporal machinery wants them: with zero motion its history
+	// alignment is wrong wherever anything moves. The guidance is resampled to the network's
+	// extent with the vectors unchanged, and the packet below converts their pixel scale --
+	// the reference's own convention for this exact hand-off.
+	p.motionReady = false;
+	if (p.wantMotion) {
+		const FrameGuidanceExtent extent{ p.width, p.height };
+		const FrameGuidanceView guidance = SelectFrameGuidanceChannels(
+			context.frameGuidance, context.zeroFrameGuidance, context.frameId,
+			extent, true);
+		winrt::com_ptr<ID3D11DeviceContext4> context4;
+		p.context11->QueryInterface(IID_PPV_ARGS(context4.put()));
+		if (context4 && p.guidanceInterop->WaitForProducer(context4.get(), guidance) &&
+			p.guidanceInterop->Update(guidance, context.frameId, extent)) {
+			const uint32_t sourceW = guidance.motion.metadata.sourceExtent.width;
+			const uint32_t sourceH = guidance.motion.metadata.sourceExtent.height;
+			p.guidanceInterop->Transition(p.list.get(), D3D12_RESOURCE_STATE_COMMON,
+				kStateShaderRead);
+			Barrier(p.list.get(), p.motion.get(), kStateShaderRead,
+				D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+			p.Bind(20, p.guidanceInterop->Motion(), DXGI_FORMAT_R16G16_FLOAT,
+				p.motion.get(), DXGI_FORMAT_R16G16_FLOAT);
+			const UINT dims[4]{ p.netWidth, p.netHeight, sourceW, sourceH };
+			p.DispatchSized(p.motionResample.get(), 20, p.netWidth, p.netHeight, 0, dims);
+			Barrier(p.list.get(), p.motion.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+				kStateShaderRead);
+			p.guidanceInterop->Transition(p.list.get(), kStateShaderRead,
+				D3D12_RESOURCE_STATE_COMMON);
+			p.motionScaleX = float(p.netWidth) / float(std::max(sourceW, 1u));
+			p.motionScaleY = float(p.netHeight) / float(std::max(sourceH, 1u));
+			p.motionReady = true;
+		}
 	}
 
 	// Diagnostic A/B: with this file present the engine is skipped entirely and the
@@ -1955,8 +2112,11 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// Its adaptation is not stable; the measurements are on kExposureValue.
 	packet.exposure = p.exposureTexture.get();
 	packet.exposureState = kPacketState;
-	packet.scaleX = 1.0f;
-	packet.scaleY = 1.0f;
+	// The motion field's pixel scale relative to the network's, as the reference computes
+	// it when it resamples motion for the engine. Without a motion guide these stay at one,
+	// where they have always been.
+	packet.scaleX = p.motionReady ? p.motionScaleX : 1.0f;
+	packet.scaleY = p.motionReady ? p.motionScaleY : 1.0f;
 
 	// No transitions here. The engine is handed shader-readable surfaces, exactly as the
 	// reference hands it shader-readable surfaces, and it deals with hazards itself.
@@ -2070,6 +2230,11 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			p.failed = true;
 			return true;
 		}
+	}
+	// The frame's last signal: the guidance textures may be reused by the producer once this
+	// value is reached, so the interop is told it before the next frame can Update.
+	if (p.guidanceInterop) {
+		p.guidanceInterop->MarkSubmitted(signal2);
 	}
 
 	p.context11->CopyResource(context.output, p.sharedOut11.get());

@@ -32,6 +32,11 @@ public:
 	// machine without them reports the effect as unavailable instead of failing late.
 	static bool IsAvailable() noexcept;
 
+	// The renderer only produces frame guidance -- real and zero -- for backends that
+	// declare a need for it. Without this the guidance service never runs optical flow for
+	// us, which is why the first motion attempt saw empty views for both.
+	FrameGuidanceRequirements GetFrameGuidanceRequirements() const noexcept override;
+
 	bool Initialize(
 		DeviceResources& resources,
 		ID3D11Texture2D* input,

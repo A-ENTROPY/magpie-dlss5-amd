@@ -127,22 +127,39 @@ using HipSetFn = int (*)(int);
 constexpr char kConvertInShader[] = R"(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
-
+#ifdef SRGB_IN
+float3 SrgbToLinear(float3 v) {
+	return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
+}
+#endif
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-	dst[id.xy] = src.Load(int3(id.xy, 0));
+	float4 v = src.Load(int3(id.xy, 0));
+#ifdef SRGB_IN
+	v.rgb = SrgbToLinear(v.rgb);
+#endif
+	dst[id.xy] = v;
 }
 )";
 
 constexpr char kConvertOutShader[] = R"(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
-
+#ifdef SRGB_IN
+float3 LinearToSrgb(float3 v) {
+	v = max(v, 0);
+	return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+#endif
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-	dst[id.xy] = src.Load(int3(id.xy, 0));
+	float4 v = src.Load(int3(id.xy, 0));
+#ifdef SRGB_IN
+	v.rgb = LinearToSrgb(v.rgb);
+#endif
+	dst[id.xy] = v;
 }
 )";
 
@@ -511,7 +528,13 @@ struct DlssnrAmdBackend::Impl {
 	winrt::com_ptr<ID3D12DescriptorHeap> heap;
 	winrt::com_ptr<ID3D12RootSignature> root;
 	winrt::com_ptr<ID3D12PipelineState> convertIn;
+	winrt::com_ptr<ID3D12PipelineState> convertInSrgb;
 	winrt::com_ptr<ID3D12PipelineState> convertOut;
+	winrt::com_ptr<ID3D12PipelineState> convertOutSrgb;
+
+	// Whether Magpie's frame is handed to the engine as linear values rather than as the
+	// sRGB-encoded ones it arrives in. Read from the ini so it can be A/B'd without a build.
+	bool srgbInput = true;
 	winrt::com_ptr<ID3D12PipelineState> downsample;
 	winrt::com_ptr<ID3D12PipelineState> resolve;
 	uint32_t descriptorStride = 0;
@@ -725,9 +748,10 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 
 	// The two ends of the conversion, one pipeline each.
 	auto compile = [&](const char* source, size_t length, const char* name,
+		const D3D_SHADER_MACRO* macros,
 		winrt::com_ptr<ID3D12PipelineState>& out) -> bool {
 		winrt::com_ptr<ID3DBlob> cs, csError;
-		if (FAILED(D3DCompile(source, length, name, nullptr, nullptr, "main",
+		if (FAILED(D3DCompile(source, length, name, macros, nullptr, "main",
 			"cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, cs.put(), csError.put()))) {
 			Logger::Get().Error(fmt::format("DLSSNR AMD: {} shader failed: {}", name,
 				csError ? static_cast<const char*>(csError->GetBufferPointer()) : "?"));
@@ -740,13 +764,23 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 			IID_PPV_ARGS(out.put())));
 	};
 
+	// The conversions exist twice: once passing the frame through untouched and once
+	// decoding sRGB on the way in and encoding it on the way out. Which one runs is a
+	// setting, because whether the engine wants linear input is a question about the
+	// picture that only a real frame can answer.
+	const D3D_SHADER_MACRO srgbMacros[] = { { "SRGB_IN", "1" }, { nullptr, nullptr } };
 	return compile(kConvertInShader, sizeof(kConvertInShader) - 1, "convert in",
-			convertIn) &&
+			nullptr, convertIn) &&
+		compile(kConvertInShader, sizeof(kConvertInShader) - 1, "convert in linear",
+			srgbMacros, convertInSrgb) &&
 		compile(kConvertOutShader, sizeof(kConvertOutShader) - 1, "convert out",
-			convertOut) &&
+			nullptr, convertOut) &&
+		compile(kConvertOutShader, sizeof(kConvertOutShader) - 1, "convert out linear",
+			srgbMacros, convertOutSrgb) &&
 		compile(kDownsampleShader, sizeof(kDownsampleShader) - 1, "downsample",
-			downsample) &&
-		compile(kResolveShader, sizeof(kResolveShader) - 1, "resolve", resolve);
+			nullptr, downsample) &&
+		compile(kResolveShader, sizeof(kResolveShader) - 1, "resolve",
+			nullptr, resolve);
 }
 
 bool DlssnrAmdBackend::Impl::CreateSized(
@@ -1129,6 +1163,25 @@ bool DlssnrAmdBackend::Initialize(
 	p.modelScale = settings.enableInputResolutionScaling
 		? float(std::clamp<uint32_t>(settings.inputResolutionPercent, 25, 100)) / 100.0f
 		: 1.0f;
+
+	// Whether the frame goes to the engine as linear values or exactly as it arrives.
+	//
+	// The engine's own residual shader decodes sRGB and re-encodes it around the edit, which
+	// only comes out as the identity if what it is given is linear to begin with; and the
+	// reference states the same of its own path -- "color composition is adapted to
+	// pre-exposed linear input". Magpie's eight-bit SDR frame is sRGB-encoded, so the two
+	// only line up if something converts. Read from the runtime's ini under a key it does
+	// not know, so the answer can come from a frame rather than from a rebuild:
+	//
+	//   [DlssNrOnAmd]
+	//   SrgbInput=0
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		p.srgbInput =
+			GetPrivateProfileIntW(L"DlssNrOnAmd", L"SrgbInput", 1, iniPath.c_str()) != 0;
+	}
+	Logger::Get().Info(fmt::format("DLSSNR AMD: srgb input {}",
+		p.srgbInput ? "yes" : "no"));
 	// The engine module stays loaded across effect rebuilds and keeps its history, so a
 	// new backend instance always starts by invalidating it.
 	p.resetHistory = true;
@@ -1379,7 +1432,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		p.Bind(2, p.sharedIn12.get(), p.inputFormat, p.full.get(),
 			DXGI_FORMAT_R16G16B16A16_FLOAT);
-		p.Dispatch(p.convertIn.get(), 2);
+		p.Dispatch(p.srgbInput ? p.convertInSrgb.get() : p.convertIn.get(), 2);
 		Barrier(p.list.get(), p.sharedIn12.get(), kStateShaderRead, kCommon);
 		Barrier(p.list.get(), p.full.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
@@ -1443,7 +1496,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		// a reduced scale is the wrong size for this and would be a format-sized mismatch.
 		p.Bind(6, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
-		p.Dispatch(p.convertOut.get(), 6);
+		p.Dispatch(p.srgbInput ? p.convertOutSrgb.get() : p.convertOut.get(), 6);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kCommon);
 		p.list->Close();
@@ -1656,7 +1709,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		p.Bind(6, picture, DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
-		p.Dispatch(p.convertOut.get(), 6);
+		p.Dispatch(p.srgbInput ? p.convertOutSrgb.get() : p.convertOut.get(), 6);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kCommon);
 	}

@@ -543,6 +543,8 @@ struct DlssnrAmdBackend::Impl {
 	winrt::com_ptr<ID3D12Resource> probe;
 	uint64_t probeBytes = 0;
 	bool probed = false;
+	// TEMPORARY DIAGNOSTIC: how many frames of the series have been logged.
+	int probeSamples = 0;
 
 	uint32_t width = 0, height = 0;
 
@@ -574,7 +576,7 @@ struct DlssnrAmdBackend::Impl {
 	bool WaitForEngine(uint64_t deadlineMs) noexcept;
 	void DestroySized() noexcept;
 	float Measure(ID3D12Resource* res, DXGI_FORMAT format,
-		D3D12_RESOURCE_STATES before) noexcept;
+		D3D12_RESOURCE_STATES before, uint64_t* nonFinite = nullptr) noexcept;
 };
 
 bool DlssnrAmdBackend::Impl::LoadRuntime() noexcept {
@@ -1200,14 +1202,26 @@ bool DlssnrAmdBackend::Resize(
 }
 
 float DlssnrAmdBackend::Impl::Measure(
-	ID3D12Resource* res, DXGI_FORMAT format, D3D12_RESOURCE_STATES before
+	ID3D12Resource* res, DXGI_FORMAT format, D3D12_RESOURCE_STATES before,
+	uint64_t* nonFinite
 ) noexcept {
 	// Only ever called on the first frame. Reading a texture back means a copy, a
 	// submit and a wait, which is far too much per frame -- but once, it is the
 	// difference between knowing which stage emitted an empty picture and guessing.
 	const uint32_t bpp = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
-	const uint64_t rowPitch = uint64_t(width) * bpp;
-	const uint64_t total = rowPitch * height;
+	// The resource's own extent, not the capture's. This used to read `width`/`height` --
+	// the capture size -- which is correct only while nothing is scaled. Once the network
+	// runs at a reduced size the copy below asked for a region larger than the source, which
+	// is an invalid copy that leaves the readback buffer partly uninitialised, and half-float
+	// interpretation of uninitialised bytes is NaN. Every "engine out" figure measured at a
+	// reduced scale before this fix was therefore meaningless, including the reading that
+	// made the engine's output look a quarter of its input.
+	const D3D12_RESOURCE_DESC measured = res->GetDesc();
+	// Rounded up to the 256-byte alignment a placed footprint requires; without that an odd
+	// width would make every measurement at that size an invalid copy.
+	const uint64_t rowPitch = (uint64_t(measured.Width) * bpp + 255) / 256 * 256;
+	const uint64_t total = rowPitch * measured.Height;
+	const uint32_t mw = uint32_t(measured.Width), mh = measured.Height;
 
 	if (!probe || probeBytes < total) {
 		probe = nullptr;
@@ -1243,8 +1257,8 @@ float DlssnrAmdBackend::Impl::Measure(
 	dst.pResource = probe.get();
 	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	dst.PlacedFootprint.Footprint.Format = format;
-	dst.PlacedFootprint.Footprint.Width = width;
-	dst.PlacedFootprint.Footprint.Height = height;
+	dst.PlacedFootprint.Footprint.Width = mw;
+	dst.PlacedFootprint.Footprint.Height = mh;
 	dst.PlacedFootprint.Footprint.Depth = 1;
 	dst.PlacedFootprint.Footprint.RowPitch = (UINT)rowPitch;
 	list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
@@ -1271,14 +1285,24 @@ float DlssnrAmdBackend::Impl::Measure(
 	}
 	double sum = 0;
 	uint64_t count = 0;
+	// Non-finite samples are counted, not averaged. Letting one through turns the whole mean
+	// into NaN, which says only "something somewhere was not a number" and hides how much of
+	// the surface that was.
+	uint64_t bad = 0;
 	if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
 		const uint16_t* p16 = static_cast<const uint16_t*>(mapped);
-		for (uint64_t i = 0; i < total / 2; ++i) { sum += HalfToFloat(p16[i]); ++count; }
+		for (uint64_t i = 0; i < total / 2; ++i) {
+			const float v = HalfToFloat(p16[i]);
+			if (std::isfinite(v)) { sum += v; ++count; } else { ++bad; }
+		}
 	} else {
 		const uint8_t* p8 = static_cast<const uint8_t*>(mapped);
 		for (uint64_t i = 0; i < total; ++i) { sum += p8[i] / 255.0; ++count; }
 	}
 	probe->Unmap(0, nullptr);
+	if (nonFinite) {
+		*nonFinite = bad;
+	}
 	return count ? float(sum / double(count)) : -1.0f;
 }
 
@@ -1618,26 +1642,25 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 
 	p.context11->CopyResource(context.output, p.sharedOut11.get());
 
-	// One measurement, a few frames in. Not the first frame: the engine loads kernels
-	// and starts its temporal accumulation on the opening jobs, so its first output is
-	// not representative -- measuring there reported a zero for a run that visibly
-	// worked. The tenth frame is past that. Three places an empty picture could come
-	// from -- the frame never arriving, the engine, or the conversion back out -- and
-	// these means say which. The fourth candidate, the conversion into the engine,
-	// cannot be measured here any more: the engine reads and writes one texture, so
-	// there is no pre-engine reading to take without a second stall. The bypass probe
-	// covers it instead.
-	if (!p.probed && p.framesSeen >= 10) {
-		p.probed = true;
+	// TEMPORARY DIAGNOSTIC -- remove once the brightness wobble is pinned down.
+	//
+	// Twelve consecutive frames' means instead of one sample. A single reading cannot tell a
+	// steady picture from one that is breathing; a run of them can, and the three points
+	// separate the frame arriving from the engine's own output from what finally leaves, so
+	// whichever of the three is swinging is where to look. Readbacks stall the queue, which
+	// is why this is a short window and not a permanent per-frame reading.
+	if (p.probeSamples < 12 && p.framesSeen >= 10) {
+		const int n = p.probeSamples++;
+		uint64_t badIn = 0, badNet = 0, badOut = 0;
 		const float inMean = p.Measure(p.sharedIn12.get(), p.inputFormat,
-			D3D12_RESOURCE_STATE_COMMON);
-		const float outMean = p.Measure(p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
-			kStateShaderRead);
-		const float finalMean = p.Measure(p.sharedOut12.get(), p.outputFormat,
-			D3D12_RESOURCE_STATE_COMMON);
+			D3D12_RESOURCE_STATE_COMMON, &badIn);
+		const float netMean = p.Measure(p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+			kStateShaderRead, &badNet);
+		const float outMean = p.Measure(p.sharedOut12.get(), p.outputFormat,
+			D3D12_RESOURCE_STATE_COMMON, &badOut);
 		Logger::Get().Info(fmt::format(
-			"DLSSNR AMD probe: frame in {:.4f}, engine out {:.4f}, "
-			"picture out {:.4f}", inMean, outMean, finalMean));
+			"DLSSNR AMD series {:2d}: in {:.4f}(bad {}) net {:.4f}(bad {}) out {:.4f}(bad {})",
+			n, inMean, badIn, netMean, badNet, outMean, badOut));
 	}
 	return true;
 }

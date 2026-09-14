@@ -148,7 +148,13 @@ Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
 #ifdef SRGB_IN
 float3 LinearToSrgb(float3 v) {
-	v = max(v, 0);
+	// The target here is eight bits, so anything above white is already white. Letting it
+	// through does not preserve it: the encode keeps stretching the top of the range, and
+	// what should be a soft roll-off becomes a flat clipped patch -- the blown highlights
+	// this was reported as. Upstream's temporal filter saturates for the same reason
+	// (`Output = ... Hdr ? clamp(color,-65504,65504) : saturate(color)`), and the FP16
+	// output path never reaches this shader.
+	v = saturate(v);
 	return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
 }
 #endif

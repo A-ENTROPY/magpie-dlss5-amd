@@ -148,14 +148,28 @@ constexpr char kConvertOutShader[] = R"(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
 #ifdef SRGB_IN
+cbuffer Settings : register(b0) { uint shoulderMilli; };
+
+float3 DisplayShoulder(float3 v) {
+	// The target is eight bits: encoded 1.0 is 255, so any linear value above 1.0 clips to
+	// flat white and the detail inside highlights is gone. A roll-off above 1.0 cannot
+	// help -- the encode still pushes it past 255 -- so the top of the linear range is
+	// remapped into the display range instead. Everything below the anchor is untouched;
+	// above it the value compresses smoothly toward 1.0. The slope just above the anchor
+	// is made to equal the slope below it, so there is no seam, and the mapping is
+	// monotonic, so the brightest pixels keep their ordering. Linear 1.0 lands near 0.925
+	// with the default anchor, and a value of 10 lands near 0.998, instead of everything
+	// above 1.0 sharing the same flat 255.
+	const float k = max(shoulderMilli, 10u) / 1000.0;
+	const float s = k / (1.0 - k);   // the slope needed for a C1 join at the anchor
+	v = max(v, 0);
+	float3 t = (v - k) / max(v, 1e-6);      // 0 at the anchor, -> 1 at infinity
+	float3 g = t / (t + (1.0 - t) / s);     // -> 0 at t=0, -> 1 at t=1
+	return lerp(v, k + (1.0 - k) * g, saturate(t * 1000.0));
+}
+
 float3 LinearToSrgb(float3 v) {
-	// The target here is eight bits, so anything above white is already white. Letting it
-	// through does not preserve it: the encode keeps stretching the top of the range, and
-	// what should be a soft roll-off becomes a flat clipped patch -- the blown highlights
-	// this was reported as. Upstream's temporal filter saturates for the same reason
-	// (`Output = ... Hdr ? clamp(color,-65504,65504) : saturate(color)`), and the FP16
-	// output path never reaches this shader.
-	v = saturate(v);
+	v = DisplayShoulder(v);
 	return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
 }
 #endif
@@ -727,6 +741,11 @@ struct DlssnrAmdBackend::Impl {
 	// Whether Magpie's frame is handed to the engine as linear values rather than as the
 	// sRGB-encoded ones it arrives in. Read from the ini so it can be A/B'd without a build.
 	bool srgbInput = true;
+
+	// The anchor of the output shoulder, in thousandths of linear. Lower preserves more
+	// highlight structure at the cost of dimming the top of the range; the reason it is a
+	// setting rather than a constant is on the conversion shader.
+	uint32_t shoulderMilli = 850;
 
 	// How large an edit the resolve will apply, in thousandths of the local magnitude.
 	// Lower is calmer; the reason it is a setting rather than a constant is on the shader.
@@ -1574,6 +1593,12 @@ bool DlssnrAmdBackend::Initialize(
 			iniPath.c_str());
 		p.editBoundMilli = static_cast<uint32_t>(std::clamp(bound, 5, 1000));
 	}
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		const int shoulder = GetPrivateProfileIntW(L"DlssNrOnAmd", L"HighlightShoulder",
+			850, iniPath.c_str());
+		p.shoulderMilli = static_cast<uint32_t>(std::clamp(shoulder, 50, 990));
+	}
 	Logger::Get().Info(fmt::format("DLSSNR AMD: edit bound {} / 1000", p.editBoundMilli));
 	// The engine module stays loaded across effect rebuilds and keeps its history, so a
 	// new backend instance always starts by invalidating it.
@@ -1986,6 +2011,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		// a reduced scale is the wrong size for this and would be a format-sized mismatch.
 		p.Bind(6, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
+		p.list->SetComputeRoot32BitConstants(1, 1, &p.shoulderMilli, 0);
 		p.Dispatch(p.srgbInput ? p.convertOutSrgb.get() : p.convertOut.get(), 6);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kCommon);
@@ -2212,6 +2238,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		p.Bind(6, picture, DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
+		p.list->SetComputeRoot32BitConstants(1, 1, &p.shoulderMilli, 0);
 		p.Dispatch(p.srgbInput ? p.convertOutSrgb.get() : p.convertOut.get(), 6);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kCommon);

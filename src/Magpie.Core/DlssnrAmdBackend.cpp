@@ -937,7 +937,22 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	At<uint8_t>(runtime, kRvaEnabled) = 1;
 	At<uint8_t>(runtime, kRvaUseFsrInputs) = 1;
 	At<uint8_t>(runtime, kRvaUseDepth) = 0;
-	At<int>(runtime, kRvaTonemap) = -1;
+
+	// Deliberately *not* written: the tonemap mode at +0x76e20.
+	//
+	// The reference pins it to -1, "auto tonemap by input format", and this backend copied
+	// that. But the runtime reads the same field from its own ini in DllMain, so writing it
+	// here overrides whatever the file says -- the same trap the inline and interop flags
+	// turned out to be. Left alone, the engine's own default for a missing key is -1, which
+	// is what this wrote anyway, so a default install is unaffected and
+	// `[DlssNrOnAmd] Tonemap=<n>` in dlssnr_on_amd.ini now has the last word.
+	//
+	// This matters because the look is reported as a very heavy tone curve -- shadows
+	// crushed, highlights blown, the picture reading like a strong cinematic grade -- while
+	// the frame mean is unchanged (0.3862 against 0.3846 with the engine at 960x540, which
+	// is a contrast curve, not a brightness shift). The tonemap is the field that decides
+	// how the network's linear output is presented, so it is the right thing to be able to
+	// sweep from a file rather than from a rebuild.
 
 	// Inline mode is what the runtime ships and what every working installation runs.
 	// Both flags are also settable from dlssnr_on_amd.ini under [DlssNrOnAmd], but the ini
@@ -997,7 +1012,28 @@ bool DlssnrAmdBackend::Impl::CreateExposure() noexcept {
 	if (FAILED(source->Map(0, &written, &mapped)) || !mapped) {
 		return false;
 	}
-	*static_cast<float*>(mapped) = kExposureValue;
+	// The value is read from the runtime's own ini under a key the runtime does not know and
+	// therefore ignores. Whether the picture looks right at a given exposure is a judgement
+	// that needs eyes on the screen, so it should not cost a rebuild per attempt:
+	//
+	//   [DlssNrOnAmd]
+	//   Exposure=0.8
+	//
+	// Missing, unparseable or non-positive falls back to kExposureValue.
+	float exposureValue = kExposureValue;
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		wchar_t buffer[64]{};
+		GetPrivateProfileStringW(L"DlssNrOnAmd", L"Exposure", L"", buffer,
+			static_cast<DWORD>(std::size(buffer)), iniPath.c_str());
+		float parsed = 0.0f;
+		if (swscanf_s(buffer, L"%f", &parsed) == 1 && std::isfinite(parsed) &&
+			parsed > 0.0f) {
+			exposureValue = parsed;
+		}
+	}
+	Logger::Get().Info(fmt::format("DLSSNR AMD: exposure {:.3f}", exposureValue));
+	*static_cast<float*>(mapped) = exposureValue;
 	source->Unmap(0, nullptr);
 
 	if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.get(), nullptr))) {

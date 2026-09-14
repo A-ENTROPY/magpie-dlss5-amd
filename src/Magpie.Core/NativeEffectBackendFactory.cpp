@@ -117,8 +117,15 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 		// device matching the render card, a runtime of the wrong build -- the NGX path
 		// runs exactly as before, so nothing changes on a machine that never had it.
 		if (DlssnrAmdBackend::IsAvailable()) {
+			// Upstream's anti-flicker setting, read the same way its own backend reads it. The
+			// AMD path has no optical flow, so anything non-zero lands on the static route.
+			const int antiFlicker = DLSSNRAntiFlickerMode(
+				[&](std::string_view name, float fallback) {
+					const auto it = option.parameters.find(std::string(name));
+					return it == option.parameters.end() ? fallback : it->second;
+				});
 			auto amd = std::make_unique<DlssnrAmdBackend>();
-			if (amd->Initialize(resources, input, output, settings)) {
+			if (amd->Initialize(resources, input, output, settings, antiFlicker)) {
 				Logger::Get().Info("DLSSNR: running on the AMD backend");
 				return { true, std::move(amd) };
 			}

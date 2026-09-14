@@ -36,7 +36,10 @@ public:
 		DeviceResources& resources,
 		ID3D11Texture2D* input,
 		ID3D11Texture2D* output,
-		const DLSSNRSettings& settings
+		const DLSSNRSettings& settings,
+		// The effect's anti-flicker request. Modes above 1 reproject history with optical
+		// flow, which this backend has no source for, so they are served as mode 1.
+		int antiFlickerMode
 	) noexcept;
 
 	bool Resize(

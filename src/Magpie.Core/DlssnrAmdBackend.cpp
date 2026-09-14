@@ -210,7 +210,7 @@ void main(uint3 p : SV_DispatchThreadID)
 constexpr char kResolveShader[] = R"(
 Texture2D<float4> src : register(t0);
 Texture2D<float4> baseline : register(t1);
-Texture2D<float4> edited : register(t2);
+Texture2D<float4> residual : register(t2);
 RWTexture2D<float4> dst : register(u0);
 cbuffer Extent : register(b0) { uint w; uint h; uint lowW; uint lowH; uint boundMilli; };
 
@@ -219,9 +219,10 @@ cbuffer Extent : register(b0) { uint w; uint h; uint lowW; uint lowH; uint bound
 float3 Guide(float3 c) { return c / (1 + abs(c)); }
 float MaxAbs(float3 v) { return max(abs(v.r), max(abs(v.g), abs(v.b))); }
 
-// The edit, taken from the reduced frame and accepted only where that frame agrees with
-// this pixel. Three things here come from the upstream anti-flicker filter, which works
-// the same problem from the other side:
+// The edit comes from the residual the temporal pass left, which is this frame's edit when
+// accumulation is off and a blend of recent frames' when it is on. It is accepted only
+// where the reduced frame agrees with this pixel. Three things here come from the upstream
+// anti-flicker filter, which works the same problem from the other side:
 //
 //   the agreement is judged over the whole bilinear footprint and by its worst sample, not
 //   by one sample -- a single comparison is noisy, and a noisy weight is a weight that
@@ -245,12 +246,12 @@ bool SampleEdit(int2 p, out float3 edit) {
 	[unroll] for (int y = 0; y < 2; ++y)
 	[unroll] for (int x = 0; x < 2; ++x) {
 		int2 n = clamp(a + int2(x, y), 0, int2(lowW - 1, lowH - 1));
-		float4 e = edited.Load(int3(n, 0));
+		float4 r = residual.Load(int3(n, 0));
 		float4 b = baseline.Load(int3(n, 0));
-		if (!all(isfinite(e.rgb)) || !all(isfinite(b.rgb))) continue;
+		if (!all(isfinite(r.rgb)) || !all(isfinite(b.rgb))) continue;
 		worst = max(worst, MaxAbs(c - Guide(b.rgb)));
 		float weight = (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y);
-		sum += weight * (e.rgb - b.rgb);
+		sum += weight * r.rgb;
 		mass += weight;
 	}
 	if (mass < .05) return false;
@@ -293,6 +294,97 @@ void main(uint3 p : SV_DispatchThreadID)
 // `dst = isfinite(e) && e > 0 ? e : 1.0`. A game frame has already been exposed by the
 // game, so the network has no business re-adapting it.
 constexpr float kExposureValue = 1.0f;
+
+// The residual, carried between frames. This is upstream's `antiFlicker` mode 1, static
+// accumulation, whose design document names it the one route that needs no motion vectors
+// -- the only kind available here. Its shape is theirs:
+//
+//   the residual -- what the network changed, taken at the resolution it ran at -- is kept
+//   rather than the picture, and never fed back into the network;
+//
+//   this frame's residual is blended toward that history, and the history is first clamped
+//   into the range the current frame's neighbourhood actually spans, which is what stops a
+//   correction from persisting where the picture moved on;
+//
+//   history is trusted only where the guide agrees with it, judged over a neighbourhood by
+//   both its mean and its worst sample;
+//
+//   and where the history cannot be trusted the frame's own residual is used unchanged,
+//   rather than a blend of the two.
+//
+// The blend weight is not here: it comes from the capture interval, so the accumulation is
+// a duration in real time rather than a frame count.
+constexpr char kTemporalShader[] = R"(
+Texture2D<float4> edited : register(t0);
+Texture2D<float4> baseline : register(t1);
+Texture2D<float4> historyResidual : register(t2);
+Texture2D<float4> historyGuide : register(t3);
+RWTexture2D<float4> nextResidual : register(u0);
+RWTexture2D<float4> nextGuide : register(u1);
+cbuffer Settings : register(b0) { uint w; uint h; float weight; uint historyValid; };
+
+float3 Guide(float3 c) { return c / (1 + abs(c)); }
+float MaxAbs(float3 v) { return max(abs(v.r), max(abs(v.g), abs(v.b))); }
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+	int2 p = int2(id.xy);
+	if (p.x >= int(w) || p.y >= int(h)) return;
+	int2 last = int2(w, h) - 1;
+
+	float4 raw = edited.Load(int3(p, 0));
+	float4 base = baseline.Load(int3(p, 0));
+	bool finiteInput = all(isfinite(raw.rgb)) && all(isfinite(base.rgb));
+	float3 guide = finiteInput ? Guide(base.rgb) : 0;
+	nextGuide[p] = float4(guide, finiteInput ? 1 : 0);
+	if (!finiteInput) {
+		nextResidual[p] = 0;
+		return;
+	}
+
+	float3 current = raw.rgb - base.rgb;
+	float3 result = current;
+
+	if (historyValid != 0 && weight > 0) {
+		float error = 0;
+		float worst = 0;
+		bool valid = true;
+		float3 lo = current, hi = current;
+		[unroll] for (int y = -1; y <= 1; ++y)
+		[unroll] for (int x = -1; x <= 1; ++x) {
+			int2 n = clamp(p + int2(x, y), int2(0, 0), last);
+			float4 oldGuide = historyGuide.Load(int3(n, 0));
+			if (!all(isfinite(oldGuide.rgb)) || oldGuide.a < .999) { valid = false; continue; }
+			float e = MaxAbs(guide - oldGuide.rgb);
+			error += e / 9.0;
+			worst = max(worst, e);
+			float4 neighbour = edited.Load(int3(n, 0));
+			float4 neighbourBase = baseline.Load(int3(n, 0));
+			if (all(isfinite(neighbour.rgb)) && all(isfinite(neighbourBase.rgb))) {
+				float3 residualN = neighbour.rgb - neighbourBase.rgb;
+				lo = min(lo, residualN);
+				hi = max(hi, residualN);
+			}
+		}
+		// Two tests, tight, as upstream has them: the mean disagreement over the patch and
+		// its worst sample. A single loose test lets the blend follow noise.
+		float q = (1 - smoothstep(.008, .04, error)) * (1 - smoothstep(.025, .10, worst));
+		float4 old = historyResidual.Load(int3(p, 0));
+		if (valid && q > 0 && all(isfinite(old.rgb)) && old.a >= .999) {
+			// The clamp is the whole point: an edit may only persist as far as this frame's
+			// own neighbourhood allows it to.
+			float3 margin = .02 + q * abs(old.rgb);
+			float3 safe = clamp(old.rgb, lo - margin, hi + margin);
+			result = lerp(current, safe, weight * q);
+		}
+	}
+
+	// Alpha carries validity, not opacity: a value nobody could trust must not be read as
+	// history next frame.
+	nextResidual[p] = float4(clamp(result, -65504, 65504), 1);
+}
+)";
 
 std::filesystem::path ExeDirectory() noexcept {
 	return Win32Helper::GetExePath().parent_path();
@@ -577,6 +669,32 @@ struct DlssnrAmdBackend::Impl {
 	// How large an edit the resolve will apply, in thousandths of the local magnitude.
 	// Lower is calmer; the reason it is a setting rather than a constant is on the shader.
 	uint32_t editBoundMilli = 500;
+
+	winrt::com_ptr<ID3D12PipelineState> temporal;
+
+	// Anti-flicker: the residual carried between frames at the network's resolution, with
+	// the guide it was measured against. Ping-ponged, because the pass reads one pair and
+	// writes the other. Alpha in both carries validity, not opacity.
+	winrt::com_ptr<ID3D12Resource> historyResidual[2];
+	winrt::com_ptr<ID3D12Resource> historyGuide[2];
+	uint32_t historyIndex = 0;
+
+	// The blend weight comes from the capture interval, so the accumulation is a duration in
+	// real time rather than a frame count -- upstream derives it the same way,
+	// exp(-dt/0.08) with anything past 0.25 s treated as stale. A repeated capture is not a
+	// new sample, and neither is a frame the effect was rebuilt for.
+	uint64_t lastFrameId = 0;
+	uint64_t lastRevision = 0;
+	uint64_t lastTimestamp = 0;
+	bool temporalValid = false;
+
+	// What the effect asked for. Zero leaves the residual pass subtracting and nothing else,
+	// which is exactly what ran before any of this existed.
+	int antiFlickerMode = 0;
+
+	// Whether the network runs below the capture size. Not the same as the resolve path
+	// being in use: anti-flicker needs the resolve even at 100%.
+	bool downscaling = false;
 	winrt::com_ptr<ID3D12PipelineState> downsample;
 	winrt::com_ptr<ID3D12PipelineState> resolve;
 	uint32_t descriptorStride = 0;
@@ -608,6 +726,9 @@ struct DlssnrAmdBackend::Impl {
 	winrt::com_ptr<ID3D12Resource> probe;
 	uint64_t probeBytes = 0;
 	bool probed = false;
+	// The previous call's samples, for the flicker measure. Never used for anything else.
+	std::vector<float> sample;
+	std::vector<float> previousSample;
 	// TEMPORARY DIAGNOSTIC: how many frames of the series have been logged.
 	int probeSamples = 0;
 
@@ -635,14 +756,25 @@ struct DlssnrAmdBackend::Impl {
 		ID3D12Resource* uav, DXGI_FORMAT uavFormat) noexcept;
 	void BindResolve(uint32_t slot, ID3D12Resource* srv, ID3D12Resource* uav,
 		ID3D12Resource* baselineTexture, ID3D12Resource* edited) noexcept;
+	void BindTemporal(uint32_t slot, ID3D12Resource* edited, ID3D12Resource* nextResidual,
+		ID3D12Resource* nextGuide, ID3D12Resource* baselineTexture,
+		ID3D12Resource* historyResidualTexture,
+		ID3D12Resource* historyGuideTexture) noexcept;
+	void CreateSrv(ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE where) noexcept;
+	bool RunTemporal(const NativeEffectDrawContext& context) noexcept;
 	void Dispatch(ID3D12PipelineState* pso, uint32_t slot) noexcept;
+	// `residualTableSlot` is where the second descriptor table starts, or 0 for a pass that
+	// has no second table. It is a slot rather than a flag because the passes lay their
+	// descriptors out differently: the temporal pass writes two UAVs before its extra
+	// sources, the resolve writes one.
 	void DispatchSized(ID3D12PipelineState* pso, uint32_t slot, uint32_t dw, uint32_t dh,
-		bool setResidualTable, const UINT* constants = nullptr,
+		uint32_t residualTableSlot, const UINT* constants = nullptr,
 		uint32_t constantCount = 4) noexcept;
 	bool WaitForEngine(uint64_t deadlineMs) noexcept;
 	void DestroySized() noexcept;
 	float Measure(ID3D12Resource* res, DXGI_FORMAT format,
-		D3D12_RESOURCE_STATES before, uint64_t* nonFinite = nullptr) noexcept;
+		D3D12_RESOURCE_STATES before, uint64_t* nonFinite = nullptr,
+		float* meanAbsDelta = nullptr) noexcept;
 };
 
 bool DlssnrAmdBackend::Impl::LoadRuntime() noexcept {
@@ -750,9 +882,13 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 	// implementation: one SRV from t0, one UAV from u0 at table offset 1, a second table
 	// of two SRVs from t1, and twenty-four 32-bit constants. No static sampler. The
 	// conversion shaders above use the same layout, which is why there is only one.
+	// Two UAVs, not one: the temporal pass writes the residual and the guide it will be
+	// measured against next frame. A shader that binds a register the root signature does
+	// not cover makes CreateComputePipelineState fail, and that failure used to be silent --
+	// see the note in the compile lambda.
 	D3D12_DESCRIPTOR_RANGE ranges[2]{};
 	ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
-	ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1 };
+	ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 1 };
 
 	D3D12_ROOT_PARAMETER params[3]{};
 	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -762,7 +898,10 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 	params[1].Constants = { 0, 0, 24 };
 	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-	D3D12_DESCRIPTOR_RANGE residualRange{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 1, 0, 0 };
+	// Three, not two: the temporal pass reads a current guide and the guide it was
+	// accumulated against, so the second table carries t1 through t3. The conversions and
+	// the resolve declare only t1 and t2 and are unaffected.
+	D3D12_DESCRIPTOR_RANGE residualRange{ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 1, 0, 0 };
 	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[2].DescriptorTable = { 1, &residualRange };
 	params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -803,8 +942,18 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 		D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};
 		ps.pRootSignature = root.get();
 		ps.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
-		return SUCCEEDED(device12->CreateComputePipelineState(&ps,
-			IID_PPV_ARGS(out.put())));
+		const HRESULT hr = device12->CreateComputePipelineState(&ps,
+			IID_PPV_ARGS(out.put()));
+		if (FAILED(hr)) {
+			// Worth a line of its own. A pipeline whose shader binds a register the root
+			// signature does not cover fails here, and this returned false in silence once:
+			// the whole backend declined, the effect fell through to a path that does not
+			// exist on this machine, and the only evidence was that nothing happened.
+			Logger::Get().Error(fmt::format(
+				"DLSSNR AMD: {} pipeline failed (0x{:08x}); check the root signature "
+				"covers every register it binds", name, static_cast<uint32_t>(hr)));
+		}
+		return SUCCEEDED(hr);
 	};
 
 	// The conversions exist twice: once passing the frame through untouched and once
@@ -823,7 +972,9 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 		compile(kDownsampleShader, sizeof(kDownsampleShader) - 1, "downsample",
 			nullptr, downsample) &&
 		compile(kResolveShader, sizeof(kResolveShader) - 1, "resolve",
-			nullptr, resolve);
+			nullptr, resolve) &&
+		compile(kTemporalShader, sizeof(kTemporalShader) - 1, "temporal",
+			nullptr, temporal);
 }
 
 bool DlssnrAmdBackend::Impl::CreateSized(
@@ -876,7 +1027,11 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 		uint32_t(uint64_t(w) * floorScale / 10000u));
 	netHeight = std::max(std::clamp(scaledH, 32u, h),
 		uint32_t(uint64_t(h) * floorScale / 10000u));
-	scaled = netWidth != w || netHeight != h;
+	downscaling = netWidth != w || netHeight != h;
+	// The resolve path runs whenever the network is smaller than the capture, and also when
+	// anti-flicker is on: the residual has to be extracted and composited somewhere, and that
+	// is what the resolve does -- at 1:1 when nothing is scaled.
+	scaled = downscaling || antiFlickerMode != 0;
 
 	// The frame at full resolution, in the engine's own format. It is what the capture is
 	// converted into, what the resolve takes its detail from, and at 100% scale it is also
@@ -903,6 +1058,18 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 				DXGI_FORMAT_R16G16B16A16_FLOAT, resolved)) {
 			return false;
 		}
+		// The residual history, at the resolution the network ran at, which is where the
+		// edit lives. Two of each, because the pass reads one pair and writes the other.
+		for (int i = 0; i < 2; ++i) {
+			if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
+					DXGI_FORMAT_R16G16B16A16_FLOAT, historyResidual[i]) ||
+				!CreateEngineTexture(device12.get(), netWidth, netHeight,
+					DXGI_FORMAT_R16G16B16A16_FLOAT, historyGuide[i])) {
+				return false;
+			}
+		}
+		historyIndex = 0;
+		temporalValid = false;
 	}
 	// The engine's input contract names motion and depth. This backend has no source for
 	// either, and zero-filled buffers are what the reference feeds when a game offers
@@ -930,10 +1097,26 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	full = nullptr;
 	baseline = nullptr;
 	resolved = nullptr;
+	for (int i = 0; i < 2; ++i) {
+		historyResidual[i] = nullptr;
+		historyGuide[i] = nullptr;
+	}
 	// A new extent means the history describes the wrong geometry.
 	resetHistory = true;
+	temporalValid = false;
 	motion = nullptr;
 	depth = nullptr;
+}
+
+void DlssnrAmdBackend::Impl::CreateSrv(ID3D12Resource* res,
+	D3D12_CPU_DESCRIPTOR_HANDLE where
+) noexcept {
+	D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+	s.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	s.Texture2D.MipLevels = 1;
+	device12->CreateShaderResourceView(res, &s, where);
 }
 
 void DlssnrAmdBackend::Impl::Bind(
@@ -958,7 +1141,7 @@ void DlssnrAmdBackend::Impl::Dispatch(ID3D12PipelineState* pso, uint32_t slot) n
 }
 
 void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t slot,
-	uint32_t dw, uint32_t dh, bool setResidualTable, const UINT* constants,
+	uint32_t dw, uint32_t dh, uint32_t residualTableSlot, const UINT* constants,
 	uint32_t constantCount
 ) noexcept {
 	// `slot` matters more than it looks. Descriptors are read when the GPU executes the
@@ -971,11 +1154,11 @@ void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t sl
 	D3D12_GPU_DESCRIPTOR_HANDLE table = heap->GetGPUDescriptorHandleForHeapStart();
 	table.ptr += UINT64(slot) * descriptorStride;
 	list->SetComputeRootDescriptorTable(0, table);
-	if (setResidualTable) {
-		// The resolve reads its two extra sources from t1/t2, which live in the table two
-		// descriptors along.
-		D3D12_GPU_DESCRIPTOR_HANDLE residual = table;
-		residual.ptr += 2 * descriptorStride;
+	if (residualTableSlot != 0) {
+		// The extra sources live in a table of their own; where it starts depends on how many
+		// descriptors the pass put before it.
+		D3D12_GPU_DESCRIPTOR_HANDLE residual = heap->GetGPUDescriptorHandleForHeapStart();
+		residual.ptr += UINT64(residualTableSlot) * descriptorStride;
 		list->SetComputeRootDescriptorTable(2, residual);
 	}
 	list->SetPipelineState(pso);
@@ -995,13 +1178,71 @@ void DlssnrAmdBackend::Impl::BindResolve(uint32_t slot, ID3D12Resource* srv,
 	// resolve's second root table finds them two descriptors along.
 	Bind(slot, srv, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, DXGI_FORMAT_R16G16B16A16_FLOAT);
 
-	D3D12_SHADER_RESOURCE_VIEW_DESC s{};
-	s.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-	s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-	s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-	s.Texture2D.MipLevels = 1;
-	device12->CreateShaderResourceView(baselineTexture, &s, Cpu(slot + 2));
-	device12->CreateShaderResourceView(edited, &s, Cpu(slot + 3));
+	CreateSrv(baselineTexture, Cpu(slot + 2));
+	CreateSrv(edited, Cpu(slot + 3));
+}
+
+void DlssnrAmdBackend::Impl::BindTemporal(uint32_t slot, ID3D12Resource* edited,
+	ID3D12Resource* nextResidual, ID3D12Resource* nextGuide,
+	ID3D12Resource* baselineTexture, ID3D12Resource* historyResidualTexture,
+	ID3D12Resource* historyGuideTexture
+) noexcept {
+	// t0 and u0 through the usual pair, then u1 immediately after it, and the three sources
+	// from t1 in the table that follows -- which is why this pass's second table starts at
+	// slot + 3 while the resolve's starts at slot + 2.
+	Bind(slot, edited, DXGI_FORMAT_R16G16B16A16_FLOAT, nextResidual,
+		DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+	u.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+	device12->CreateUnorderedAccessView(nextGuide, nullptr, &u, Cpu(slot + 2));
+
+	CreateSrv(baselineTexture, Cpu(slot + 3));
+	CreateSrv(historyResidualTexture, Cpu(slot + 4));
+	CreateSrv(historyGuideTexture, Cpu(slot + 5));
+}
+
+// The residual for this frame: what the network changed, at the resolution it ran at, with
+// earlier frames carried into it where the effect asked for them. Always runs on the
+// resolve path; with anti-flicker off it is a subtraction and nothing more.
+bool DlssnrAmdBackend::Impl::RunTemporal(const NativeEffectDrawContext& context) noexcept {
+	const uint32_t from = historyIndex;
+	const uint32_t to = 1 - historyIndex;
+
+	uint32_t weightMilli = 0;
+	const bool hasHistory = antiFlickerMode != 0 && temporalValid;
+	const uint64_t now = GetTickCount64();
+	const bool duplicate =
+		context.frameId == lastFrameId && context.inputRevision == lastRevision;
+	if (hasHistory && !duplicate && context.frameId > lastFrameId &&
+		context.inputRevision == lastRevision && now > lastTimestamp) {
+		const double seconds = double(now - lastTimestamp) * 1e-3;
+		if (seconds <= 0.25) {
+			weightMilli = static_cast<uint32_t>(
+				std::clamp(std::exp(-seconds / 0.08), 0.0, 1.0) * 1000.0);
+		}
+	}
+
+	Barrier(list.get(), historyResidual[to].get(), kStateShaderRead,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	Barrier(list.get(), historyGuide[to].get(), kStateShaderRead,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	BindTemporal(12, net.get(), historyResidual[to].get(), historyGuide[to].get(),
+		baseline.get(), historyResidual[from].get(), historyGuide[from].get());
+	const UINT constants[4]{ netWidth, netHeight, weightMilli, hasHistory ? 1u : 0u };
+	DispatchSized(temporal.get(), 12, netWidth, netHeight, 15, constants, 4);
+	Barrier(list.get(), historyResidual[to].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		kStateShaderRead);
+	Barrier(list.get(), historyGuide[to].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		kStateShaderRead);
+
+	historyIndex = to;
+	temporalValid = true;
+	lastFrameId = context.frameId;
+	lastRevision = context.inputRevision;
+	lastTimestamp = now;
+	return true;
 }
 
 bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath) noexcept {
@@ -1180,9 +1421,21 @@ bool DlssnrAmdBackend::Initialize(
 	DeviceResources& resources,
 	ID3D11Texture2D* input,
 	ID3D11Texture2D* output,
-	const DLSSNRSettings& settings
+	const DLSSNRSettings& settings,
+	int antiFlickerMode
 ) noexcept {
 	auto& p = *_impl;
+	// Set before anything is allocated: whether the residual path is in use decides which
+	// surfaces exist. Modes 2 to 4 are optical-flow routes and there is no optical flow here,
+	// so every non-zero request is served as mode 1 -- static accumulation, the route
+	// upstream's design document names as needing no motion. Said out loud, because a
+	// setting that quietly does something else is worse than one that says so.
+	p.antiFlickerMode = antiFlickerMode != 0 ? 1 : 0;
+	if (antiFlickerMode > 1) {
+		Logger::Get().Warn(fmt::format(
+			"DLSSNR AMD: anti-flicker mode {} needs optical flow; serving it as static "
+			"accumulation", antiFlickerMode));
+	}
 	// Recorded, not yet acted on. The engine's fields are still written from this
 	// backend's own constants because mapping Magpie's parameter names onto them one-to-one
 	// does not work -- see the note in Draw. Printing them means the next attempt starts
@@ -1311,9 +1564,11 @@ bool DlssnrAmdBackend::Initialize(
 	const float appliedScale = float(p.netWidth) / float(inputDesc.Width);
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD: engine up on HIP device {}; {}x{} {} -> {}, network at {}x{} "
-		"(requested {:.2f}, applied {:.2f})", p.hipDevice, inputDesc.Width, inputDesc.Height,
+		"(requested {:.2f}, applied {:.2f}), anti-flicker {}",
+		p.hipDevice, inputDesc.Width, inputDesc.Height,
 		(uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format,
-		p.netWidth, p.netHeight, p.modelScale, appliedScale));
+		p.netWidth, p.netHeight, p.modelScale, appliedScale,
+		p.antiFlickerMode ? "static accumulation" : "off"));
 	return true;
 }
 
@@ -1347,7 +1602,7 @@ bool DlssnrAmdBackend::Resize(
 
 float DlssnrAmdBackend::Impl::Measure(
 	ID3D12Resource* res, DXGI_FORMAT format, D3D12_RESOURCE_STATES before,
-	uint64_t* nonFinite
+	uint64_t* nonFinite, float* meanAbsDelta
 ) noexcept {
 	// Only ever called on the first frame. Reading a texture back means a copy, a
 	// submit and a wait, which is far too much per frame -- but once, it is the
@@ -1433,15 +1688,37 @@ float DlssnrAmdBackend::Impl::Measure(
 	// into NaN, which says only "something somewhere was not a number" and hides how much of
 	// the surface that was.
 	uint64_t bad = 0;
+	// When asked, the samples are also compared against the previous call's, which is how
+	// the flicker is measured: against a still scene, any difference between one frame and
+	// the next is the effect changing its mind.
+	if (meanAbsDelta) {
+		sample.clear();
+	}
 	if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
 		const uint16_t* p16 = static_cast<const uint16_t*>(mapped);
 		for (uint64_t i = 0; i < total / 2; ++i) {
 			const float v = HalfToFloat(p16[i]);
 			if (std::isfinite(v)) { sum += v; ++count; } else { ++bad; }
+			if (meanAbsDelta && std::isfinite(v)) sample.push_back(v);
 		}
 	} else {
 		const uint8_t* p8 = static_cast<const uint8_t*>(mapped);
-		for (uint64_t i = 0; i < total; ++i) { sum += p8[i] / 255.0; ++count; }
+		for (uint64_t i = 0; i < total; ++i) {
+			sum += p8[i] / 255.0; ++count;
+			if (meanAbsDelta) sample.push_back(p8[i] / 255.0f);
+		}
+	}
+	if (meanAbsDelta) {
+		double diff = 0;
+		uint64_t diffCount = 0;
+		if (previousSample.size() == sample.size()) {
+			for (size_t i = 0; i < sample.size(); ++i) {
+				diff += std::abs(double(sample[i]) - double(previousSample[i]));
+				++diffCount;
+			}
+		}
+		*meanAbsDelta = diffCount ? float(diff / double(diffCount)) : -1.0f;
+		previousSample = sample;
 	}
 	probe->Unmap(0, nullptr);
 	if (nonFinite) {
@@ -1499,26 +1776,16 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// the reference makes the same choice for the same reason. The copy into `baseline` has
 	// to happen before the engine runs, since the engine edits its surface in place and the
 	// resolve needs the difference.
-	if (p.scaled) {
+	if (p.downscaling) {
 		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		p.Bind(4, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, p.net.get(),
 			DXGI_FORMAT_R16G16B16A16_FLOAT);
 		const UINT dims[4]{ p.netWidth, p.netHeight, p.width, p.height };
-		p.DispatchSized(p.downsample.get(), 4, p.netWidth, p.netHeight, false, dims);
+		p.DispatchSized(p.downsample.get(), 4, p.netWidth, p.netHeight, 0, dims);
 		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
-
-		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
-			D3D12_RESOURCE_STATE_COPY_SOURCE);
-		Barrier(p.list.get(), p.baseline.get(), kStateShaderRead,
-			D3D12_RESOURCE_STATE_COPY_DEST);
-		p.list->CopyResource(p.baseline.get(), p.net.get());
-		Barrier(p.list.get(), p.baseline.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-			kStateShaderRead);
-		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-			kStateShaderRead);
-	} else {
+	} else if (p.scaled) {
 		Barrier(p.list.get(), p.full.get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_COPY_SOURCE);
 		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
@@ -1527,6 +1794,17 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_COPY_DEST,
 			kStateShaderRead);
 		Barrier(p.list.get(), p.full.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+			kStateShaderRead);
+	}
+	if (p.scaled) {
+		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		Barrier(p.list.get(), p.baseline.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		p.list->CopyResource(p.baseline.get(), p.net.get());
+		Barrier(p.list.get(), p.baseline.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			kStateShaderRead);
+		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
 			kStateShaderRead);
 	}
 
@@ -1592,6 +1870,8 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	p.lastSubmitTick = now;
 	if (p.resetHistory || gap) {
 		p.resetHistory = false;
+		// The carried residual describes a picture that is no longer here.
+		p.temporalValid = false;
 		At<uint8_t>(p.runtime, kRvaWantHistory) = 0;
 		At<void*>(p.runtime, kRvaHistory) = nullptr;
 	}
@@ -1742,12 +2022,19 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// 100% there is nothing to resolve and the engine's own surface is the picture.
 	ID3D12Resource* picture = p.net.get();
 	if (p.scaled) {
+		// The residual for this frame, before anything composites it. With anti-flicker off
+		// this only subtracts; with it on, earlier frames are blended in here.
+		if (!p.RunTemporal(context)) {
+			p.failed = true;
+			return true;
+		}
 		Barrier(p.list.get(), p.resolved.get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.BindResolve(8, p.full.get(), p.resolved.get(), p.baseline.get(), p.net.get());
+		p.BindResolve(8, p.full.get(), p.resolved.get(), p.baseline.get(),
+			p.historyResidual[p.historyIndex].get());
 		const UINT dims[5]{ p.width, p.height, p.netWidth, p.netHeight,
 			p.editBoundMilli };
-		p.DispatchSized(p.resolve.get(), 8, p.width, p.height, true, dims, 5);
+		p.DispatchSized(p.resolve.get(), 8, p.width, p.height, 10, dims, 5);
 		Barrier(p.list.get(), p.resolved.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
 		picture = p.resolved.get();
@@ -1797,15 +2084,19 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	if (p.probeSamples < 12 && p.framesSeen >= 10) {
 		const int n = p.probeSamples++;
 		uint64_t badIn = 0, badNet = 0, badOut = 0;
+		float deltaIn = -1.0f, deltaOut = -1.0f;
+		// Both ends are measured frame to frame. The input's change is what the game did;
+		// the picture's change is what flicker is when the scene is still.
 		const float inMean = p.Measure(p.sharedIn12.get(), p.inputFormat,
-			D3D12_RESOURCE_STATE_COMMON, &badIn);
+			D3D12_RESOURCE_STATE_COMMON, &badIn, &deltaIn);
 		const float netMean = p.Measure(p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
 			kStateShaderRead, &badNet);
 		const float outMean = p.Measure(p.sharedOut12.get(), p.outputFormat,
-			D3D12_RESOURCE_STATE_COMMON, &badOut);
+			D3D12_RESOURCE_STATE_COMMON, &badOut, &deltaOut);
 		Logger::Get().Info(fmt::format(
-			"DLSSNR AMD series {:2d}: in {:.4f}(bad {}) net {:.4f}(bad {}) out {:.4f}(bad {})",
-			n, inMean, badIn, netMean, badNet, outMean, badOut));
+			"DLSSNR AMD series {:2d}: in {:.4f}(bad {}) net {:.4f}(bad {}) "
+			"out {:.4f}(bad {}) | frame-to-frame: in {:.5f} out {:.5f}",
+			n, inMean, badIn, netMean, badNet, outMean, badOut, deltaIn, deltaOut));
 	}
 	return true;
 }

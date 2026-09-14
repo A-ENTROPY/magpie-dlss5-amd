@@ -223,6 +223,22 @@ void main(uint3 p : SV_DispatchThreadID)
 }
 )";
 
+// The exposure handed to the engine, in a one-pixel R32_FLOAT texture.
+//
+// Left to itself the engine adapts its own exposure frame by frame, and that adaptation is
+// not stable. On a scene whose input mean sat between 0.490 and 0.502 the exposure it chose
+// moved between 0.645 and 0.925 -- a fifth of its own value, frame to frame, with the
+// picture not changing. That multiplies the whole image and reads as a lamp breathing.
+//
+// It is not something this backend introduced. In the working OptiScaler installation's own
+// log, at the same 960x540, its exposure moved between 0.65 and 3.33 -- five times -- on
+// input that never left 0.48..0.51. The reference passes no exposure and lives with it.
+//
+// 1.0 is the reference's own value for having nothing better: its exposure shader ends
+// `dst = isfinite(e) && e > 0 ? e : 1.0`. A game frame has already been exposed by the
+// game, so the network has no business re-adapting it.
+constexpr float kExposureValue = 1.0f;
+
 std::filesystem::path ExeDirectory() noexcept {
 	return Win32Helper::GetExePath().parent_path();
 }
@@ -490,6 +506,8 @@ struct DlssnrAmdBackend::Impl {
 	winrt::com_ptr<ID3D12Resource> resolved;
 	winrt::com_ptr<ID3D12Resource> motion;
 	winrt::com_ptr<ID3D12Resource> depth;
+	// One pixel, holding the exposure the engine is told to use instead of adapting one.
+	winrt::com_ptr<ID3D12Resource> exposureTexture;
 	winrt::com_ptr<ID3D12DescriptorHeap> heap;
 	winrt::com_ptr<ID3D12RootSignature> root;
 	winrt::com_ptr<ID3D12PipelineState> convertIn;
@@ -545,6 +563,7 @@ struct DlssnrAmdBackend::Impl {
 	bool CreatePipeline() noexcept;
 	bool CreateSized(uint32_t w, uint32_t h, DXGI_FORMAT inFmt, DXGI_FORMAT outFmt) noexcept;
 	bool InitEngine(const std::filesystem::path& weightsPath) noexcept;
+	bool CreateExposure() noexcept;
 	void Bind(uint32_t slot, ID3D12Resource* srv, DXGI_FORMAT srvFormat,
 		ID3D12Resource* uav, DXGI_FORMAT uavFormat) noexcept;
 	void BindResolve(uint32_t slot, ID3D12Resource* srv, ID3D12Resource* uav,
@@ -753,10 +772,31 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 
 	// The network's extent. Everything the engine touches is built at this size, and at
 	// 100% it is the capture size, which is the path that shipped before the scale existed.
+	//
+	// The short side is held at 540 pixels, and that floor is measured rather than assumed.
+	// At 480x270 -- 25% of a 1080p capture -- two things go wrong at once. The engine's
+	// output falls to about a sixteenth of its input (probe: `frame in 0.4905, engine out
+	// 0.0312`, against 0.5873/0.5908 at full size), so the filter is not filtering. And its
+	// auto-exposure starts hunting: on a scene whose input mean sat between 0.490 and 0.502
+	// the exposure the engine chose swung between 0.645 and 0.925, a fifth of its own value,
+	// frame to frame. That is what reads as an old projector lamp breathing.
+	//
+	// 540 is the convention for the smallest frame this class of model is built for, and it
+	// has the useful property of landing both common captures inside the range that works:
+	// a 1080p capture stops at 50%, a 4K capture can reach 25% and still be 960x540.
+	constexpr uint32_t kMinimumNetworkShortSide = 540;
 	const uint32_t scaledW = uint32_t(float(w) * modelScale + 0.5f);
 	const uint32_t scaledH = uint32_t(float(h) * modelScale + 0.5f);
-	netWidth = std::clamp(scaledW, 32u, w);
-	netHeight = std::clamp(scaledH, 32u, h);
+	// The scale that would put the short side exactly on the floor, in ten-thousandths, so
+	// the two dimensions keep their aspect. The request is raised to meet it rather than
+	// being rejected, so asking for too small a frame still gives the smallest usable one.
+	const uint32_t shortSide = std::min(w, h);
+	const uint32_t floorScale = shortSide <= kMinimumNetworkShortSide ? 10000u
+		: uint32_t(uint64_t(kMinimumNetworkShortSide) * 10000u / shortSide);
+	netWidth = std::max(std::clamp(scaledW, 32u, w),
+		uint32_t(uint64_t(w) * floorScale / 10000u));
+	netHeight = std::max(std::clamp(scaledH, 32u, h),
+		uint32_t(uint64_t(h) * floorScale / 10000u));
 	scaled = netWidth != w || netHeight != h;
 
 	// The frame at full resolution, in the engine's own format. It is what the capture is
@@ -793,6 +833,10 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 			DXGI_FORMAT_R16G16_FLOAT, motion) ||
 		!CreateEngineTexture(device12.get(), netWidth, netHeight,
 			DXGI_FORMAT_R32_FLOAT, depth)) {
+		return false;
+	}
+	// Held steady rather than adapted; the reason and the measurements are on kExposureValue.
+	if (!CreateExposure()) {
 		return false;
 	}
 	return true;
@@ -911,6 +955,82 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	}
 
 	At<uint8_t>(runtime, kRvaFlag767f8) = 1;
+	return true;
+}
+
+bool DlssnrAmdBackend::Impl::CreateExposure() noexcept {
+	if (exposureTexture) {
+		return true;
+	}
+	// A default-heap, UAV-capable texture, matching the reference's own exposure surface
+	// (`createScratch(p->exposureCopy, 1, 1, DXGI_FORMAT_R32_FLOAT)`), because that is the
+	// shape of resource the engine is handed and samples. An earlier attempt put this on the
+	// upload heap as a shortcut and the filter stopped contributing entirely -- exposure 0
+	// normalises the image to black -- so the heap type is not a detail here.
+	if (!CreateEngineTexture(device12.get(), 1, 1, DXGI_FORMAT_R32_FLOAT, exposureTexture)) {
+		return false;
+	}
+
+	// Fill it once. The reference does this with a compute pass; a copy from an upload
+	// buffer lands the same value with less machinery, and the value never changes.
+	D3D12_HEAP_PROPERTIES uploadHeap{};
+	uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	D3D12_RESOURCE_DESC sourceDesc{};
+	sourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	sourceDesc.Width = 256;  // one row at the alignment a 1x1 R32 copy requires
+	sourceDesc.Height = 1;
+	sourceDesc.DepthOrArraySize = 1;
+	sourceDesc.MipLevels = 1;
+	sourceDesc.Format = DXGI_FORMAT_UNKNOWN;
+	sourceDesc.SampleDesc.Count = 1;
+	sourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	winrt::com_ptr<ID3D12Resource> source;
+	if (FAILED(device12->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE,
+		&sourceDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+		IID_PPV_ARGS(source.put())))) {
+		return false;
+	}
+	void* mapped = nullptr;
+	const D3D12_RANGE written{ 0, sizeof(float) };
+	if (FAILED(source->Map(0, &written, &mapped)) || !mapped) {
+		return false;
+	}
+	*static_cast<float*>(mapped) = kExposureValue;
+	source->Unmap(0, nullptr);
+
+	if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.get(), nullptr))) {
+		return false;
+	}
+	Barrier(list.get(), exposureTexture.get(), kStateShaderRead,
+		D3D12_RESOURCE_STATE_COPY_DEST);
+	D3D12_TEXTURE_COPY_LOCATION to{};
+	to.pResource = exposureTexture.get();
+	to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	to.SubresourceIndex = 0;
+	D3D12_TEXTURE_COPY_LOCATION from{};
+	from.pResource = source.get();
+	from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	from.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+	from.PlacedFootprint.Footprint.Width = 1;
+	from.PlacedFootprint.Footprint.Height = 1;
+	from.PlacedFootprint.Footprint.Depth = 1;
+	from.PlacedFootprint.Footprint.RowPitch = 256;
+	list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+	Barrier(list.get(), exposureTexture.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		kStateShaderRead);
+	if (FAILED(list->Close())) {
+		return false;
+	}
+	ID3D12CommandList* lists[] = { list.get() };
+	queue->ExecuteCommandLists(1, lists);
+	const uint64_t signal = ++fenceValue;
+	queue->Signal(fence.get(), signal);
+	if (fence->GetCompletedValue() < signal) {
+		fence->SetEventOnCompletion(signal, fenceEvent.get());
+		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -1040,11 +1160,14 @@ bool DlssnrAmdBackend::Initialize(
 	}
 
 	p.ready = true;
+	// The applied scale is printed alongside the requested one, because the floor can raise
+	// it and a setting that silently does nothing is worse than one that says so.
+	const float appliedScale = float(p.netWidth) / float(inputDesc.Width);
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD: engine up on HIP device {}; {}x{} {} -> {}, network at {}x{} "
-		"(scale {:.2f})", p.hipDevice, inputDesc.Width, inputDesc.Height,
+		"(requested {:.2f}, applied {:.2f})", p.hipDevice, inputDesc.Width, inputDesc.Height,
 		(uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format,
-		p.netWidth, p.netHeight, p.modelScale));
+		p.netWidth, p.netHeight, p.modelScale, appliedScale));
 	return true;
 }
 
@@ -1211,10 +1334,10 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	if (p.scaled) {
 		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.Bind(2, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, p.net.get(),
+		p.Bind(4, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, p.net.get(),
 			DXGI_FORMAT_R16G16B16A16_FLOAT);
 		const UINT dims[4]{ p.netWidth, p.netHeight, p.width, p.height };
-		p.DispatchSized(p.downsample.get(), 2, p.netWidth, p.netHeight, false, dims);
+		p.DispatchSized(p.downsample.get(), 4, p.netWidth, p.netHeight, false, dims);
 		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
 
@@ -1258,9 +1381,9 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		// Bypassed: the full-resolution converted frame, not the network's surface, which at
 		// a reduced scale is the wrong size for this and would be a format-sized mismatch.
-		p.Bind(4, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+		p.Bind(6, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
-		p.Dispatch(p.convertOut.get(), 4);
+		p.Dispatch(p.convertOut.get(), 6);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kCommon);
 		p.list->Close();
@@ -1380,7 +1503,9 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	packet.motionState = kPacketState;
 	packet.depth = p.depth.get();
 	packet.depthState = kPacketState;
-	packet.exposure = nullptr;
+	// An exposure rather than nullptr, so the engine uses it instead of adapting its own.
+	// Its adaptation is not stable; the measurements are on kExposureValue.
+	packet.exposure = p.exposureTexture.get();
 	packet.exposureState = kPacketState;
 	packet.scaleX = 1.0f;
 	packet.scaleY = 1.0f;
@@ -1451,9 +1576,9 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	if (p.scaled) {
 		Barrier(p.list.get(), p.resolved.get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.BindResolve(6, p.full.get(), p.resolved.get(), p.baseline.get(), p.net.get());
+		p.BindResolve(8, p.full.get(), p.resolved.get(), p.baseline.get(), p.net.get());
 		const UINT dims[4]{ p.width, p.height, p.netWidth, p.netHeight };
-		p.DispatchSized(p.resolve.get(), 6, p.width, p.height, true, dims);
+		p.DispatchSized(p.resolve.get(), 8, p.width, p.height, true, dims);
 		Barrier(p.list.get(), p.resolved.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
 		picture = p.resolved.get();
@@ -1469,9 +1594,9 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	} else {
 		Barrier(p.list.get(), p.sharedOut12.get(), kCommon,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.Bind(4, picture, DXGI_FORMAT_R16G16B16A16_FLOAT,
+		p.Bind(6, picture, DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
-		p.Dispatch(p.convertOut.get(), 4);
+		p.Dispatch(p.convertOut.get(), 6);
 		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kCommon);
 	}

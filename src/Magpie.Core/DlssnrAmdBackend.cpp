@@ -2048,6 +2048,36 @@ bool DlssnrAmdBackend::Initialize(
 		(uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format,
 		p.netWidth, p.netHeight, p.modelScale, appliedScale, p.antiFlickerMode,
 		p.wantMotion ? "optical-flow" : "none"));
+
+	// What the chain hands this effect, which decides how the FSR3 route has to be built.
+	//
+	// The upscaler backends in this project take a render-resolution frame and reconstruct the
+	// display one: FSR3Upscaler dispatches with renderSize set to its input and writes its
+	// output, and it creates its own flat depth, so a path with no depth source is already
+	// inside its contract. Running the network at a reduced size and reconstructing afterwards
+	// would replace the resolve, which composites an upsampled residual onto the captured
+	// frame instead, and it is the reconstruction quality that is wanted.
+	//
+	// Whether that is a chaining job or an embedding one turns on one fact. ResizeTextures
+	// hands each effect's output to the next, sized from that effect's descriptor, and this
+	// effect declares its output at the input's size. If the chain ever hands over an output
+	// smaller than the input, the reconstruction can simply be the next effect in the chain,
+	// and the work is a declaration plus a mode. If it never does, the upscaler has to be
+	// built inside this backend. Logged rather than assumed: the two differ by an order of
+	// magnitude, and one run settles it.
+	{
+		std::error_code ec;
+		const bool upscalerPresent = std::filesystem::exists(
+			ExeDirectory() / L"amd_fidelityfx_upscaler_dx12.dll", ec);
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD chain sizes: input {}x{} -> output {}x{} ({}); network {}x{}, "
+			"resolve {}; FSR3 upscaler runtime {}",
+			inputDesc.Width, inputDesc.Height, outputDesc.Width, outputDesc.Height,
+			(inputDesc.Width == outputDesc.Width && inputDesc.Height == outputDesc.Height)
+				? "equal, the chain asks for no resize here" : "different",
+			p.netWidth, p.netHeight, p.scaled ? "in use" : "not in use",
+			upscalerPresent ? "present" : "missing"));
+	}
 	return true;
 }
 

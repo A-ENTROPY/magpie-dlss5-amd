@@ -342,7 +342,13 @@ Texture2D<float2> motionField : register(t4);
 RWTexture2D<float4> nextResidual : register(u0);
 RWTexture2D<float4> nextGuide : register(u1);
 cbuffer Settings : register(b0) {
-	uint w; uint h; float weight; uint historyValid;
+	// weightMilli, not a float. The constant buffer slot is filled from a uint32 holding
+	// thousandths, so declaring it float here reinterpreted the bit pattern instead of
+	// converting it: 1000 became the denormal 1.4e-42, and since the only thing the weight
+	// does is scale the history term of the blend below, the accumulation silently did
+	// nothing -- every anti-flicker mode behaved the same, and the reprojected history the
+	// optical flow exists to supply was multiplied away. Declared as the integer it is.
+	uint w; uint h; uint weightMilli; uint historyValid;
 	uint useMotion; uint motionScaleXMilli; uint motionScaleYMilli;
 };
 
@@ -366,7 +372,7 @@ void main(uint3 id : SV_DispatchThreadID)
 	float3 current = raw.rgb - base.rgb;
 	float3 result = current;
 
-	if (historyValid != 0 && weight > 0) {
+	if (historyValid != 0 && weightMilli > 0) {
 		// The range this frame's own neighbourhood spans; a carried edit may only persist as
 		// far as the picture allows it to.
 		float3 lo = current, hi = current;
@@ -439,7 +445,7 @@ void main(uint3 id : SV_DispatchThreadID)
 		if (haveHistory) {
 			float3 margin = .02 + trust * abs(old);
 			float3 safe = clamp(old, lo - margin, hi + margin);
-			result = lerp(current, safe, weight * trust);
+			result = lerp(current, safe, weightMilli / 1000.0 * trust);
 		}
 	}
 
@@ -746,6 +752,9 @@ struct DlssnrAmdBackend::Impl {
 	// sRGB-encoded ones it arrives in. Read from the ini so it can be A/B'd without a build.
 	bool srgbInput = true;
 
+
+
+
 	// The anchor of the output shoulder, in thousandths of linear. Lower preserves more
 	// highlight structure at the cost of dimming the top of the range; the reason it is a
 	// setting rather than a constant is on the conversion shader.
@@ -840,7 +849,57 @@ struct DlssnrAmdBackend::Impl {
 	// TEMPORARY DIAGNOSTIC: how many frames of the series have been logged.
 	int probeSamples = 0;
 
+	// Where the frame's time goes, on the performance counter.
+	//
+	// The engine reports its own job in whole milliseconds and, by the shape of the numbers
+	// it prints, off a clock that only moves about every 16 ms: every job it has ever logged
+	// here is 15, 16, 31, 32, 46, 47, 62, 63 or 78 ms and nothing in between. That is enough
+	// to see a job is slower at 1080p than at 540p, and nothing like enough to say which
+	// stage of the frame the time is in, which is the only question worth asking before
+	// optimising anything. These are the same stages, timed here.
+	uint64_t phaseAccum[7] = {};
+	uint64_t phaseAt[7] = {};
+
+	// Frame-to-frame intervals, for the window the phase log covers.
+	//
+	// The mean is the number everyone quotes and the one that says least about how a frame
+	// rate feels: a run alternating 8 ms and 60 ms has the same mean as a steady 34, and
+	// looks nothing like it. The percentiles and the worst frame are what say that, and they
+	// are also the only place a hitch shows up at all -- the engine's watchdog, a capture
+	// gap, a fence that took a second. The phases measure what this backend spends inside
+	// the frame; these measure the frame.
+	float frameIntervalsMs[128] = {};
+	uint32_t frameIntervalCount = 0;
+	uint64_t lastDrawQpc = 0;
+
+	// The frame that has just finished, kept so that a slow one can be reported with its own
+	// phases rather than the next frame's: the interval that says a frame was slow is only
+	// known when the following frame starts, by which point the slow frame's marks are gone.
+	float prevFramePhasesMs[6] = {};
+	float prevFrameTotalMs = 0.0f;
+	FrameGuidanceFrameId prevFrameId = 0;
+	uint32_t prevFrameJob = 0;
+	uint32_t slowFramesLogged = 0;
+	uint32_t phaseFrames = 0;
+	uint64_t phaseWindowStart = 0;
+
 	uint32_t width = 0, height = 0;
+
+	// The frame counter the phase log runs on, so a reader can tell it from the engine's.
+	static uint64_t Qpc() noexcept {
+		LARGE_INTEGER v{};
+		QueryPerformanceCounter(&v);
+		return static_cast<uint64_t>(v.QuadPart);
+	}
+
+	static double MsPerTick() noexcept {
+		static const double scale = [] {
+			LARGE_INTEGER f{};
+			QueryPerformanceFrequency(&f);
+			return f.QuadPart ? 1000.0 / static_cast<double>(f.QuadPart) : 0.0;
+		}();
+		return scale;
+	}
 
 	~Impl() {
 		// The runtime stays loaded for the life of the process: it starts worker threads
@@ -882,6 +941,7 @@ struct DlssnrAmdBackend::Impl {
 		uint32_t residualTableSlot, const UINT* constants = nullptr,
 		uint32_t constantCount = 4) noexcept;
 	bool WaitForEngine(uint64_t deadlineMs) noexcept;
+	bool SubmitEngineJob() noexcept;
 	void DestroySized() noexcept;
 	float Measure(ID3D12Resource* res, DXGI_FORMAT format,
 		D3D12_RESOURCE_STATES before, uint64_t* nonFinite = nullptr,
@@ -1368,6 +1428,25 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	At<ID3D12CommandQueue*>(runtime, kRvaQueue) = queue.get();
 	queue.get()->AddRef();
 	At<int>(runtime, kRvaHipDevice) = hipDevice;
+	// Inline stays pinned, and it is the one engine key this backend does not expose.
+	//
+	// It was unpinned once to try the runtime's asynchronous route, and the attempt is worth
+	// recording because its failure was not the engine's. With Inline=0 the completion
+	// signal this backend polls -- the sync counter at +0x76c14 against the job counter at
+	// +0x76d74 -- never moves: 473 samples, the counter zero in every one, while the
+	// runtime's own log showed its worker finishing jobs of 31 to 47 ms throughout. With
+	// every wait failing, every frame left through the timeout path below, which returns
+	// without closing the command list or writing the output texture, and the screen went
+	// black. So the black frame that was blamed on the asynchronous route was this backend
+	// never writing a frame.
+	//
+	// The candidate that looked like a completion counter, +0x76d7c, trailed the job counter
+	// by exactly one across 237 samples under a load that should have made it drift -- a
+	// frame rate of 34 against jobs of 31 to 47 ms -- so it is a saved copy of the previous
+	// job number, not a count of finished ones. Driving the asynchronous route needs a
+	// different completion mechanism and a composite that lags a frame, since the engine
+	// rewrites its surface in place and a lagged residual has to be paired with the baseline
+	// it was measured against. Neither is here, so the pin stays.
 	At<uint8_t>(runtime, kRvaInlineMode) = 1;
 	At<uint8_t>(runtime, kRvaEnabled) = 1;
 	// Deliberately *not* written here: Interop, which belongs to dlssnr_on_amd.ini the way
@@ -1525,14 +1604,241 @@ bool DlssnrAmdBackend::Impl::WaitForEngine(uint64_t deadlineMs) noexcept {
 	// The network runs on the engine's own worker, so a fence on this queue says nothing
 	// about whether a result exists. The engine publishes its progress in its sync
 	// counter, and that is what the working implementation polls.
+	//
+	// The loop spins before it sleeps, and the sleep is a real one. `Sleep(0)` gives up the
+	// rest of this thread's slice to a ready thread of the same or higher priority on the
+	// same processor, which is not a promise that the engine's worker -- a plain work item
+	// whose priority this backend does not set -- gets to run. The process timer is already
+	// at a millisecond for the engine's sake, so `Sleep(1)` costs about that much and does
+	// guarantee the worker is scheduled. Against jobs of twenty to thirty milliseconds that
+	// is not a price worth avoiding, and a stall of a third of a second is.
+	//
+	// The spin is short and entered every time: a completion that lands during it is taken
+	// without giving up the processor at all, which is the common case.
 	const uint32_t wanted = At<UINT>(runtime, kRvaJobCounter);
 	const uint64_t deadline = GetTickCount64() + deadlineMs;
+	uint32_t spins = 0;
 	while (At<UINT>(runtime, kRvaSyncCounter) < wanted) {
 		if (GetTickCount64() > deadline) {
 			return false;
 		}
-		Sleep(0);
+		if (++spins <= 4096) {
+			YieldProcessor();
+		} else {
+			Sleep(1);
+		}
 	}
+	return true;
+}
+
+// One job for the engine: its per-pass state, the packet, the submission, and the wait
+// for its worker to publish a result.
+//
+// False means the frame is finished -- the engine refused it, the command list latched an
+// error, or the job did not finish inside its budget -- and the caller should pass the
+// frame through. A method rather than a block only because the frame's phases are timed
+// around it and the job is the one part of Draw that is a single, self-contained act.
+bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
+	auto& p = *this;
+	phaseAt[2] = Impl::Qpc();
+	// ---- 2. the engine's own state, immediately before it records ----
+	// Not set-and-forget: the working implementation rewrites the whole block per pass.
+	// 0x76e1d is the engine's `Temporal` key as well as the per-pass flag the reference
+	// asserts; the control drives it directly.
+	At<uint8_t>(p.runtime, kRvaPerPassFlag) = p.settings.amdTemporal ? 1 : 0;
+
+	// History is only meaningful while consecutive frames agree. The engine's own job
+	// counter cannot be the trigger, for the reason the reference gives: recreating staging
+	// restarts it, so job 1 can follow job 1 and equality says nothing.
+	const uint64_t now = GetTickCount64();
+	const bool gap = p.lastSubmitTick != 0 && now - p.lastSubmitTick > 250;
+	p.lastSubmitTick = now;
+	if (p.resetHistory || gap) {
+		p.resetHistory = false;
+		// The carried residual describes a picture that is no longer here.
+		p.temporalValid = false;
+		At<uint8_t>(p.runtime, kRvaWantHistory) = 0;
+		At<void*>(p.runtime, kRvaHistory) = nullptr;
+	}
+
+	At<UINT>(p.runtime, kRvaDepthInverted) = 0;
+	At<uint8_t>(p.runtime, kRvaDepthExplicit) = 1;
+	// These are the runtime's own defaults, and an attempt to drive them from Magpie's
+	// parameters had to be backed out of. Magpie's UI defaults are the *inverse* of the
+	// runtime's for two of the three: its localToneStrength defaults to 1 where the runtime
+	// starts at 0, its skinStructureStrength defaults to 0 where the runtime starts near 1,
+	// and its useAutoMask defaults to false where the runtime starts at 1. Writing the UI
+	// values straight through therefore switched off the engine's auto mask and skin
+	// structure on every default install, and the visible edit collapsed: the engine log
+	// showed the chain healthy (jobs completing, history on) while the probe read
+	// `frame in 0.5502, engine out 0.5525` -- the filter running but editing almost nothing.
+	//
+	// So the parameter set cannot be mapped one-to-one. Magpie's names and defaults were
+	// chosen for the NGX residual path, where they mean something else. Wiring them up is
+	// still wanted, but it has to be done one field at a time against a real frame, with
+	// the defaults reconciled first -- not all at once on the assumption that the names
+	// line up.
+	// The engine's own controls, from the effect's parameters rather than from constants.
+	// Every one of these was a fixed value until now, which is why the controls in Magpie's
+	// UI appeared to do nothing: they were being written over here on every frame.
+	// NR Style has no engine field to write. The runtime's own UI lists exactly what it
+	// exposes -- Enabled, Tone intensity, Structure intensity, Skin structure and Inline --
+	// with no style among them, its fifteen configuration keys have none either, and the
+	// name the NGX path uses is an extension key of its own (`DLSSNR.Style`). The runtime
+	// also states in its own text that it gates off the broad lighting and colour channels a
+	// style would act on, so there is nothing here for a style to reach directly.
+	//
+	// What the three are given instead is the engine's content controls, chosen by what the
+	// network's own description says they do rather than by what the names suggest. Its
+	// Structure control adds ambient occlusion, contact shadows, reflections and subsurface
+	// scattering, and its skin channel routes structure through a semantic character mask;
+	// both are wrong for flat colour and hard edges, which is exactly what makes Default
+	// unusable on stylised and animated content. So:
+	//
+	//   Default    the sliders govern, unchanged
+	//   Natural    a light touch: less of the added detail, little of the character channel,
+	//              no tone channels -- for animation, cel shading and stylised rendering
+	//   Cinematic  more of both, with the tone channels on, for photographic content
+	//
+	// A scale, not an override, so the sliders stay authoritative at Default and their effect
+	// stays visible at the other two.
+	const float styleDetail = p.settings.style == 1 ? 0.6f
+		: p.settings.style == 2 ? 1.25f : 1.0f;
+	const float styleSkin = p.settings.style == 1 ? 0.3f
+		: p.settings.style == 2 ? 1.2f : 1.0f;
+	const UINT styleChannels = p.settings.style == 1 ? 0u
+		: p.settings.style == 2 ? std::max(1u, static_cast<UINT>(p.settings.amdToneChannels))
+		: static_cast<UINT>(std::clamp(p.settings.amdToneChannels, 0, 2));
+
+	At<float>(p.runtime, kRvaLocalTone) =
+		std::clamp(p.settings.localToneStrength, 0.0f, 2.0f);
+	const float engineStructure =
+		std::clamp(p.settings.localStructureStrength * styleDetail, 0.0f, 2.0f);
+	const float engineSkin =
+		std::clamp(p.settings.skinStructureStrength * styleSkin, 0.0f, 2.0f);
+	At<float>(p.runtime, kRvaLocalStructure) = engineStructure;
+	At<float>(p.runtime, kRvaSkinStructure) = engineSkin;
+	At<UINT>(p.runtime, kRvaToneChannels) = styleChannels;
+	// The values the engine actually receives, so a style that is supposed to change them
+	// can be seen doing so rather than inferred.
+	if (p.settings.style != p.loggedStyle || p.settings.intensity != p.loggedIntensity) {
+		p.loggedStyle = p.settings.style;
+		p.loggedIntensity = p.settings.intensity;
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD engine values: style={} -> structure={:.3f} skin={:.3f} "
+			"toneChannels={} intensity={:.2f}", p.settings.style, engineStructure,
+			engineSkin, styleChannels, p.settings.intensity));
+	}
+	At<UINT>(p.runtime, kRvaCharMask) = p.settings.useAutoMask ? 1u : 0u;
+	At<uint8_t>(p.runtime, kRvaUseDepth) = p.settings.amdUseDepth ? 1 : 0;
+	At<uint8_t>(p.runtime, kRvaUseFsrInputs) = p.settings.amdUseFsrInputs ? 1 : 0;
+	// Deliberately absent: the wait allowance at +0x76c44.
+	//
+	// The working implementation writes `262144 + pixels/2` into that field every pass, and
+	// this backend did the same thing at first. It is a mistake, and the engine's own log
+	// says so plainly. That field is the iteration ceiling the inline wait spins against,
+	// and the engine maintains it itself -- its log shows the ceiling at 13659064, then
+	// 211732559, 191115557, 220213086, 400000000, changing as it measures. Writing the
+	// formula fights it for the field, and the formula's value for 1920x1080 is 1298944:
+	// about 3.5 ms of spinning at the ~370000 iterations/ms the engine reports, against
+	// jobs that take 250-280 ms.
+	//
+	// The log makes the split unmistakable. Every pass where the engine held the field
+	// finished cleanly -- "spin used 404259 iterations for a 63 ms job", no timeout, at a
+	// ceiling in the tens or hundreds of millions. Every one of the thirteen timeouts in
+	// that run reports "iteration cap after 1298944 iterations, cap 1298944", which is the
+	// formula's number, followed by "current input kept" -- the frame handed back
+	// unprocessed. So the intermittent drop-out is not the engine being too slow; it is
+	// this backend lowering the engine's own ceiling and then losing the race to restore it.
+	// The failure feeds itself, because the engine shortens its wait budget after each
+	// timeout, which makes the next expiry likelier under exactly the heavy load where the
+	// user notices it.
+	//
+	// Leaving the field alone lets the engine do what it was already doing: it recovers on
+	// its own, logging "100 clean jobs; wait budget back to 600 ms".
+
+	// The heap, signature and table the reference leaves bound when it hands the frame to
+	// the engine. Slot 0 is the input as a shader resource and slot 1 the same surface as
+	// an unordered-access target -- which is right for a filter that reads and writes one
+	// texture. The engine opens the resource for HIP access itself; this binding is here
+	// so the command list matches the one the engine was written against.
+	p.Bind(0, p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+		p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+	{
+		ID3D12DescriptorHeap* h = p.heap.get();
+		p.list->SetComputeRootSignature(p.root.get());
+		p.list->SetDescriptorHeaps(1, &h);
+		p.list->SetComputeRootDescriptorTable(0,
+			p.heap->GetGPUDescriptorHandleForHeapStart());
+	}
+
+	Packet packet{};
+	packet.list = p.list.get();
+	// One surface, read and written in place. This is the whole contract: the reference
+	// hands over its engine-resolution colour texture and then reads the result out of
+	// that same texture. There is no second resource, and pointing this field at one --
+	// as an earlier version of this backend did -- leaves the engine staring at an empty
+	// texture, which is what its own log reports as "encoded mean 0.000".
+	packet.colour = p.net.get();
+	packet.colourState = kPacketState;
+	packet.motion = p.motion.get();
+	packet.motionState = kPacketState;
+	packet.depth = p.depth.get();
+	packet.depthState = kPacketState;
+	// An exposure rather than nullptr, so the engine uses it instead of adapting its own.
+	// Its adaptation is not stable; the measurements are on kExposureValue.
+	packet.exposure = p.exposureTexture.get();
+	packet.exposureState = kPacketState;
+	// The motion field's pixel scale relative to the network's, as the reference computes
+	// it when it resamples motion for the engine. Without a motion guide these stay at one,
+	// where they have always been.
+	packet.scaleX = p.motionReady ? p.motionScaleX : 1.0f;
+	packet.scaleY = p.motionReady ? p.motionScaleY : 1.0f;
+
+	// No transitions here. The engine is handed shader-readable surfaces, exactly as the
+	// reference hands it shader-readable surfaces, and it deals with hazards itself.
+
+	if (!CallRecord(p.record, &packet) || At<uint8_t>(p.runtime, kRvaStatusFlag) != 0) {
+		p.failed = true;
+		Logger::Get().Error("DLSSNR AMD: the engine refused the frame");
+		return false;
+	}
+
+	if (FAILED(p.list->Close())) {
+		p.failed = true;
+		Logger::Get().Error("DLSSNR AMD: the command list latched an error");
+		return false;
+	}
+	ID3D12CommandList* lists[] = { p.list.get() };
+	p.queue->ExecuteCommandLists(1, lists);
+	if (!CallNotify(p.notify, p.queue.get(), 1, lists)) {
+		p.failed = true;
+		return false;
+	}
+
+	phaseAt[3] = Impl::Qpc();
+
+	// 5 s while the engine is still warming up, 500 ms once it is going. Both are far
+	// above the steady-state cost (tens of milliseconds at this resolution) and bound
+	// how long a stalled job may hold the render thread.
+	const uint64_t budget = p.framesSeen < 3 ? 5000 : 500;
+	++p.framesSeen;
+	if (!p.WaitForEngine(budget)) {
+		// Skip this frame and let the next one try. Latching a failure here would mean
+		// one slow frame disables the effect until the profile is reloaded, which is a
+		// far worse outcome than a frame that came out unprocessed.
+		if (++p.timeouts <= 3) {
+			Logger::Get().Warn(fmt::format(
+				"DLSSNR AMD: engine did not finish within {} ms; frame passed through "
+				"({} so far)", budget, p.timeouts));
+		}
+		// A frame the engine gave up on leaves its history one step behind the scene.
+		p.resetHistory = true;
+		return false;
+	}
+
+	phaseAt[4] = Impl::Qpc();
+
 	return true;
 }
 
@@ -1927,6 +2233,46 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 
 	constexpr D3D12_RESOURCE_STATES kCommon = D3D12_RESOURCE_STATE_COMMON;
 
+	// The frame's stages, on the performance counter. See phaseAccum in Impl for why this
+	// cannot be read off the engine's own job figures.
+	auto& phaseAt = p.phaseAt;
+	phaseAt[0] = Impl::Qpc();
+
+	// The interval since the last one of these, which is the frame time as the renderer and
+	// the game together produced it -- not the part of it spent in here. Measured at the top
+	// of a frame, it is therefore the frame that has just finished.
+	float frameIntervalMs = 0.0f;
+	if (p.lastDrawQpc != 0) {
+		frameIntervalMs = static_cast<float>(
+			double(phaseAt[0] - p.lastDrawQpc) * Impl::MsPerTick());
+		if (p.frameIntervalCount < 128) {
+			p.frameIntervalsMs[p.frameIntervalCount++] = frameIntervalMs;
+		}
+	}
+	p.lastDrawQpc = phaseAt[0];
+
+	// One line per slow frame, carrying the same phases the window log averages.
+	//
+	// The window average says a hitch happened and cannot say what it was made of. A window
+	// whose worst frame was 312 ms reported an engine phase 4.5 ms above normal, which is
+	// 540 ms of extra time across 120 frames -- more than one hitch, and nothing in the
+	// window says whether that was one stall or several. Telling a single 312 ms stall from
+	// a scatter of smaller ones is the difference between a capture that stopped delivering
+	// frames and a chain that got slower, so the slow frame is reported on its own, with the
+	// phases belonging to it.
+	constexpr float kSlowFrameMs = 80.0f;
+	if (frameIntervalMs > kSlowFrameMs && p.slowFramesLogged < 200) {
+		++p.slowFramesLogged;
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD slow frame: {:.1f} ms, frameId {} job {} | convert {:.2f} + motion "
+			"{:.2f} + record {:.2f} + engine {:.2f} + composite {:.2f} + copy {:.2f} = "
+			"{:.2f} ms, {:.2f} elsewhere",
+			frameIntervalMs, p.prevFrameId, p.prevFrameJob,
+			p.prevFramePhasesMs[0], p.prevFramePhasesMs[1], p.prevFramePhasesMs[2],
+			p.prevFramePhasesMs[3], p.prevFramePhasesMs[4], p.prevFramePhasesMs[5],
+			p.prevFrameTotalMs, frameIntervalMs - p.prevFrameTotalMs));
+	}
+
 	// A texture shared between two devices sits in COMMON on the D3D12 side and has to
 	// go back there before the other device may touch it again, so every crossing below
 	// is COMMON -> in use -> COMMON.
@@ -2000,6 +2346,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			kStateShaderRead);
 	}
 
+	phaseAt[1] = Impl::Qpc();
 	// ---- 1c. the motion guide ----
 	// Magpie's frame guidance carries motion vectors in source pixels from its optical-flow
 	// provider, and the engine's temporal machinery wants them: with zero motion its history
@@ -2087,197 +2434,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		return true;
 	}
 
-	// ---- 2. the engine's own state, immediately before it records ----
-	// Not set-and-forget: the working implementation rewrites the whole block per pass.
-	// 0x76e1d is the engine's `Temporal` key as well as the per-pass flag the reference
-	// asserts; the control drives it directly.
-	At<uint8_t>(p.runtime, kRvaPerPassFlag) = p.settings.amdTemporal ? 1 : 0;
-
-	// History is only meaningful while consecutive frames agree. The engine's own job
-	// counter cannot be the trigger, for the reason the reference gives: recreating staging
-	// restarts it, so job 1 can follow job 1 and equality says nothing.
-	const uint64_t now = GetTickCount64();
-	const bool gap = p.lastSubmitTick != 0 && now - p.lastSubmitTick > 250;
-	p.lastSubmitTick = now;
-	if (p.resetHistory || gap) {
-		p.resetHistory = false;
-		// The carried residual describes a picture that is no longer here.
-		p.temporalValid = false;
-		At<uint8_t>(p.runtime, kRvaWantHistory) = 0;
-		At<void*>(p.runtime, kRvaHistory) = nullptr;
-	}
-
-	At<UINT>(p.runtime, kRvaDepthInverted) = 0;
-	At<uint8_t>(p.runtime, kRvaDepthExplicit) = 1;
-	// These are the runtime's own defaults, and an attempt to drive them from Magpie's
-	// parameters had to be backed out of. Magpie's UI defaults are the *inverse* of the
-	// runtime's for two of the three: its localToneStrength defaults to 1 where the runtime
-	// starts at 0, its skinStructureStrength defaults to 0 where the runtime starts near 1,
-	// and its useAutoMask defaults to false where the runtime starts at 1. Writing the UI
-	// values straight through therefore switched off the engine's auto mask and skin
-	// structure on every default install, and the visible edit collapsed: the engine log
-	// showed the chain healthy (jobs completing, history on) while the probe read
-	// `frame in 0.5502, engine out 0.5525` -- the filter running but editing almost nothing.
-	//
-	// So the parameter set cannot be mapped one-to-one. Magpie's names and defaults were
-	// chosen for the NGX residual path, where they mean something else. Wiring them up is
-	// still wanted, but it has to be done one field at a time against a real frame, with
-	// the defaults reconciled first -- not all at once on the assumption that the names
-	// line up.
-	// The engine's own controls, from the effect's parameters rather than from constants.
-	// Every one of these was a fixed value until now, which is why the controls in Magpie's
-	// UI appeared to do nothing: they were being written over here on every frame.
-	// NR Style has no engine field to write. The runtime's own UI lists exactly what it
-	// exposes -- Enabled, Tone intensity, Structure intensity, Skin structure and Inline --
-	// with no style among them, its fifteen configuration keys have none either, and the
-	// name the NGX path uses is an extension key of its own (`DLSSNR.Style`). The runtime
-	// also states in its own text that it gates off the broad lighting and colour channels a
-	// style would act on, so there is nothing here for a style to reach directly.
-	//
-	// What the three are given instead is the engine's content controls, chosen by what the
-	// network's own description says they do rather than by what the names suggest. Its
-	// Structure control adds ambient occlusion, contact shadows, reflections and subsurface
-	// scattering, and its skin channel routes structure through a semantic character mask;
-	// both are wrong for flat colour and hard edges, which is exactly what makes Default
-	// unusable on stylised and animated content. So:
-	//
-	//   Default    the sliders govern, unchanged
-	//   Natural    a light touch: less of the added detail, little of the character channel,
-	//              no tone channels -- for animation, cel shading and stylised rendering
-	//   Cinematic  more of both, with the tone channels on, for photographic content
-	//
-	// A scale, not an override, so the sliders stay authoritative at Default and their effect
-	// stays visible at the other two.
-	const float styleDetail = p.settings.style == 1 ? 0.6f
-		: p.settings.style == 2 ? 1.25f : 1.0f;
-	const float styleSkin = p.settings.style == 1 ? 0.3f
-		: p.settings.style == 2 ? 1.2f : 1.0f;
-	const UINT styleChannels = p.settings.style == 1 ? 0u
-		: p.settings.style == 2 ? std::max(1u, static_cast<UINT>(p.settings.amdToneChannels))
-		: static_cast<UINT>(std::clamp(p.settings.amdToneChannels, 0, 2));
-
-	At<float>(p.runtime, kRvaLocalTone) =
-		std::clamp(p.settings.localToneStrength, 0.0f, 2.0f);
-	const float engineStructure =
-		std::clamp(p.settings.localStructureStrength * styleDetail, 0.0f, 2.0f);
-	const float engineSkin =
-		std::clamp(p.settings.skinStructureStrength * styleSkin, 0.0f, 2.0f);
-	At<float>(p.runtime, kRvaLocalStructure) = engineStructure;
-	At<float>(p.runtime, kRvaSkinStructure) = engineSkin;
-	At<UINT>(p.runtime, kRvaToneChannels) = styleChannels;
-	// The values the engine actually receives, so a style that is supposed to change them
-	// can be seen doing so rather than inferred.
-	if (p.settings.style != p.loggedStyle || p.settings.intensity != p.loggedIntensity) {
-		p.loggedStyle = p.settings.style;
-		p.loggedIntensity = p.settings.intensity;
-		Logger::Get().Info(fmt::format(
-			"DLSSNR AMD engine values: style={} -> structure={:.3f} skin={:.3f} "
-			"toneChannels={} intensity={:.2f}", p.settings.style, engineStructure,
-			engineSkin, styleChannels, p.settings.intensity));
-	}
-	At<UINT>(p.runtime, kRvaCharMask) = p.settings.useAutoMask ? 1u : 0u;
-	At<uint8_t>(p.runtime, kRvaUseDepth) = p.settings.amdUseDepth ? 1 : 0;
-	At<uint8_t>(p.runtime, kRvaUseFsrInputs) = p.settings.amdUseFsrInputs ? 1 : 0;
-	// Deliberately absent: the wait allowance at +0x76c44.
-	//
-	// The working implementation writes `262144 + pixels/2` into that field every pass, and
-	// this backend did the same thing at first. It is a mistake, and the engine's own log
-	// says so plainly. That field is the iteration ceiling the inline wait spins against,
-	// and the engine maintains it itself -- its log shows the ceiling at 13659064, then
-	// 211732559, 191115557, 220213086, 400000000, changing as it measures. Writing the
-	// formula fights it for the field, and the formula's value for 1920x1080 is 1298944:
-	// about 3.5 ms of spinning at the ~370000 iterations/ms the engine reports, against
-	// jobs that take 250-280 ms.
-	//
-	// The log makes the split unmistakable. Every pass where the engine held the field
-	// finished cleanly -- "spin used 404259 iterations for a 63 ms job", no timeout, at a
-	// ceiling in the tens or hundreds of millions. Every one of the thirteen timeouts in
-	// that run reports "iteration cap after 1298944 iterations, cap 1298944", which is the
-	// formula's number, followed by "current input kept" -- the frame handed back
-	// unprocessed. So the intermittent drop-out is not the engine being too slow; it is
-	// this backend lowering the engine's own ceiling and then losing the race to restore it.
-	// The failure feeds itself, because the engine shortens its wait budget after each
-	// timeout, which makes the next expiry likelier under exactly the heavy load where the
-	// user notices it.
-	//
-	// Leaving the field alone lets the engine do what it was already doing: it recovers on
-	// its own, logging "100 clean jobs; wait budget back to 600 ms".
-
-	// The heap, signature and table the reference leaves bound when it hands the frame to
-	// the engine. Slot 0 is the input as a shader resource and slot 1 the same surface as
-	// an unordered-access target -- which is right for a filter that reads and writes one
-	// texture. The engine opens the resource for HIP access itself; this binding is here
-	// so the command list matches the one the engine was written against.
-	p.Bind(0, p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
-		p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
-	{
-		ID3D12DescriptorHeap* h = p.heap.get();
-		p.list->SetComputeRootSignature(p.root.get());
-		p.list->SetDescriptorHeaps(1, &h);
-		p.list->SetComputeRootDescriptorTable(0,
-			p.heap->GetGPUDescriptorHandleForHeapStart());
-	}
-
-	Packet packet{};
-	packet.list = p.list.get();
-	// One surface, read and written in place. This is the whole contract: the reference
-	// hands over its engine-resolution colour texture and then reads the result out of
-	// that same texture. There is no second resource, and pointing this field at one --
-	// as an earlier version of this backend did -- leaves the engine staring at an empty
-	// texture, which is what its own log reports as "encoded mean 0.000".
-	packet.colour = p.net.get();
-	packet.colourState = kPacketState;
-	packet.motion = p.motion.get();
-	packet.motionState = kPacketState;
-	packet.depth = p.depth.get();
-	packet.depthState = kPacketState;
-	// An exposure rather than nullptr, so the engine uses it instead of adapting its own.
-	// Its adaptation is not stable; the measurements are on kExposureValue.
-	packet.exposure = p.exposureTexture.get();
-	packet.exposureState = kPacketState;
-	// The motion field's pixel scale relative to the network's, as the reference computes
-	// it when it resamples motion for the engine. Without a motion guide these stay at one,
-	// where they have always been.
-	packet.scaleX = p.motionReady ? p.motionScaleX : 1.0f;
-	packet.scaleY = p.motionReady ? p.motionScaleY : 1.0f;
-
-	// No transitions here. The engine is handed shader-readable surfaces, exactly as the
-	// reference hands it shader-readable surfaces, and it deals with hazards itself.
-
-	if (!CallRecord(p.record, &packet) || At<uint8_t>(p.runtime, kRvaStatusFlag) != 0) {
-		p.failed = true;
-		Logger::Get().Error("DLSSNR AMD: the engine refused the frame");
-		return true;
-	}
-
-	if (FAILED(p.list->Close())) {
-		p.failed = true;
-		Logger::Get().Error("DLSSNR AMD: the command list latched an error");
-		return true;
-	}
-	ID3D12CommandList* lists[] = { p.list.get() };
-	p.queue->ExecuteCommandLists(1, lists);
-	if (!CallNotify(p.notify, p.queue.get(), 1, lists)) {
-		p.failed = true;
-		return true;
-	}
-
-	// 5 s while the engine is still warming up, 500 ms once it is going. Both are far
-	// above the steady-state cost (tens of milliseconds at this resolution) and bound
-	// how long a stalled job may hold the render thread.
-	const uint64_t budget = p.framesSeen < 3 ? 5000 : 500;
-	++p.framesSeen;
-	if (!p.WaitForEngine(budget)) {
-		// Skip this frame and let the next one try. Latching a failure here would mean
-		// one slow frame disables the effect until the profile is reloaded, which is a
-		// far worse outcome than a frame that came out unprocessed.
-		if (++p.timeouts <= 3) {
-			Logger::Get().Warn(fmt::format(
-				"DLSSNR AMD: engine did not finish within {} ms; frame passed through "
-				"({} so far)", budget, p.timeouts));
-		}
-		// A frame the engine gave up on leaves its history one step behind the scene.
-		p.resetHistory = true;
+	if (!p.SubmitEngineJob()) {
 		return true;
 	}
 
@@ -2349,6 +2506,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		p.failed = true;
 		return true;
 	}
+	ID3D12CommandList* lists[] = { p.list.get() };
 	p.queue->ExecuteCommandLists(1, lists);
 
 	const uint64_t signal2 = ++p.fenceValue;
@@ -2360,6 +2518,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			return true;
 		}
 	}
+	phaseAt[5] = Impl::Qpc();
 	// The frame's last signal: the guidance textures may be reused by the producer once this
 	// value is reached, so the interop is told it before the next frame can Update.
 	if (p.guidanceInterop) {
@@ -2391,6 +2550,67 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			"DLSSNR AMD series {:2d}: in {:.4f}(bad {}) net {:.4f}(bad {}) "
 			"out {:.4f}(bad {}) | frame-to-frame: in {:.5f} out {:.5f}",
 			n, inMean, badIn, netMean, badNet, outMean, badOut, deltaIn, deltaOut));
+	}
+
+	// ---- where the frame went ----
+	// Averaged over a window and printed at the optical-flow provider's cadence, so the two
+	// can be read side by side. The stages are the ones the frame actually has: getting
+	// Magpie's picture into the form the engine takes, resampling the motion guide to the
+	// network's extent, recording and handing over the packet, waiting for the engine's
+	// worker, compositing the result back, and the copy into Magpie's output texture.
+	phaseAt[6] = Impl::Qpc();
+	if (p.phaseWindowStart == 0) {
+		p.phaseWindowStart = phaseAt[0];
+	}
+	for (int i = 0; i < 6; ++i) {
+		p.phaseAccum[i] += phaseAt[i + 1] - phaseAt[i];
+		p.prevFramePhasesMs[i] = static_cast<float>(
+			double(phaseAt[i + 1] - phaseAt[i]) * Impl::MsPerTick());
+	}
+	p.phaseAccum[6] += phaseAt[6] - phaseAt[0];
+	p.prevFrameId = context.frameId;
+	p.prevFrameJob = At<UINT>(p.runtime, kRvaJobCounter);
+	p.prevFrameTotalMs = static_cast<float>(
+		double(phaseAt[6] - phaseAt[0]) * Impl::MsPerTick());
+	if (++p.phaseFrames >= 120) {
+		const double msPerFrame = Impl::MsPerTick() / double(p.phaseFrames);
+		const double span = double(phaseAt[6] - p.phaseWindowStart) * Impl::MsPerTick();
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD phases over {} frames, {:.2f} ms/frame: convert {:.2f} + motion "
+			"{:.2f} + record {:.2f} + engine {:.2f} + composite {:.2f} + copy {:.2f} "
+			"+ rest {:.2f} = {:.2f} ms",
+			p.phaseFrames, span / double(p.phaseFrames),
+			p.phaseAccum[0] * msPerFrame, p.phaseAccum[1] * msPerFrame,
+			p.phaseAccum[2] * msPerFrame, p.phaseAccum[3] * msPerFrame,
+			p.phaseAccum[4] * msPerFrame, p.phaseAccum[5] * msPerFrame,
+			std::max(0.0, (span - double(p.phaseAccum[6]) * msPerFrame)
+				/ double(p.phaseFrames)),
+			p.phaseAccum[6] * msPerFrame));
+		for (int i = 0; i < 7; ++i) {
+			p.phaseAccum[i] = 0;
+		}
+		p.phaseFrames = 0;
+		p.phaseWindowStart = phaseAt[6];
+
+		if (p.frameIntervalCount) {
+			std::vector<float> sorted(
+				p.frameIntervalsMs, p.frameIntervalsMs + p.frameIntervalCount);
+			std::sort(sorted.begin(), sorted.end());
+			const auto at = [&sorted](double q) noexcept {
+				return sorted[static_cast<size_t>(q * double(sorted.size() - 1))];
+			};
+			uint32_t over33 = 0, over50 = 0;
+			for (uint32_t i = 0; i < p.frameIntervalCount; ++i) {
+				over33 += p.frameIntervalsMs[i] > 33.3f ? 1u : 0u;
+				over50 += p.frameIntervalsMs[i] > 50.0f ? 1u : 0u;
+			}
+			Logger::Get().Info(fmt::format(
+				"DLSSNR AMD frame time over {} frames: p50 {:.2f} p95 {:.2f} p99 {:.2f} "
+				"max {:.2f} ms | {} over 33.3 ms, {} over 50",
+				p.frameIntervalCount, at(0.50), at(0.95), at(0.99), sorted.back(),
+				over33, over50));
+			p.frameIntervalCount = 0;
+		}
 	}
 	return true;
 }

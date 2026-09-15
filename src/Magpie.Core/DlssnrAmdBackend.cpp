@@ -1362,14 +1362,24 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	At<int>(runtime, kRvaHipDevice) = hipDevice;
 	At<uint8_t>(runtime, kRvaInlineMode) = 1;
 	At<uint8_t>(runtime, kRvaEnabled) = 1;
-	// Interop is the runtime's own key and is left to dlssnr_on_amd.ini, the way Tonemap is;
-	// setting it here would override whatever the file says. UseFsrInputs and UseDepth are
-	// written per pass from the effect's parameters instead.
+	// Deliberately *not* written here: Interop, which belongs to dlssnr_on_amd.ini the way
+	// Tonemap does. An earlier version of this function still pinned it to 1 while the
+	// comment beside it claimed otherwise, so `Interop=0` in the file did nothing.
 	//
 	// Inline stays pinned, and it is the one engine key this backend does not expose. The
 	// engine in inline mode completes the job on the frame it was given, which is what the
 	// rest of this backend assumes when it converts the result out; the asynchronous mode
 	// hands back the previous frame instead and the chain has no such path.
+
+	// The engines decides at staging time which guides it will carry, and the staging is
+	// built inside the init call below -- so the flags that choose them have to be set
+	// before it, not only per pass. This is not a style choice: UseDepth was moved to the
+	// per-pass block alone, the staging then read the ini default of 1, and every job since
+	// has carried a depth guide this backend has no source for -- fed from a zero-filled
+	// texture, and paid for on every frame.
+	At<uint8_t>(runtime, kRvaUseDepth) = settings.amdUseDepth ? 1 : 0;
+	At<uint8_t>(runtime, kRvaUseFsrInputs) = settings.amdUseFsrInputs ? 1 : 0;
+	At<uint8_t>(runtime, kRvaPerPassFlag) = settings.amdTemporal ? 1 : 0;
 
 	// Deliberately *not* written: the tonemap mode at +0x76e20.
 	//
@@ -1391,10 +1401,8 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// Both flags are also settable from dlssnr_on_amd.ini under [DlssNrOnAmd], but the ini
 	// is read in the runtime's DllMain and these writes land after that, so anything set
 	// here wins. That was tried the other way round -- leaving them to the ini so Inline=0
-	// could be tested -- and the result was a black frame, so they are pinned again. Do not
-	// unpin them without testing one variable at a time.
-	At<uint8_t>(runtime, kRvaInlineMode) = 1;
-	At<uint8_t>(runtime, kRvaInterop) = 1;
+	// could be tested -- and the result was a black frame, so Inline is pinned. Do not unpin
+	// it without testing one variable at a time.
 
 	const std::string weights = weightsPath.string();
 	if (!CallInit(init,

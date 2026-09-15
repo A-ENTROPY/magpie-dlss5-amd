@@ -12,6 +12,10 @@
 #include <dxgi1_6.h>
 #include <bcrypt.h>
 #include <d3dcompiler.h>
+// The runtime's wait loops sleep in milliseconds, and a millisecond sleep is only a
+// millisecond when the system timer has been raised. See the note in Initialize.
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 
 namespace Magpie {
 
@@ -791,6 +795,7 @@ struct DlssnrAmdBackend::Impl {
 	bool motionReady = false;
 	float motionScaleX = 1.0f, motionScaleY = 1.0f;
 	bool wantMotion = false;
+	bool timerRaised = false;
 	// What this backend asks the renderer's guidance service for, mirrored back at it so the
 	// optical-flow provider actually runs for us.
 	MotionVectorRequest motionRequest{};
@@ -841,6 +846,9 @@ struct DlssnrAmdBackend::Impl {
 		// The runtime stays loaded for the life of the process: it starts worker threads
 		// holding references into its own image, and unloading it under them is not
 		// something this backend can make safe.
+		if (timerRaised) {
+			timeEndPeriod(1);
+		}
 	}
 
 	D3D12_CPU_DESCRIPTOR_HANDLE Cpu(uint32_t slot) const noexcept {
@@ -1680,6 +1688,19 @@ bool DlssnrAmdBackend::Initialize(
 	if (!p.fenceEvent.valid() || FAILED(p.list->Close())) {
 		return false;
 	}
+
+	// Raise the system timer to 1 ms for this process, and hold it for the backend's life.
+	//
+	// The runtime waits in milliseconds -- its own decompilation shows Sleep(0) and Sleep(1)
+	// in the job and worker paths -- and Windows resolves any millisecond wait to the system
+	// timer tick, 15.6 ms by default. That tick is what the engine's own job times are
+	// quantized to: 15, 31, 46, 62 and 78 ms, all multiples of it, and identical at 480x270
+	// and 960x540 despite four times the pixels. The network is not taking 31 ms to do 0.13
+	// megapixels of work; its waits are being billed in 15.6 ms units. Since Windows 10 2004
+	// the timer resolution is per process, and the engine is a DLL in this process, so
+	// raising it here is what those waits need.
+	timeBeginPeriod(1);
+	p.timerRaised = true;
 
 	// The motion guide's crossing from D3D11 to this device, the same boundary the NGX path
 	// uses. It is created once; each frame either updates it with this frame's guidance or

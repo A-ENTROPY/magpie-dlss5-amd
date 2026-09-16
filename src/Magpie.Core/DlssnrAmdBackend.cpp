@@ -1,5 +1,12 @@
 #include "pch.h"
 #include "DlssnrAmdBackend.h"
+
+// The reconstruction route drives the FSR3 upscaler this project already carries. Its
+// implementation is compiled only when the FidelityFX SDK is present, and the build treats
+// that SDK as optional, so the call sites are guarded the same way rather than assuming it.
+#ifdef MP_ENABLE_FSR3_ZEROMV
+#include "FSR3Upscaler.h"
+#endif
 #include "FrameGuidanceD3D12Interop.h"
 #include "DeviceResources.h"
 #include "Logger.h"
@@ -755,6 +762,11 @@ struct DlssnrAmdBackend::Impl {
 
 
 
+	// Whether the engine's edited frame is handed to the FSR3 upscaler to reconstruct, rather
+	// than composited back here as a residual. Read from the ini like srgbInput and editBound,
+	// so the two routes can be compared without a rebuild.
+	bool reconstruct = false;
+
 	// The anchor of the output shoulder, in thousandths of linear. Lower preserves more
 	// highlight structure at the cost of dimming the top of the range; the reason it is a
 	// setting rather than a constant is on the conversion shader.
@@ -767,6 +779,27 @@ struct DlssnrAmdBackend::Impl {
 	// How large an edit the resolve will apply, in thousandths of the local magnitude.
 	// Lower is calmer; the reason it is a setting rather than a constant is on the shader.
 	uint32_t editBoundMilli = 500;
+
+	// The reconstruction route.
+	//
+	// Everything this backend does after the engine has edited its frame is a way of getting
+	// the edit back onto the captured picture: a residual taken at the network's resolution,
+	// reprojected, and composited onto the full-resolution frame. This project already carries
+	// a finished upscaler that does that job with a temporal accumulator behind it --
+	// FSR3Upscaler takes a render-resolution colour, copies it into shared surfaces of its
+	// own, takes motion from the frame guidance, supplies its own flat depth, runs at zero
+	// jitter and writes the upscaled result. Handing it the engine's edited frame replaces the
+	// resolve and the two hand-written temporal passes with an accumulator built for this.
+	//
+	// What that is not, plainly: the captured frame has already been upscaled by the game, so
+	// the colour handed over carries no sub-pixel jitter and there is no depth to give. An
+	// implementation sitting before the game's upscaler has both and reconstructs better for
+	// it. This is the same accumulator working from less.
+	std::unique_ptr<NativeEffectBackend> reconstruction;
+	winrt::com_ptr<ID3D11Texture2D> netShared11;
+	winrt::com_ptr<ID3D12Resource> netShared12;
+	uint32_t reconstructionDraws = 0;
+	uint32_t reconstructionFailures = 0;
 
 	winrt::com_ptr<ID3D12PipelineState> temporal;
 
@@ -942,6 +975,11 @@ struct DlssnrAmdBackend::Impl {
 		uint32_t constantCount = 4) noexcept;
 	bool WaitForEngine(uint64_t deadlineMs) noexcept;
 	bool SubmitEngineJob() noexcept;
+	// Brings up the FSR3 upscaler over a shared copy of the engine's frame, when the route is
+	// selected. A no-op otherwise, and a no-op when the SDK is not in this build.
+	bool CreateReconstruction(DeviceResources& resources, ID3D11Texture2D* output) noexcept;
+	// Hands the engine's edited frame to it and lets it write the output.
+	bool RunReconstruction(const NativeEffectDrawContext& context) noexcept;
 	void DestroySized() noexcept;
 	float Measure(ID3D12Resource* res, DXGI_FORMAT format,
 		D3D12_RESOURCE_STATES before, uint64_t* nonFinite = nullptr,
@@ -1252,7 +1290,116 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 	return true;
 }
 
+bool DlssnrAmdBackend::Impl::CreateReconstruction(
+	DeviceResources& resources, ID3D11Texture2D* output
+) noexcept {
+	reconstruction.reset();
+	netShared11 = nullptr;
+	netShared12 = nullptr;
+	if (!reconstruct || !netWidth || !netHeight || !output) {
+		return true;
+	}
+#ifndef MP_ENABLE_FSR3_ZEROMV
+	Logger::Get().Warn(
+		"DLSSNR AMD: the reconstruction route was asked for but this build has no FSR3 "
+		"upscaler; falling back to the resolve");
+	return true;
+#else
+	if (!CreateSharedTexture(device11, device12.get(), netWidth, netHeight,
+			DXGI_FORMAT_R16G16B16A16_FLOAT, false, netShared11, netShared12)) {
+		Logger::Get().Error("DLSSNR AMD: the reconstruction input could not be shared");
+		return false;
+	}
+	auto upscaler = std::make_unique<FSR3Upscaler>();
+	if (!upscaler->Initialize(resources, netShared11.get(), output, settings.motionRequest)) {
+		Logger::Get().Error("DLSSNR AMD: the FSR3 upscaler refused to initialise");
+		return false;
+	}
+	reconstruction = std::move(upscaler);
+	// Said out loud because the sizes are the whole point of the route: the engine edits at
+	// netWidth by netHeight and the accumulator reconstructs the captured size from it.
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD: reconstruction on -- FSR3 upscaler from {}x{} to the captured size, "
+		"motion {}", netWidth, netHeight,
+		settings.motionRequest.method == OpticalFlowMethod::None ? "none (zero-MV route)"
+			: "from the frame guidance"));
+	return true;
+#endif
+}
+
+bool DlssnrAmdBackend::Impl::RunReconstruction(
+	const NativeEffectDrawContext& context
+) noexcept {
+#ifdef MP_ENABLE_FSR3_ZEROMV
+	// The engine's submission is on the queue whether or not it answered, so the allocator
+	// cannot be handed to a new list until it has run -- the same wait the composite path
+	// does before it records anything.
+	const uint64_t submitted = ++fenceValue;
+	queue->Signal(fence.get(), submitted);
+	if (fence->GetCompletedValue() < submitted) {
+		fence->SetEventOnCompletion(submitted, fenceEvent.get());
+		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
+			return false;
+		}
+	}
+	if (FAILED(allocator->Reset()) ||
+		FAILED(list->Reset(allocator.get(), nullptr))) {
+		return false;
+	}
+	// The engine leaves its surface readable; a copy to a surface the other device reads goes
+	// through COMMON, which is the rule every crossing in this backend follows.
+	Barrier(list.get(), netShared12.get(), D3D12_RESOURCE_STATE_COMMON,
+		D3D12_RESOURCE_STATE_COPY_DEST);
+	list->CopyResource(netShared12.get(), net.get());
+	Barrier(list.get(), netShared12.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		D3D12_RESOURCE_STATE_COMMON);
+	if (FAILED(list->Close())) {
+		return false;
+	}
+	ID3D12CommandList* lists[] = { list.get() };
+	queue->ExecuteCommandLists(1, lists);
+	const uint64_t copied = ++fenceValue;
+	queue->Signal(fence.get(), copied);
+	if (fence->GetCompletedValue() < copied) {
+		fence->SetEventOnCompletion(copied, fenceEvent.get());
+		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
+			return false;
+		}
+	}
+
+	// The upscaler does its own copying, its own fences and its own barriers from here: it is
+	// handed the shared texture, not a command list.
+	const NativeEffectDrawContext hand{
+		.input = netShared11.get(),
+		.output = context.output,
+		.frameId = context.frameId,
+		.inputRevision = context.inputRevision,
+		.frameGuidance = context.frameGuidance,
+		.zeroFrameGuidance = context.zeroFrameGuidance,
+	};
+	if (!reconstruction->Draw(hand)) {
+		return false;
+	}
+	++reconstructionDraws;
+	if (reconstructionDraws == 1 || reconstructionDraws % 300 == 0) {
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: reconstruction frame {} ({})", reconstructionDraws,
+			context.frameGuidance.IsValidFor(context.frameId, { netWidth, netHeight })
+				? "guidance valid" : "guidance not valid for this size"));
+	}
+	return true;
+#else
+	(void)context;
+	return false;
+#endif
+}
+
 void DlssnrAmdBackend::Impl::DestroySized() noexcept {
+	// Before the surfaces: the upscaler holds the shared texture it was given, and it has to
+	// let go of one that is about to be replaced.
+	reconstruction.reset();
+	netShared11 = nullptr;
+	netShared12 = nullptr;
 	sharedIn11 = nullptr;
 	sharedIn12 = nullptr;
 	sharedOut11 = nullptr;
@@ -1937,6 +2084,11 @@ bool DlssnrAmdBackend::Initialize(
 			850, iniPath.c_str());
 		p.shoulderMilli = static_cast<uint32_t>(std::clamp(shoulder, 50, 990));
 	}
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		p.reconstruct =
+			GetPrivateProfileIntW(L"DlssNrOnAmd", L"Reconstruct", 0, iniPath.c_str()) != 0;
+	}
 	Logger::Get().Info(fmt::format("DLSSNR AMD: edit bound {} / 1000", p.editBoundMilli));
 	// The engine module stays loaded across effect rebuilds and keeps its history, so a
 	// new backend instance always starts by invalidating it.
@@ -2033,6 +2185,9 @@ bool DlssnrAmdBackend::Initialize(
 			inputDesc.Format, outputDesc.Format)) {
 		return false;
 	}
+	if (!p.CreateReconstruction(resources, output)) {
+		return false;
+	}
 	if (!p.InitEngine(ExeDirectory() / kWeightsName)) {
 		return false;
 	}
@@ -2106,7 +2261,14 @@ bool DlssnrAmdBackend::Resize(
 			WaitForSingleObject(p.fenceEvent.get(), 1000);
 		}
 	}
-	return p.CreateSized(inDesc.Width, inDesc.Height, inDesc.Format, outDesc.Format);
+	const bool sized =
+		p.CreateSized(inDesc.Width, inDesc.Height, inDesc.Format, outDesc.Format);
+	if (!sized) {
+		return false;
+	}
+	// Rebuilt against the new sizes; CreateSized has already released the old surfaces, so
+	// this is the only place the upscaler can be handed a matching pair.
+	return p.CreateReconstruction(resources, output);
 }
 
 float DlssnrAmdBackend::Impl::Measure(
@@ -2465,6 +2627,25 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	}
 
 	if (!p.SubmitEngineJob()) {
+		return true;
+	}
+
+	if (p.reconstruction) {
+		// The reconstruction writes the output itself -- it is handed the engine's frame and
+		// the output texture, and does its own copying and fencing between them. Everything
+		// below composes the edit back here instead, so none of it should run.
+		//
+		// A failure is latched rather than retried: the output texture would keep whatever it
+		// held, which is a frozen picture, and a route that cannot draw should say so through
+		// the same rejection any other broken effect gets.
+		if (!p.RunReconstruction(context)) {
+			if (++p.reconstructionFailures <= 3) {
+				Logger::Get().Warn(fmt::format(
+					"DLSSNR AMD: the reconstruction did not draw ({} so far)",
+					p.reconstructionFailures));
+			}
+			p.failed = true;
+		}
 		return true;
 	}
 

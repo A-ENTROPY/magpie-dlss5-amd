@@ -569,18 +569,39 @@ bool CallNotify(NotifyFn fn, ID3D12CommandQueue* queue, UINT count,
 }
 
 ID3D12Device* CreateDeviceOnAdapter(ID3D11Device* device11) noexcept {
+	// Each of the three ways this can fail says which it was, and the third says which adapter
+	// it was trying. They used to share one message further up, which made a session that
+	// landed on the wrong GPU and a device the driver refused look identical in the log.
+	// This machine has two adapters, so that distinction is worth keeping.
 	winrt::com_ptr<IDXGIDevice> dxgiDevice;
-	if (FAILED(device11->QueryInterface(IID_PPV_ARGS(dxgiDevice.put())))) {
+	HRESULT hr = device11->QueryInterface(IID_PPV_ARGS(dxgiDevice.put()));
+	if (FAILED(hr)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR AMD: the renderer's D3D11 device is not an IDXGIDevice (0x{:08x})",
+			static_cast<uint32_t>(hr)));
 		return nullptr;
 	}
 	winrt::com_ptr<IDXGIAdapter> adapter;
-	if (FAILED(dxgiDevice->GetAdapter(adapter.put()))) {
+	hr = dxgiDevice->GetAdapter(adapter.put());
+	if (FAILED(hr)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR AMD: the renderer's device reports no adapter (0x{:08x})",
+			static_cast<uint32_t>(hr)));
 		return nullptr;
 	}
 
+	DXGI_ADAPTER_DESC desc{};
+	const bool named = SUCCEEDED(adapter->GetDesc(&desc));
 	winrt::com_ptr<ID3D12Device> device12;
-	if (FAILED(D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_12_0,
-		IID_PPV_ARGS(device12.put())))) {
+	hr = D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_12_0,
+		IID_PPV_ARGS(device12.put()));
+	if (FAILED(hr)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR AMD: no D3D12 device at feature level 12_0 on the adapter the renderer "
+			"is using -- vendor 0x{:04x} device 0x{:04x}{} -- 0x{:08x}",
+			named ? desc.VendorId : 0u, named ? desc.DeviceId : 0u,
+			named && desc.VendorId == 0x8086 ? " (Intel; the engine needs the AMD one)" : "",
+			static_cast<uint32_t>(hr)));
 		return nullptr;
 	}
 	return device12.detach();
@@ -817,6 +838,14 @@ struct DlssnrAmdBackend::Impl {
 	// values onto what a display expects -- the shoulder and the sRGB encode -- never ran.
 	// That is the whole of the darkness: linear read as sRGB crushes the shadows and pins the
 	// highlights.
+	// The ordering between the upscaler's writes and this backend's reads. They are on two
+	// devices, and a shared resource used by two devices without one is what the driver
+	// answers with DXGI_ERROR_DRIVER_INTERNAL_ERROR and a removed device -- which is exactly
+	// what happened when the upscaler's output was read straight back on this queue.
+	winrt::com_ptr<ID3D11Fence> reconFence11;
+	winrt::com_ptr<ID3D12Fence> reconFence12;
+	winrt::com_ptr<ID3D11DeviceContext4> context4;
+	uint64_t reconFenceValue = 0;
 	winrt::com_ptr<ID3D11Texture2D> reconOut11;
 	winrt::com_ptr<ID3D12Resource> reconOut12;
 	winrt::com_ptr<ID3D11Texture2D> motionShared11;
@@ -1392,6 +1421,27 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		.useReactiveMask = false,
 		.useTransparencyMask = false,
 	});
+	// The fence pair the two devices share, built the way the upscaler builds its own.
+	if (FAILED(device11->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+			IID_PPV_ARGS(reconFence11.put())))) {
+		Logger::Get().Error("DLSSNR AMD: the reconstruction could not create its fence");
+		return false;
+	}
+	HANDLE rawFence = nullptr;
+	if (FAILED(reconFence11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &rawFence))) {
+		Logger::Get().Error("DLSSNR AMD: the reconstruction could not share its fence");
+		return false;
+	}
+	wil::unique_handle fenceHandle(rawFence);
+	if (FAILED(device12->OpenSharedHandle(fenceHandle.get(),
+			IID_PPV_ARGS(reconFence12.put())))) {
+		Logger::Get().Error("DLSSNR AMD: the reconstruction could not open its fence");
+		return false;
+	}
+	if (FAILED(context11->QueryInterface(IID_PPV_ARGS(context4.put())))) {
+		Logger::Get().Error("DLSSNR AMD: the renderer's context cannot signal a fence");
+		return false;
+	}
 	reconstruction = std::move(upscaler);
 	// Said out loud because the sizes are the whole point of the route: the engine edits at
 	// netWidth by netHeight and the accumulator reconstructs the captured size from it.
@@ -1504,13 +1554,20 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	// picture out of linear and into what the output format means. Skipping it is what made
 	// the route dark -- see the note on the surface.
 	//
-	// Its work is in D3D11, so the writes are flushed before this queue reads the D3D12 side
-	// of the same surface; the upscaler has already waited on its own fence.
+	// Order the two devices: the upscaler's copy into the shared surface is D3D11 work, and
+	// this queue is about to read the D3D12 side of it. Flushing submits that work but says
+	// nothing about when it finishes, so the fence is signalled where the work is and waited
+	// on where the result is read.
+	const uint64_t reconReady = ++reconFenceValue;
+	if (FAILED(context4->Signal(reconFence11.get(), reconReady))) {
+		return fail("signalling the reconstruction fence");
+	}
 	context11->Flush();
 	if (FAILED(allocator->Reset()) ||
 		FAILED(list->Reset(allocator.get(), nullptr))) {
 		return fail("resetting the allocator for the output");
 	}
+	queue->Wait(reconFence12.get(), reconReady);
 	if (outputIsFp16) {
 		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_COMMON,
 			D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1535,8 +1592,19 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
 			D3D12_RESOURCE_STATE_COMMON);
 	}
-	if (FAILED(list->Close())) {
-		return fail("closing the output list");
+	const HRESULT closeHr = list->Close();
+	if (FAILED(closeHr)) {
+		// The HRESULT is the only thing that says why: the list latches the first invalid
+		// operation without saying which, and the debug layer's message does not reach this
+		// log. Logged with the device's own reason, which names a removal if that is what
+		// happened rather than a recording mistake.
+		if (++reconstructionFailures <= 6) {
+			Logger::Get().Warn(fmt::format(
+				"DLSSNR AMD: the output list would not close, 0x{:08x}; device reason "
+				"0x{:08x}", static_cast<uint32_t>(closeHr),
+				static_cast<uint32_t>(device12->GetDeviceRemovedReason())));
+		}
+		return false;
 	}
 	ID3D12CommandList* outLists[] = { list.get() };
 	queue->ExecuteCommandLists(1, outLists);
@@ -1571,6 +1639,10 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	netShared12 = nullptr;
 	reconOut11 = nullptr;
 	reconOut12 = nullptr;
+	reconFence11 = nullptr;
+	reconFence12 = nullptr;
+	context4 = nullptr;
+	reconFenceValue = 0;
 	motionShared11 = nullptr;
 	motionShared12 = nullptr;
 	zeroMotion11 = nullptr;

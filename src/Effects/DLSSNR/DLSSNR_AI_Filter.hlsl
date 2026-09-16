@@ -216,6 +216,14 @@ int amdUseDepth;
 int amdUseFsrInputs;
 
 //!PARAMETER
+//!GROUP DLSSNR · Pass 1
+//!LABEL NR Reconstruction
+//!DEFAULT 0
+//!OPTION 0 Resolve (residual)
+//!OPTION 1 FSR3 upscale
+int amdReconstruct;
+
+//!PARAMETER
 //!GROUP DLSSNR · Pass 2
 
 //!LABEL NR Style\n(0 Default, 1 Natural, 2 Cinematic)

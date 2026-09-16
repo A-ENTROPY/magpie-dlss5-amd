@@ -52,6 +52,7 @@ DLSSNRSettings ParseDLSSNRSettings(const EffectOption& option, bool hdrEnabled) 
 			getParameter("amdToneChannels", 0.0f))), 0, 2),
 		.amdUseDepth = getParameter("amdUseDepth", 0.0f) >= 0.5f ? 1 : 0,
 		.amdUseFsrInputs = getParameter("amdUseFsrInputs", 1.0f) >= 0.5f ? 1 : 0,
+		.amdReconstruct = getParameter("amdReconstruct", 0.0f) >= 0.5f ? 1 : 0,
 		.motionRequest = ParseDlssOpticalFlowRequest(option),
 		.experimentalHdr = DlssnrExperimentProtocol{ .enabled = hdrEnabled, .scale = 1.0f }
 	};

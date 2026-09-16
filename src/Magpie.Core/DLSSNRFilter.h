@@ -29,6 +29,11 @@ struct DLSSNRSettings {
 	int amdToneChannels = 0;
 	int amdUseDepth = 0;
 	int amdUseFsrInputs = 1;
+	// How the engine's edited frame gets back onto the captured picture. Off is the residual
+	// route this backend has always used: the edit is taken at the network's resolution,
+	// reprojected and composited onto the full-resolution frame. On hands the edited frame to
+	// the FSR3 upscaler this project carries and lets its accumulator reconstruct instead.
+	int amdReconstruct = 0;
 	MotionVectorRequest motionRequest{};
 	// Experimental FP16 path. SDR RGBA8 remains the default.
 	DlssnrExperimentProtocol experimentalHdr{};

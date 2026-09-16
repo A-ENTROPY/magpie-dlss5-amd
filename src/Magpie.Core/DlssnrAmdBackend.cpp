@@ -2029,13 +2029,13 @@ bool DlssnrAmdBackend::Initialize(
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD parameters: tone={:.3f} structure={:.3f} skin={:.3f} autoMask={} "
 		"temporal={} toneChannels={} useDepth={} useHostInputs={} resolution={}% "
-		"style={} intensity={:.2f}",
+		"style={} intensity={:.2f} reconstruct={}",
 		settings.localToneStrength, settings.localStructureStrength,
 		settings.skinStructureStrength, settings.useAutoMask ? "on" : "off",
 		settings.amdTemporal, settings.amdToneChannels, settings.amdUseDepth,
 		settings.amdUseFsrInputs,
 		settings.enableInputResolutionScaling ? int(settings.inputResolutionPercent) : 100,
-		settings.style, settings.intensity));
+		settings.style, settings.intensity, settings.amdReconstruct));
 	// The one control that moves the frame rate. The network's cost is close to linear in
 	// the pixels it is handed -- measured at roughly 30 ms per megapixel here -- and in
 	// inline mode the game waits for it, so the frame rate is its reciprocal. Magpie's
@@ -2084,11 +2084,10 @@ bool DlssnrAmdBackend::Initialize(
 			850, iniPath.c_str());
 		p.shoulderMilli = static_cast<uint32_t>(std::clamp(shoulder, 50, 990));
 	}
-	{
-		const auto iniPath = ExeDirectory() / kIniName;
-		p.reconstruct =
-			GetPrivateProfileIntW(L"DlssNrOnAmd", L"Reconstruct", 0, iniPath.c_str()) != 0;
-	}
+	// The reconstruction route is an effect parameter rather than an ini key, so the app's own
+	// control reaches it and there is one source of truth for it. The ini key it was read from
+	// during development is gone rather than kept alongside.
+	p.reconstruct = settings.amdReconstruct != 0;
 	Logger::Get().Info(fmt::format("DLSSNR AMD: edit bound {} / 1000", p.editBoundMilli));
 	// The engine module stays loaded across effect rebuilds and keeps its history, so a
 	// new backend instance always starts by invalidating it.

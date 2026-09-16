@@ -592,6 +592,13 @@ ID3D12Device* CreateDeviceOnAdapter(ID3D11Device* device11) noexcept {
 
 	DXGI_ADAPTER_DESC desc{};
 	const bool named = SUCCEEDED(adapter->GetDesc(&desc));
+	// Which adapter this session landed on, said every time rather than only on failure: this
+	// machine has two, and a session on the wrong one cannot start the engine at all.
+	if (named) {
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: render adapter vendor 0x{:04x} device 0x{:04x}",
+			desc.VendorId, desc.DeviceId));
+	}
 	winrt::com_ptr<ID3D12Device> device12;
 	hr = D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_12_0,
 		IID_PPV_ARGS(device12.put()));
@@ -1132,7 +1139,24 @@ bool DlssnrAmdBackend::Impl::CreateHip() noexcept {
 		}
 	}
 	if (hipDevice < 0) {
-		Logger::Get().Error("DLSSNR AMD: no HIP device matches the render adapter");
+		// Which adapter the renderer is on, and which ones HIP is offering. This machine has
+		// two, and when the renderer lands on the one without a HIP device the backend cannot
+		// start at all -- a failure that reads as the effect being broken and is not.
+		std::string seen;
+		for (int i = 0; i < count; ++i) {
+			if (getProps(&props, i) != 0) {
+				continue;
+			}
+			LUID luid{};
+			std::memcpy(&luid, props.raw + 272, sizeof(luid));
+			seen += fmt::format("{}{:08x}:{:08x}", seen.empty() ? "" : ", ",
+				static_cast<uint32_t>(luid.HighPart), static_cast<uint32_t>(luid.LowPart));
+		}
+		Logger::Get().Error(fmt::format(
+			"DLSSNR AMD: no HIP device matches the render adapter -- renderer is on LUID "
+			"{:08x}:{:08x}, HIP offers [{}] of {} device(s)",
+			static_cast<uint32_t>(target.HighPart), static_cast<uint32_t>(target.LowPart),
+			seen, count));
 		return false;
 	}
 	if (hipSet(hipDevice) != 0) {

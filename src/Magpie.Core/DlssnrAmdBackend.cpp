@@ -798,6 +798,22 @@ struct DlssnrAmdBackend::Impl {
 	std::unique_ptr<NativeEffectBackend> reconstruction;
 	winrt::com_ptr<ID3D11Texture2D> netShared11;
 	winrt::com_ptr<ID3D12Resource> netShared12;
+	// Motion at the network's extent, for the upscaler to reproject with.
+	//
+	// It asks the frame guidance for motion, and it checks that what it is handed matches its
+	// own input extent -- depth, motion and confidence all present and all at that size. The
+	// guidance this backend is given is produced at the captured extent, so it cannot be
+	// passed through; what goes over instead is a view built here, at the network's size,
+	// carrying the motion this backend already resamples to exactly that extent.
+	winrt::com_ptr<ID3D11Texture2D> motionShared11;
+	winrt::com_ptr<ID3D12Resource> motionShared12;
+	// The three the check needs and the dispatch does not read: the upscaler supplies its own
+	// flat depth and never samples the ones handed in, so these exist to satisfy the contract
+	// and are never written after creation. The zero motion is the honest answer for a frame
+	// whose own motion is not ready.
+	winrt::com_ptr<ID3D11Texture2D> zeroMotion11;
+	winrt::com_ptr<ID3D11Texture2D> guideDepth11;
+	winrt::com_ptr<ID3D11Texture2D> guideConfidence11;
 	uint32_t reconstructionDraws = 0;
 	uint32_t reconstructionFailures = 0;
 
@@ -1310,6 +1326,31 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		Logger::Get().Error("DLSSNR AMD: the reconstruction input could not be shared");
 		return false;
 	}
+	// The placeholders: two that are never read, one that stands in for motion until the
+	// provider has produced any. None of them needs contents.
+	auto makePlain = [this](DXGI_FORMAT format, winrt::com_ptr<ID3D11Texture2D>& out) noexcept {
+		D3D11_TEXTURE2D_DESC desc{};
+		desc.Width = netWidth;
+		desc.Height = netHeight;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.Format = format;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		return SUCCEEDED(device11->CreateTexture2D(&desc, nullptr, out.put()));
+	};
+	if (!CreateSharedTexture(device11, device12.get(), netWidth, netHeight,
+			DXGI_FORMAT_R16G16_FLOAT, false, motionShared11, motionShared12)) {
+		Logger::Get().Error("DLSSNR AMD: the reconstruction could not share its motion");
+		return false;
+	}
+	if (!makePlain(DXGI_FORMAT_R16G16_FLOAT, zeroMotion11) ||
+		!makePlain(DXGI_FORMAT_R32_FLOAT, guideDepth11) ||
+		!makePlain(DXGI_FORMAT_R8_UNORM, guideConfidence11)) {
+		Logger::Get().Error("DLSSNR AMD: the reconstruction could not build its guide");
+		return false;
+	}
 	auto upscaler = std::make_unique<FSR3Upscaler>();
 	if (!upscaler->Initialize(resources, netShared11.get(), output, settings.motionRequest)) {
 		Logger::Get().Error("DLSSNR AMD: the FSR3 upscaler refused to initialise");
@@ -1353,6 +1394,15 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	list->CopyResource(netShared12.get(), net.get());
 	Barrier(list.get(), netShared12.get(), D3D12_RESOURCE_STATE_COPY_DEST,
 		D3D12_RESOURCE_STATE_COMMON);
+	// The motion this backend resampled to the network's extent, on the same submission, so
+	// the single fence below covers both and the upscaler reads a finished pair.
+	if (motionReady) {
+		Barrier(list.get(), motionShared12.get(), D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		list->CopyResource(motionShared12.get(), motion.get());
+		Barrier(list.get(), motionShared12.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			D3D12_RESOURCE_STATE_COMMON);
+	}
 	if (FAILED(list->Close())) {
 		return false;
 	}
@@ -1367,6 +1417,22 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 		}
 	}
 
+	// A guidance view at the upscaler's own extent, built rather than inherited: see the note
+	// on the motion surfaces. The sync point is left empty because the copy above was ordered
+	// by this queue and the fence before it, so there is nothing else to wait on.
+	const FrameGuidanceExtent extent{ netWidth, netHeight };
+	FrameGuidanceMetadata meta{};
+	meta.frameId = context.frameId;
+	meta.sourceExtent = extent;
+	meta.validRegion = FrameGuidanceRegion{ 0, 0, netWidth, netHeight };
+	meta.valid = true;
+	FrameGuidanceView guidance{};
+	guidance.motion = { motionReady ? motionShared11.get() : zeroMotion11.get(),
+		DXGI_FORMAT_R16G16_FLOAT, meta };
+	guidance.depth = { guideDepth11.get(), DXGI_FORMAT_R32_FLOAT, meta };
+	guidance.confidence = { guideConfidence11.get(), DXGI_FORMAT_R8_UNORM, meta };
+	guidance.requiresHistoryReset = context.frameGuidance.requiresHistoryReset;
+
 	// The upscaler does its own copying, its own fences and its own barriers from here: it is
 	// handed the shared texture, not a command list.
 	const NativeEffectDrawContext hand{
@@ -1374,8 +1440,8 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 		.output = context.output,
 		.frameId = context.frameId,
 		.inputRevision = context.inputRevision,
-		.frameGuidance = context.frameGuidance,
-		.zeroFrameGuidance = context.zeroFrameGuidance,
+		.frameGuidance = guidance,
+		.zeroFrameGuidance = guidance,
 	};
 	if (!reconstruction->Draw(hand)) {
 		return false;
@@ -1383,9 +1449,8 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	++reconstructionDraws;
 	if (reconstructionDraws == 1 || reconstructionDraws % 300 == 0) {
 		Logger::Get().Info(fmt::format(
-			"DLSSNR AMD: reconstruction frame {} ({})", reconstructionDraws,
-			context.frameGuidance.IsValidFor(context.frameId, { netWidth, netHeight })
-				? "guidance valid" : "guidance not valid for this size"));
+			"DLSSNR AMD: reconstruction frame {} (motion {})", reconstructionDraws,
+			motionReady ? "from this backend's resample" : "not ready, zero"));
 	}
 	return true;
 #else
@@ -1400,6 +1465,11 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	reconstruction.reset();
 	netShared11 = nullptr;
 	netShared12 = nullptr;
+	motionShared11 = nullptr;
+	motionShared12 = nullptr;
+	zeroMotion11 = nullptr;
+	guideDepth11 = nullptr;
+	guideConfidence11 = nullptr;
 	sharedIn11 = nullptr;
 	sharedIn12 = nullptr;
 	sharedOut11 = nullptr;

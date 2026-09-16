@@ -811,6 +811,14 @@ struct DlssnrAmdBackend::Impl {
 	// guidance this backend is given is produced at the captured extent, so it cannot be
 	// passed through; what goes over instead is a view built here, at the network's size,
 	// carrying the motion this backend already resamples to exactly that extent.
+	// Where the upscaler writes, at the captured size and in the engine's own format, so that
+	// the frame can go through the output stage every other route ends in. Handed the display
+	// texture directly it wrote linear values straight into it, and the stage that maps linear
+	// values onto what a display expects -- the shoulder and the sRGB encode -- never ran.
+	// That is the whole of the darkness: linear read as sRGB crushes the shadows and pins the
+	// highlights.
+	winrt::com_ptr<ID3D11Texture2D> reconOut11;
+	winrt::com_ptr<ID3D12Resource> reconOut12;
 	winrt::com_ptr<ID3D11Texture2D> motionShared11;
 	winrt::com_ptr<ID3D12Resource> motionShared12;
 	// The three the check needs and the dispatch does not read: the upscaler supplies its own
@@ -1346,6 +1354,11 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 		return SUCCEEDED(device11->CreateTexture2D(&desc, nullptr, out.put()));
 	};
+	if (!CreateSharedTexture(device11, device12.get(), width, height,
+			DXGI_FORMAT_R16G16B16A16_FLOAT, true, reconOut11, reconOut12)) {
+		Logger::Get().Error("DLSSNR AMD: the reconstruction could not share its output");
+		return false;
+	}
 	if (!CreateSharedTexture(device11, device12.get(), netWidth, netHeight,
 			DXGI_FORMAT_R16G16_FLOAT, false, motionShared11, motionShared12)) {
 		Logger::Get().Error("DLSSNR AMD: the reconstruction could not share its motion");
@@ -1358,7 +1371,8 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		return false;
 	}
 	auto upscaler = std::make_unique<FSR3Upscaler>();
-	if (!upscaler->Initialize(resources, netShared11.get(), output, settings.motionRequest)) {
+	if (!upscaler->Initialize(resources, netShared11.get(), reconOut11.get(),
+			settings.motionRequest)) {
 		Logger::Get().Error("DLSSNR AMD: the FSR3 upscaler refused to initialise");
 		return false;
 	}
@@ -1471,7 +1485,7 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	// handed the shared texture, not a command list.
 	const NativeEffectDrawContext hand{
 		.input = netShared11.get(),
-		.output = context.output,
+		.output = reconOut11.get(),
 		.frameId = context.frameId,
 		.inputRevision = context.inputRevision,
 		.frameGuidance = guidance,
@@ -1485,6 +1499,57 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	if (!reconstruction->Draw(hand)) {
 		return fail("the upscaler returning false with a valid guide");
 	}
+	// The upscaler has written linear values into the surface above. What is left is the stage
+	// every other route in this backend ends with: the shoulder, and the encode that takes the
+	// picture out of linear and into what the output format means. Skipping it is what made
+	// the route dark -- see the note on the surface.
+	//
+	// Its work is in D3D11, so the writes are flushed before this queue reads the D3D12 side
+	// of the same surface; the upscaler has already waited on its own fence.
+	context11->Flush();
+	if (FAILED(allocator->Reset()) ||
+		FAILED(list->Reset(allocator.get(), nullptr))) {
+		return fail("resetting the allocator for the output");
+	}
+	if (outputIsFp16) {
+		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		list->CopyResource(sharedOut12.get(), reconOut12.get());
+		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			D3D12_RESOURCE_STATE_COMMON);
+		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+			D3D12_RESOURCE_STATE_COMMON);
+	} else {
+		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		Bind(6, reconOut12.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+			sharedOut12.get(), outputFormat);
+		list->SetComputeRoot32BitConstant(1, shoulderMilli, 0);
+		Dispatch(srgbInput ? convertOutSrgb.get() : convertOut.get(), 6);
+		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			D3D12_RESOURCE_STATE_COMMON);
+		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON);
+	}
+	if (FAILED(list->Close())) {
+		return fail("closing the output list");
+	}
+	ID3D12CommandList* outLists[] = { list.get() };
+	queue->ExecuteCommandLists(1, outLists);
+	const uint64_t written = ++fenceValue;
+	queue->Signal(fence.get(), written);
+	if (fence->GetCompletedValue() < written) {
+		fence->SetEventOnCompletion(written, fenceEvent.get());
+		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
+			return fail("waiting for the output");
+		}
+	}
+	context11->CopyResource(context.output, sharedOut11.get());
+
 	++reconstructionDraws;
 	if (reconstructionDraws == 1 || reconstructionDraws % 300 == 0) {
 		Logger::Get().Info(fmt::format(
@@ -1504,6 +1569,8 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	reconstruction.reset();
 	netShared11 = nullptr;
 	netShared12 = nullptr;
+	reconOut11 = nullptr;
+	reconOut12 = nullptr;
 	motionShared11 = nullptr;
 	motionShared12 = nullptr;
 	zeroMotion11 = nullptr;

@@ -487,31 +487,38 @@ bool FSR3Upscaler::Resize(DeviceResources& resources, ID3D11Texture2D* input,
 }
 
 bool FSR3Upscaler::Draw(const NativeEffectDrawContext& drawContext) noexcept {
+	// Numbered exits, declared first so every one of them can use it. Two different effects
+	// drive this now, and "Draw returned false" says nothing about which step it came from;
+	// the numbers map to the source, which is enough to name the failing step from a log.
+	const auto fail = [](int exit) noexcept {
+		Logger::Get().Warn(fmt::format("FSR3Upscaler: Draw stopped at exit {}", exit));
+		return false;
+	};
 	ID3D11Texture2D* input = drawContext.input;
 	ID3D11Texture2D* output = drawContext.output;
-	if (!_impl || !_impl->context) return false;
+	if (!_impl || !_impl->context) return fail(1);
 	Impl& impl = *_impl;
 	const bool guidanceReset = drawContext.frameGuidance.requiresHistoryReset &&
 		impl.lastGuidanceResetFrameId != drawContext.frameId;
 	impl.resetHistory |= guidanceReset;
-	if (!WaitForFence(impl, impl.lastSubmittedValue)) return false;
+	if (!WaitForFence(impl, impl.lastSubmittedValue)) return fail(2);
 	impl.context11->CopyResource(impl.sharedInput11.get(), input);
 	if (impl.enableOpticalFlow) {
-		if (!drawContext.frameGuidance.IsValidFor(drawContext.frameId, { impl.inputWidth, impl.inputHeight })) return false;
+		if (!drawContext.frameGuidance.IsValidFor(drawContext.frameId, { impl.inputWidth, impl.inputHeight })) return fail(3);
 		const auto sync = drawContext.frameGuidance.motion.metadata.sync;
-		if (sync.fence && sync.value && FAILED(impl.context11->Wait(sync.fence, sync.value))) return false;
+		if (sync.fence && sync.value && FAILED(impl.context11->Wait(sync.fence, sync.value))) return fail(4);
 		impl.context11->CopyResource(impl.sharedMotion11.get(), drawContext.frameGuidance.motion.texture);
 	}
 	const uint64_t inputReady = ++impl.fenceValue;
 	HRESULT hr = impl.context11->Signal(impl.fence11.get(), inputReady);
-	if (FAILED(hr)) return false;
+	if (FAILED(hr)) return fail(5);
 	impl.context11->Flush();
 	hr = impl.queue12->Wait(impl.fence12.get(), inputReady);
-	if (FAILED(hr)) return false;
+	if (FAILED(hr)) return fail(6);
 
 	hr = impl.allocator12->Reset();
 	if (SUCCEEDED(hr)) hr = impl.commandList12->Reset(impl.allocator12.get(), nullptr);
-	if (FAILED(hr)) return false;
+	if (FAILED(hr)) return fail(7);
 	D3D12_RESOURCE_BARRIER barriers[3]{};
 	barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	barriers[0].Transition = { impl.sharedInput12.get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -561,21 +568,21 @@ bool FSR3Upscaler::Draw(const NativeEffectDrawContext& drawContext) noexcept {
 	if (rc != FFX_API_RETURN_OK) {
 		Logger::Get().Error(fmt::format("Dispatch {} failed ({})",
 			impl.useFsr4 ? "FSR 4.1.1" : "FSR 3.1.5", (uint32_t)rc));
-		return false;
+		return fail(8);
 	}
 	for (UINT i = 0; i < barrierCount; ++i) {
 		std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
 	}
 	impl.commandList12->ResourceBarrier(barrierCount, barriers);
 	hr = impl.commandList12->Close();
-	if (FAILED(hr)) return false;
+	if (FAILED(hr)) return fail(9);
 	ID3D12CommandList* lists[]{ impl.commandList12.get() };
 	impl.queue12->ExecuteCommandLists(1, lists);
 	const uint64_t outputReady = ++impl.fenceValue;
 	hr = impl.queue12->Signal(impl.fence12.get(), outputReady);
 	impl.lastSubmittedValue = outputReady;
 	if (SUCCEEDED(hr)) hr = impl.context11->Wait(impl.fence11.get(), outputReady);
-	if (FAILED(hr)) return false;
+	if (FAILED(hr)) return fail(10);
 	impl.context11->CopyResource(output, impl.sharedOutput11.get());
 	impl.resetHistory = false;
 	if (guidanceReset) impl.lastGuidanceResetFrameId = drawContext.frameId;
@@ -592,9 +599,9 @@ FSR3Upscaler::FSR3Upscaler() = default;
 FSR3Upscaler::~FSR3Upscaler() = default;
 bool FSR3Upscaler::Initialize(DeviceResources&, ID3D11Texture2D*, ID3D11Texture2D*, MotionVectorRequest, bool) noexcept {
 	Logger::Get().Error("FSR3 support is not enabled in this build");
-	return false;
+	return fail(11);
 }
-bool FSR3Upscaler::Resize(DeviceResources&, ID3D11Texture2D*, ID3D11Texture2D*) noexcept { return false; }
+bool FSR3Upscaler::Resize(DeviceResources&, ID3D11Texture2D*, ID3D11Texture2D*) noexcept { return fail(12); }
 bool FSR3Upscaler::Draw(const NativeEffectDrawContext&) noexcept { return false; }
 }
 

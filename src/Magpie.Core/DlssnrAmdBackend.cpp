@@ -1375,17 +1375,27 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	// The engine's submission is on the queue whether or not it answered, so the allocator
 	// cannot be handed to a new list until it has run -- the same wait the composite path
 	// does before it records anything.
+	// Each exit names itself. The first version reported them all as one message, and that
+	// cost a round trip: the route failed, the log said only that it had, and the answer was
+	// a contract check two layers down inside the upscaler.
+	const auto fail = [this](const char* where) noexcept {
+		if (++reconstructionFailures <= 6) {
+			Logger::Get().Warn(fmt::format(
+				"DLSSNR AMD: the reconstruction stopped at {}", where));
+		}
+		return false;
+	};
 	const uint64_t submitted = ++fenceValue;
 	queue->Signal(fence.get(), submitted);
 	if (fence->GetCompletedValue() < submitted) {
 		fence->SetEventOnCompletion(submitted, fenceEvent.get());
 		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
-			return false;
+			return fail("waiting for the engine's submission");
 		}
 	}
 	if (FAILED(allocator->Reset()) ||
 		FAILED(list->Reset(allocator.get(), nullptr))) {
-		return false;
+		return fail("resetting the allocator");
 	}
 	// The engine leaves its surface readable; a copy to a surface the other device reads goes
 	// through COMMON, which is the rule every crossing in this backend follows.
@@ -1404,7 +1414,7 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 			D3D12_RESOURCE_STATE_COMMON);
 	}
 	if (FAILED(list->Close())) {
-		return false;
+		return fail("closing the copy list");
 	}
 	ID3D12CommandList* lists[] = { list.get() };
 	queue->ExecuteCommandLists(1, lists);
@@ -1413,7 +1423,7 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	if (fence->GetCompletedValue() < copied) {
 		fence->SetEventOnCompletion(copied, fenceEvent.get());
 		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
-			return false;
+			return fail("waiting for the copy");
 		}
 	}
 
@@ -1443,8 +1453,13 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 		.frameGuidance = guidance,
 		.zeroFrameGuidance = guidance,
 	};
+	// Checked here as well as inside the upscaler, so a rejection says which of the two it
+	// was: a view this side built wrong, or something further in.
+	if (!guidance.IsValidFor(context.frameId, extent)) {
+		return fail("its own guide failing the upscaler's contract");
+	}
 	if (!reconstruction->Draw(hand)) {
-		return false;
+		return fail("the upscaler returning false with a valid guide");
 	}
 	++reconstructionDraws;
 	if (reconstructionDraws == 1 || reconstructionDraws % 300 == 0) {

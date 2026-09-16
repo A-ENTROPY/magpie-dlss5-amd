@@ -795,7 +795,13 @@ struct DlssnrAmdBackend::Impl {
 	// the colour handed over carries no sub-pixel jitter and there is no depth to give. An
 	// implementation sitting before the game's upscaler has both and reconstructs better for
 	// it. This is the same accumulator working from less.
+#ifdef MP_ENABLE_FSR3_ZEROMV
+	// The concrete type, not the interface: the HDR protocol is set on the class and the
+	// interface has no virtual for it.
+	std::unique_ptr<FSR3Upscaler> reconstruction;
+#else
 	std::unique_ptr<NativeEffectBackend> reconstruction;
+#endif
 	winrt::com_ptr<ID3D11Texture2D> netShared11;
 	winrt::com_ptr<ID3D12Resource> netShared12;
 	// Motion at the network's extent, for the upscaler to reproject with.
@@ -1356,14 +1362,32 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		Logger::Get().Error("DLSSNR AMD: the FSR3 upscaler refused to initialise");
 		return false;
 	}
+	// The protocol the renderer would have set if this upscaler were a link in the chain
+	// rather than something this backend drives. It is not decoration: with hdrColorInput at
+	// its default of false the upscaler is told its colour is sRGB and applies that transfer
+	// function to values this backend has already made linear, which crushes the picture.
+	// The flag follows srgbInput for exactly that reason -- it describes what is being handed
+	// over, not what the display is.
+	upscaler->SetFsrHdrProtocol(FsrHdrProtocol{
+		.hdrColorInput = srgbInput,
+		.transfer = GroupBTransfer::Linear,
+		.preExposure = 1.0f,
+		.exposure = 1.0f,
+		.depthInverted = true,
+		.depthInfinite = true,
+		.useReactiveMask = false,
+		.useTransparencyMask = false,
+	});
 	reconstruction = std::move(upscaler);
 	// Said out loud because the sizes are the whole point of the route: the engine edits at
 	// netWidth by netHeight and the accumulator reconstructs the captured size from it.
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD: reconstruction on -- FSR3 upscaler from {}x{} to the captured size, "
-		"motion {}", netWidth, netHeight,
+		"motion {}, colour {}",
+		netWidth, netHeight,
 		settings.motionRequest.method == OpticalFlowMethod::None ? "none (zero-MV route)"
-			: "from the frame guidance"));
+			: "from the frame guidance",
+		srgbInput ? "linear (the sRGB transfer function is off)" : "sRGB-encoded"));
 	return true;
 #endif
 }

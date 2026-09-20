@@ -10,18 +10,34 @@
 
 | | 包含 | 适合谁 |
 |---|---|---|
-| **`magpie-dlss5-amd-rdna3-full.zip`** | 本适配的 Magpie + **0.3.0 运行时** + 网络权重 + FSR3 上采样 DLL | 想解压就能用 |
+| **`magpie-dlss5-amd-rdna3-full.zip`** | **开箱即用**：本适配的 Magpie + 运行时 + 权重 + FSR3 上采样 DLL + XeSS 帧生成 DLL + 全部许可证 | 想解压就能用 |
 | **`magpie-dlss5-amd-rdna3.zip`** | 只有本适配的构建产物 | 想自己准备第三方二进制 |
 
-**干净包需要你自己放这几个文件**（放在 `Magpie.exe` 旁边）：
+**full 包不需要你再放任何文件**，里面已经有：
 
-- `dlssnr_amd_pass1.dll` — AMD 侧运行时，取自 DLSS-NR-on-AMD 官方安装器。**必须是 0.3.0**（见下）。
+    DLSSNR 运行时（0.3.0）        dlssnr_amd_pass1.dll
+    网络权重                      dlssnr_on_amd_weights.bin
+    运行时设置                    dlssnr_on_amd.ini
+    FSR3 重建路线                 amd_fidelityfx_upscaler_dx12.dll
+                                  amd_fidelityfx_loader_dx12.dll
+    XeSS 帧生成（含多帧）          libxess_fg.dll（1.3.1.78）+ libxell.dll
+    XeSS 超分效果                 libxess.dll
+    许可证与第三方声明            AMD-FSR-SDK-THIRD-PARTY.md
+                                  INTEL-XESS-LICENSE.txt
+                                  INTEL-XESS-THIRD-PARTY.txt
+
+注意 `libxell.dll` 是 `libxess_fg.dll` 自己的依赖——只放后者帧生成起不来，所以两个都要。
+
+**干净包**要你自己准备（放在 `Magpie.exe` 旁边）：
+
+- `dlssnr_amd_pass1.dll` — AMD 侧运行时。**必须是 0.3.0**（见下）。
 - `dlssnr_on_amd_weights.bin` — 网络权重。
 - `dlssnr_on_amd.ini` — 随便建一个文本文件即可（默认值够用）。
-- 想用 FSR3 重建路线，再加 AMD 的 `amd_fidelityfx_upscaler_dx12.dll` 与 `amd_fidelityfx_loader_dx12.dll`。
-- 想用 XeSS 帧生成，需要 Intel 的 `libxess_fg.dll`（**指定版本 1.3.1.78**，见下）。
+- 想用 FSR3 重建路线：`amd_fidelityfx_upscaler_dx12.dll` 与 `amd_fidelityfx_loader_dx12.dll`。
+- 想用 XeSS 帧生成：`libxess_fg.dll`（**必须 1.3.1.78**）+ `libxell.dll`。
+- 想用 XeSS 超分效果：`libxess.dll`。
 
-full 包里的运行时与权重来自第三方项目与 NVIDIA 派生材料，仅随本包提供、不在此授权进一步转发。
+**来源说明**：运行时与权重来自第三方的 **OptiScaler AMD pre-SR 包**（该包把神经渲染接进 OptiScaler，超分交给 FFX/FSR），其中运行时本体是 **DLSS-NR on AMD 0.3.0**，原作者 danielblnc。这些文件属于 NVIDIA 派生材料，仅随 full 包提供、不在此授权进一步转发；走合规渠道请用干净包自备。
 
 ---
 
@@ -49,7 +65,7 @@ full 包里的运行时与权重来自第三方项目与 NVIDIA 派生材料，�
 
 - **帧倍率上限从 4× 提到 6×**（可选 2×–6×）。
 - **2×**：走 SDK 原生路径，任何显卡都不需要额外处理。
-- **3× 及以上**：在非 Intel 显卡上自动启用本项目核验过的兼容实现（内存内补丁 + 配套帧节奏修复），**不需要你手动开任何开关**。它要求 `libxess_fg.dll` 是 **1.3.1.78** 那一个构建（SHA-256 以 `EC5E0C65E075570C…` 开头）；其他构建会被拒绝并说明原因。
+- **3× 及以上**：在非 Intel 显卡上自动启用本项目核验过的兼容实现（内存内补丁 + 配套帧节奏修复），**不需要你手动开任何开关**。它要求两个文件都在位：`libxess_fg.dll` 必须是 **1.3.1.78** 那一个构建（SHA-256 以 `EC5E0C65E075570C…` 开头），以及它自己的依赖 **`libxell.dll`**——只放前者帧生成起不来。其他构建会被拒绝并说明原因。full 包这两个都带了。
 - 3×/4× 现在也可以配 **NVIDIA 光流**（此前这个组合被直接拒绝）。
 
 **要留意的**：这条多帧路径是本项目的实验性兼容实现，**不等于 Intel 官方对该组合的认证**。光流取自捕获画面、不是游戏引擎的原生运动矢量，所以平面深度、遮挡/UI/反射以及高倍率下的帧节奏等既有局限照旧；NVIDIA 高质量光流会更贵，**不保证提升最终显示帧率**。
@@ -106,7 +122,7 @@ Exposure=1.0     # 交给引擎的曝光（引擎自适应曝光不稳定，已�
 
 Magpie (experimental 0.6.8) adapted to run DLSS Neural Rendering on AMD Radeon RDNA3 (tested on an RX 7900 XTX, gfx1100) with Cyberpunk 2077 and GTA V Enhanced. This is a patch on 0.6.8.
 
-**Two packages:** `-full` bundles everything (the 0.3.0 runtime, weights and the FSR3 upscaler DLLs). The clean package contains only this port's own build products; you supply the runtime, weights, the FSR3 DLLs and `libxess_fg.dll` yourself, next to `Magpie.exe`.
+**Two packages:** `-full` is ready to use as it stands — it bundles the 0.3.0 runtime, the weights, the FSR3 upscaler DLLs, the XeSS frame-generation DLLs (`libxess_fg.dll` 1.3.1.78 plus its dependency `libxell.dll`), `libxess.dll` and the licences. Nothing has to be configured. The clean package contains only this port's own build products; it lists exactly which third-party files to supply and at which versions. The runtime and weights come from the third-party **OptiScaler AMD pre-SR** package, whose runtime is **DLSS-NR on AMD 0.3.0** (original author: danielblnc).
 
 **What's new**
 

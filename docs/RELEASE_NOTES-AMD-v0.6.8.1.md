@@ -1,50 +1,120 @@
-# 大力喜鹊 AMD RDNA3 v0.6.9 — DLSSNR 0.3.0 契约迁移与链内重建
+# 大力喜鹊 AMD RDNA3 v0.6.8.1
 
-大力喜鹊（Magpie experimental）的 **AMD Radeon RDNA3 适配版**，在 RX 7900 XTX（gfx1100）上运行 DLSS Neural Rendering。本版把 AMD 后端的运行时契约从 2.21 迁到 **DLSS-NR-on-AMD 0.3.0**，并新增链内 FSR3 重建路线。
+大力喜鹊 (Magpie experimental 0.6.8) 的 **AMD Radeon RDNA3 适配版**，在 RX 7900 XTX（gfx1100）上运行 DLSS Neural Rendering（DLSSNR），不依赖 NVIDIA NGX。实测平台：RX 7900 XTX + 赛博朋克 2077 / GTA V Enhanced。
 
-## 两个包，按需取用
+本版是 0.6.8 的补丁：**换用新版 DLSS-NR-on-AMD 0.3.0 运行时**、给 DLSSNR 加了**链内 FSR3 重建**，并把 **XeSS 帧生成的倍率扩到 6×**。
 
-- **`magpie-dlss5-amd-rdna3-full.zip`（开箱即用）**：完整应用 + 0.3.0 运行时 + 网络权重 + FSR3 上采样 DLL，解压即用。注意：运行时与权重来自第三方项目与 NVIDIA 派生材料，仅随本包提供、不在此授权进一步转发。
-- **`magpie-dlss5-amd-rdna3.zip`（合规干净包）**：仅本适配的构建产物。运行时与权重需自行从 DLSS-NR-on-AMD 官方安装器取得；想用 FSR3 重建路线还需自备 `amd_fidelityfx_upscaler_dx12.dll` 与 `amd_fidelityfx_loader_dx12.dll`。
+---
 
-## 本版更新
+## 一、两个包，按需取用
 
-**运行时契约迁移到 0.3.0。** AMD runtime 换了布局，0.2.14（`3c9ca13f…`）与 0.3.0（`8321cae7…`）**没有任何地址相同**，因此后端现在按 SHA-256 校验运行时：不匹配就拒绝加载，而不是按旧偏移跳进未知布局。0.3.0 的 packet 比旧版多 16 字节（`nativePre` 与 render extent / 子像素相位），少发这 16 字节不是"差一点"——引擎会读越界并交回黑帧。
+| | 包含 | 适合谁 |
+|---|---|---|
+| **`magpie-dlss5-amd-rdna3-full.zip`** | 本适配的 Magpie + **0.3.0 运行时** + 网络权重 + FSR3 上采样 DLL | 想解压就能用 |
+| **`magpie-dlss5-amd-rdna3.zip`** | 只有本适配的构建产物 | 想自己准备第三方二进制 |
 
-**新增 NR Reconstruction（效果参数 `amdReconstruct`）：**
+**干净包需要你自己放这几个文件**（放在 `Magpie.exe` 旁边）：
 
-- `0 Resolve (residual)`（默认）：引擎编辑后的帧按残差就地 resolve。
-- `1 FSR3 upscale`：把引擎的输出交给链内的 FSR3 上采样器重建到显示分辨率，并接上引擎的 HDR 协议与运动引导。
+- `dlssnr_amd_pass1.dll` — AMD 侧运行时，取自 DLSS-NR-on-AMD 官方安装器。**必须是 0.3.0**（见下）。
+- `dlssnr_on_amd_weights.bin` — 网络权重。
+- `dlssnr_on_amd.ini` — 随便建一个文本文件即可（默认值够用）。
+- 想用 FSR3 重建路线，再加 AMD 的 `amd_fidelityfx_upscaler_dx12.dll` 与 `amd_fidelityfx_loader_dx12.dll`。
+- 想用 XeSS 帧生成，需要 Intel 的 `libxess_fg.dll`（**指定版本 1.3.1.78**，见下）。
 
-**修复与调优：**
+full 包里的运行时与权重来自第三方项目与 NVIDIA 派生材料，仅随本包提供、不在此授权进一步转发。
 
-- 时域混合权重此前从未真正施加（`decf4a94`）——抗闪烁路线现在按预期混合。
-- guide flags 改为在引擎构建 staging **之前**设置，Interop 不再被 pin。
-- 进程定时器提到 1 ms：引擎内部的等待预算按 1 ms 计价，2 ms 及以上会让它把等待读成超时。
-- 诊断：每个会话打印落在哪个适配器上；重建路线的每个出口单独编号，失败不再都报同一条消息。
+---
 
-## 验证记录
+## 二、本版更新
 
-- **0.3.0 + Resolve 路线**（inline、输入输出均零拷贝）：3600 帧长会话，`timeouts 0`，网络 ~57 ms/帧（1248×702 捕获、输入缩放 0.6 → 网络 749×421）；运动矢量真实（`mean |mv|` 非零，此前恒为 0.000），depth on；引擎自检 `pre-block zero bytes 0.116% (healthy)`。
-- **FSR3 路线**实测可运行（日志 `route fsr`），但同分辨率下网络耗时显著更高（84–205 ms，会话内有 2 次 inline 等待超时并按设计降级为"显示上一帧残差"）。因此默认仍是 Resolve，FSR3 路线供愿意换成本的用户试用。
-- 两轮会话都跑在 1248×702 捕获、输入分辨率 60% 上；成本近似正比于像素数，减小输入分辨率仍是唯一提速手段。
+### 1. DLSSNR 适配新版运行时 DLSS-NR-on-AMD 0.3.0
 
-## 已知限制
+旧版是 2.21。**0.3.0 和 2.21 的内存布局没有一个地址是相同的**，所以本版是这样处理的：
+
+- 启动时**校验运行时的 SHA-256**（0.3.0 = `8321cae7…`）。不匹配就明确报错、拒绝启用，而不是照旧偏移乱跳——**旧运行时现在会被拒**，这是有意行为，不是崩溃。
+- 0.3.0 要求每帧多传 16 字节信息（渲染分辨率与颜色的子像素相位）。少传不是"差一点"：引擎会读越界，画面直接全黑。补齐这两个字段后，采样抹掉的细节才能被重建出来。
+
+如果你之前在 2.21 上用得好，升级 Magpie 的同时**必须一起更新运行时**，否则 DLSSNR 不会工作。
+
+### 2. 新增 NR Reconstruction：把 DLSSNR 接进 FSR3 重建
+
+效果面板里多了一个 **NR Reconstruction** 选项：
+
+- **`0 Resolve (residual)`**（默认）——引擎编辑后的帧按残差就地 resolve，就是原来的行为。
+- **`1 FSR3 upscale`**——把引擎的输出交给本项目内已有的 FSR3 上采样器，重建到显示分辨率，并接上引擎的 HDR 协议和同尺寸的运动引导。
+
+**怎么选**：FSR3 路线是新的、也更贵。同一分辨率下实测 Resolve 约 57 ms/帧，FSR3 路线 84–205 ms/帧，所以默认仍是 Resolve。想试 FSR3 就把选项拨到 1，并确认上面那两个 `amd_fidelityfx_*.dll` 在位。
+
+### 3. XeSS 帧生成：倍率扩到 2×–6×，非 Intel 显卡的多帧自动走兼容路径
+
+- **帧倍率上限从 4× 提到 6×**（可选 2×–6×）。
+- **2×**：走 SDK 原生路径，任何显卡都不需要额外处理。
+- **3× 及以上**：在非 Intel 显卡上自动启用本项目核验过的兼容实现（内存内补丁 + 配套帧节奏修复），**不需要你手动开任何开关**。它要求 `libxess_fg.dll` 是 **1.3.1.78** 那一个构建（SHA-256 以 `EC5E0C65E075570C…` 开头）；其他构建会被拒绝并说明原因。
+- 3×/4× 现在也可以配 **NVIDIA 光流**（此前这个组合被直接拒绝）。
+
+**要留意的**：这条多帧路径是本项目的实验性兼容实现，**不等于 Intel 官方对该组合的认证**。光流取自捕获画面、不是游戏引擎的原生运动矢量，所以平面深度、遮挡/UI/反射以及高倍率下的帧节奏等既有局限照旧；NVIDIA 高质量光流会更贵，**不保证提升最终显示帧率**。
+
+### 4. 修复
+
+- **抗闪烁的时域混合权重此前从未真正生效**——现在按预期混合了。
+- 引导标志改在引擎构建 staging **之前**设置；Interop 不再被 pin 住。
+- 进程定时器提到 1 ms：引擎内部的等待预算按 1 ms 计价，更粗的定时器会让它把正常等待读成超时。
+- 重建路线的每个出口单独编号（原来都报同一条消息），每个会话打印落在哪个适配器上。
+
+---
+
+## 三、DLSSNR 面板怎么用
+
+- **输入分辨率缩放**（25–100%）：网络按捕获尺寸的百分比运行，成本近似正比像素数，**这是唯一有效的提速手段**。1080p 级别的画面，缩放滑杆往下拉一档就能省下成比例的时间。
+- **抗闪烁**：无 / 静态累积 / 光流累积 / 光流累积+ / 低频时域重建。画面稳定时用静态累积即可；有运动时用带光流的档位（用 Magpie 的 AMD 光流做重投影）。
+- **NR Reconstruction**：见上，默认 Resolve。
+- **NR Intensity**：编辑强度（0 = 不编辑，2 = 翻倍）。
+- **NR Style**：三档预设（Default / Natural / Cinematic），对引擎的内容通道做整体缩放——Natural 更轻，适合二次元/赛璐璐；Cinematic 更强并打开色调通道。AMD 运行时没有自己的 style 字段，所以这三档缩放的是它实际有的通道。
+- **tone / structure / skin / autoMask**，以及 Temporal History、Tone Channels、Use Depth Guide、Use Host Inputs：都直接映射到引擎自身设置。
+- `uiCorrection` 无映射：本路径是抓成品画面，无法知道游戏 UI 在哪里。
+
+高级设置（`dlssnr_on_amd.ini`）：
+
+```ini
+[DlssNrOnAmd]
+SrgbInput=1      # 帧进引擎前 sRGB→线性、出来再编码回去。保持 1
+Inline=1         # 同行握手：游戏在同一帧内等网络。本版实测就是这个模式
+EditBound=500    # resolve 施加编辑量的千分比，高光溢出或闪烁时调低
+Exposure=1.0     # 交给引擎的曝光（引擎自适应曝光不稳定，已停用）
+```
+
+---
+
+## 四、实测与验证范围
+
+- **DLSSNR 0.3.0 + Resolve 路线**，inline、输入输出零拷贝：**3600 帧长会话、等待超时 0 次**，网络约 **57 ms/帧**（1248×702 捕获、输入缩放 60% → 网络 749×421）；运动矢量真实（此前恒为 0.000）、depth on；引擎自检 `pre-block zero bytes 0.116% (healthy)`。
+- **FSR3 重建路线**：可运行（日志 `route fsr`），但同分辨率下网络 84–205 ms，会话内出现 2 次 inline 等待超时并按设计降级为"显示上一帧残差"。因此默认仍是 Resolve。
+- **XeSS 帧生成**：兼容路径的实测记录集中在 **3×/4×**；5×/6× 沿用同一条路径，但不在这次实测范围内。
+
+---
+
+## 五、已知限制
 
 - inline 模式把帧率钉在网络的成本上（游戏等网络）；减小输入分辨率是唯一提速手段。
 - FSR3 重建路线尚未做性能调优，明显慢于 Resolve。
 - 引擎自身启动偶发崩溃（`bcrypt.dll+0x4442`，`0xc0000005`），不可稳定复现。
-- `uiCorrection` 无映射（本路径无法知道游戏 UI 在哪）；AMD runtime 没有 style 字段，NR Style 三档缩放的是它实际有的内容通道。
-- GPL-3.0；与 NVIDIA、AMD、DLSS-NR-on-AMD 均无隶属关系。
+- GPL-3.0；本项目是独立的互操作工作，与 NVIDIA、AMD、Intel、DLSS-NR-on-AMD 均无隶属关系。
 
 ---
 
 ## English
 
-Magpie (experimental) AMD RDNA3 adaptation for DLSS Neural Rendering on a Radeon RX 7900 XTX (gfx1100). This release moves the AMD backend's runtime contract from 2.21 to **DLSS-NR-on-AMD 0.3.0** and adds an in-chain FSR3 reconstruction route.
+Magpie (experimental 0.6.8) adapted to run DLSS Neural Rendering on AMD Radeon RDNA3 (tested on an RX 7900 XTX, gfx1100) with Cyberpunk 2077 and GTA V Enhanced. This is a patch on 0.6.8.
 
-- The two runtime layouts share no addresses, so the backend now verifies the runtime's SHA-256 and refuses a mismatch instead of chasing stale offsets. The 0.3.0 packet is 16 bytes longer (render extent and sub-pixel phase); sending the shorter one makes the engine read past the end and return a black frame.
-- New effect parameter **NR Reconstruction** (`amdReconstruct`): `0 Resolve (residual)` (default) or `1 FSR3 upscale`, which hands the engine's edited frame to the in-chain FSR3 upscaler, with the engine's HDR protocol and a motion guide.
-- Fixes: the temporal blend weight was never applied; guide flags are now set before the engine builds its staging and Interop is no longer pinned; the process timer is 1 ms because that is what the engine's waits are priced in.
-- Validated: 0.3.0 with the Resolve route, inline, zero-copy, 3600 frames, zero wait timeouts, ~57 ms/frame at a 1248×702 capture scaled to 0.6, real motion vectors, depth on. The FSR3 route runs but costs far more at the same extent (84–205 ms, two wait timeouts), so Resolve stays the default.
-- GPL-3.0. Independent interoperability effort; not affiliated with NVIDIA, AMD or the DLSS-NR-on-AMD project.
+**Two packages:** `-full` bundles everything (the 0.3.0 runtime, weights and the FSR3 upscaler DLLs). The clean package contains only this port's own build products; you supply the runtime, weights, the FSR3 DLLs and `libxess_fg.dll` yourself, next to `Magpie.exe`.
+
+**What's new**
+
+1. **DLSSNR now targets DLSS-NR-on-AMD 0.3.0.** The 2.21 and 0.3.0 layouts share no addresses, so the app verifies the runtime's SHA-256 (`8321cae7…`) and refuses a different build instead of following stale offsets. An older runtime is now rejected on purpose. 0.3.0 also needs 16 more bytes per frame (render extent and the colour's sub-pixel phase); without them the engine reads past the end and returns a black frame. **Update the runtime together with Magpie.**
+2. **New effect parameter NR Reconstruction.** `0 Resolve (residual)` keeps the previous behaviour; `1 FSR3 upscale` hands the engine's edited frame to the FSR3 upscaler this build carries and reconstructs it to the display resolution. It is the newer and much more expensive route: measured ~57 ms/frame for Resolve versus 84–205 ms for FSR3 at the same extent, so Resolve stays the default.
+3. **XeSS frame generation now goes up to 6×** (2×–6×, previously 2×–4×). At 2× every GPU uses the SDK's native path. At 3× and above, non-Intel GPUs automatically use this project's verified in-memory compatibility implementation — no toggle — which requires `libxess_fg.dll` build 1.3.1.78 (SHA-256 `EC5E0C65E075570C…`); other builds are rejected with a reason. 3×/4× can now also be combined with NVIDIA optical flow. This is an experimental compatibility path, not an Intel certification; optical flow comes from the captured image rather than the engine's own motion vectors, and the flat-depth, occlusion/UI/reflection and high-multiplier pacing limits still apply.
+4. **Fixes:** the anti-flicker temporal blend weight was never actually applied; guide flags are now set before the engine builds its staging and Interop is no longer pinned; the process timer is 1 ms because that is the unit the engine's waits are priced in.
+
+**Validated:** 0.3.0 with the Resolve route, inline, zero-copy — 3600 frames, zero wait timeouts, ~57 ms/frame at a 1248×702 capture scaled to 60%, real motion vectors, depth on. The FSR3 route runs but costs far more. The XeSS FG compatibility path's validation record covers 3×/4×; 5×/6× uses the same path but is outside this round's testing.
+
+GPL-3.0. An independent interoperability effort; not affiliated with NVIDIA, AMD, Intel or the DLSS-NR-on-AMD project.

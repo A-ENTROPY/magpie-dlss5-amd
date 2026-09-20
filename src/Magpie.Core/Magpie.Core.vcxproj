@@ -202,6 +202,10 @@
     <ClCompile Include="ParameterInputHost.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
+      <!-- 4459: fmt 12.1 的 base.h 在 invoke_parse 里用了一个局部名 formattable，与 fmt 自己 -->
+      <!-- 的全局名同名，MSVC /W4 会报“声明隐藏全局声明”。Release 的 /WX 把它变成错误。这个头 -->
+      <!-- 只在这里被非 PCH 方式编译一次（其它 .cpp 走 /Yu，不会重复报），所以只在这一处关掉。 -->
+      <DisableSpecificWarnings>4459;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <ClCompile Include="HdrFrame.cpp" />
     <ClCompile Include="HdrColorTransform.cpp" />

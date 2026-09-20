@@ -112,7 +112,7 @@ public:
     bool Acquire(bool compatibility, uint32_t multiplier, const void* createEntry) noexcept {
         std::lock_guard lock(leaseMutex);
         _failure = "context lease busy/poisoned, or invalid multiplier";
-        if (_held || leased || poisoned || multiplier < 2 || multiplier > 4) return false;
+        if (_held || leased || poisoned || multiplier < 2 || multiplier > 6) return false;
         if (!compatibility) { leased = _held = true; return true; }
         if (multiplier == 2) return false;
         _failure = "loaded libxess_fg.dll file identity/hash is not in the compatibility allowlist";

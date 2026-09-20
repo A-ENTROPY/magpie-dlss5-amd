@@ -124,6 +124,21 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 					const auto it = option.parameters.find(std::string(name));
 					return it == option.parameters.end() ? fallback : it->second;
 				});
+			// Multi Pass is the one control the AMD path does not serve. The reference chains two or
+			// three instances of the runtime, which means loading and initialising pass2 and pass3
+			// beside this one; this backend runs a single pass. Said out loud rather than left
+			// silent, because the control is visible in the interface and a 2 that quietly runs one
+			// pass is worse than one that says what it did.
+			{
+				const auto it = option.parameters.find("multiPass");
+				const int requested = it == option.parameters.end()
+					? 1 : static_cast<int>(std::lround(it->second));
+				if (requested > 1) {
+					Logger::Get().Warn(fmt::format(
+						"DLSSNR AMD: Multi Pass is set to {}; this backend runs one pass and "
+						"ignores the rest", requested));
+				}
+			}
 			auto amd = std::make_unique<DlssnrAmdBackend>();
 			if (amd->Initialize(resources, input, output, settings, antiFlicker)) {
 				Logger::Get().Info("DLSSNR: running on the AMD backend");

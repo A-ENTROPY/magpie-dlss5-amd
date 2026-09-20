@@ -451,7 +451,7 @@ XeSSFGPresenter::~XeSSFGPresenter() noexcept = default;
 bool XeSSFGPresenter::_Initialize(HWND hwndAttach) noexcept {
 	if ((_variant == XeSSFGVariant::X2 && _requestedMultiplier != 2) ||
 		(_variant == XeSSFGVariant::MultiFrame &&
-			(_requestedMultiplier < 2 || _requestedMultiplier > 4))) {
+			(_requestedMultiplier < 2 || _requestedMultiplier > 6))) {
 		Logger::Get().Error(fmt::format(
 			"Invalid XeSSFG multiplier: variant={}, requested={}x",
 			_variant == XeSSFGVariant::X2 ? "x2" : "MFG",

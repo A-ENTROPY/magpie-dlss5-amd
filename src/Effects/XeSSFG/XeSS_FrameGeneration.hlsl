@@ -10,7 +10,7 @@
 //!LABEL Frame Multiplier
 //!DEFAULT 2
 //!MIN 2
-//!MAX 4
+//!MAX 6
 //!STEP 1
 int multiplier;
 

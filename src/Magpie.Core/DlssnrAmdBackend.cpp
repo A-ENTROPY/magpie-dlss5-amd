@@ -9,6 +9,7 @@
 #endif
 #include "FrameGuidanceD3D12Interop.h"
 #include "DeviceResources.h"
+#include "DirectXHelper.h"
 #include "Logger.h"
 #include "Win32Helper.h"
 
@@ -42,42 +43,68 @@ namespace {
 //   base + 0x4640    void(queue, n, lists)                         notify submitted
 //   base + 0x764d8   data                                          the ctx struct
 // ---------------------------------------------------------------------------
-constexpr uintptr_t kRvaDevice = 0x764c8;
-constexpr uintptr_t kRvaQueue = 0x764d0;
-constexpr uintptr_t kRvaInitCtx = 0x764d8;
-constexpr uintptr_t kRvaHipDevice = 0x76f20;
-constexpr uintptr_t kRvaInlineMode = 0x76be0;
-constexpr uintptr_t kRvaInterop = 0x76c8c;
-constexpr uintptr_t kRvaEnabled = 0x76e1c;
-constexpr uintptr_t kRvaUseFsrInputs = 0x76e1e;
-constexpr uintptr_t kRvaUseDepth = 0x76e1f;
-constexpr uintptr_t kRvaTonemap = 0x76e20;
-constexpr uintptr_t kRvaFlag767f8 = 0x767f8;
-constexpr uintptr_t kRvaHistory = 0x765f0;
-constexpr uintptr_t kRvaWantHistory = 0x765f8;
-constexpr uintptr_t kRvaPerPassFlag = 0x76e1d;
-constexpr uintptr_t kRvaDepthInverted = 0x76e10;
-constexpr uintptr_t kRvaDepthExplicit = 0x76e14;
-constexpr uintptr_t kRvaLocalTone = 0x76e30;
-constexpr uintptr_t kRvaLocalStructure = 0x76e34;
-constexpr uintptr_t kRvaSkinStructure = 0x76e38;
-constexpr uintptr_t kRvaCharMask = 0x76e40;
-constexpr uintptr_t kRvaToneChannels = 0x76e44;
-constexpr uintptr_t kRvaJobCounter = 0x76d74;
-constexpr uintptr_t kRvaStatusFlag = 0x767fa;
-constexpr uintptr_t kRvaSyncCounter = 0x76c14;
+constexpr uintptr_t kRvaDevice = 0x96f68;
+constexpr uintptr_t kRvaQueue = 0x96f70;
+constexpr uintptr_t kRvaInitCtx = 0x96f78;
+constexpr uintptr_t kRvaHipDevice = 0x97c30;
+constexpr uintptr_t kRvaInlineMode = 0x977a0;
+// How many frames may be in flight through the engine at once.
+//
+// Two, and the reason is the runtime's own: with inline handshaking off it reports
+// "mode async (residual from an earlier frame)" and returns before its work is done, so the
+// frame being recorded and the frame being read cannot be the same one. One surface means the
+// second frame overwrites the first while the engine is still reading it, and the picture
+// comes back black. Two is the least that lets the engine work while the picture is built.
+// Four, not two. The engine takes about three times a frame here, so with two slots the
+// composite can never find one that has already retired and every frame waits out an entire
+// engine job -- the frame time becomes the engine's, with its variance on top. Four covers
+// that ratio with room, which is what the reference's own slot count (1-5, default 3) is for.
+constexpr uint32_t kSlots = 4;
+constexpr uintptr_t kRvaInterop = 0x97984;
+constexpr uintptr_t kRvaEnabled = 0x97b1c;
+constexpr uintptr_t kRvaUseFsrInputs = 0x97b1e;
+constexpr uintptr_t kRvaUseDepth = 0x97b1f;
+constexpr uintptr_t kRvaTonemap = 0x97b20;
+constexpr uintptr_t kRvaInitDone = 0x97298;
+constexpr uintptr_t kRvaHistory = 0x97090;
+constexpr uintptr_t kRvaWantHistory = 0x97098;
+constexpr uintptr_t kRvaPerPassFlag = 0x97b1d;
+constexpr uintptr_t kRvaDepthInverted = 0x97b10;
+constexpr uintptr_t kRvaDepthExplicit = 0x97b14;
+constexpr uintptr_t kRvaLocalTone = 0x97b30;
+constexpr uintptr_t kRvaLocalStructure = 0x97b34;
+constexpr uintptr_t kRvaSkinStructure = 0x97b38;
+constexpr uintptr_t kRvaCharMask = 0x97b40;
+constexpr uintptr_t kRvaToneChannels = 0x97b44;
+constexpr uintptr_t kRvaJobCounter = 0x97a6c;
+constexpr uintptr_t kRvaStatusFlag = 0x9729a;
+constexpr uintptr_t kRvaSyncCounter = 0x977d4;
 
-constexpr uintptr_t kRvaInit = 0x12380;
-constexpr uintptr_t kRvaRecord = 0xa0b0;
-constexpr uintptr_t kRvaNotify = 0x4640;
+constexpr uintptr_t kRvaInit = 0x1fe80;
+constexpr uintptr_t kRvaRecord = 0x12640;
+constexpr uintptr_t kRvaNotify = 0x9460;
+// The runtime calls this to hand work over. Every installation the reference supports points
+// it at a no-op, because the submission is done by whoever drives the queue -- here, that is
+// this backend calling Notify. Left unfilled it is a null pointer the runtime will call.
+constexpr uintptr_t kRvaTrampoline = 0x97c70;
+// The runtime's spin allowance for one job. The reference scales it with the pixel count and
+// clamps it between these same bounds, which are its own.
+constexpr uintptr_t kRvaWatchdog = 0x97804;
+// The list the runtime recorded into, handed to Notify and cleared by it. The reference calls
+// this "the publication contract": a submission is published when this is consumed, which is
+// what there is to wait on when the runtime is not itself waiting on anything.
+constexpr uintptr_t kRvaPendingList = 0x97a60;
 
 // sha256 of the build these offsets belong to. Anything else is refused rather than
 // attempted: the offsets point into a different layout and the failure mode is a jump
 // into nothing, not an error.
+// 0.3.0 (the version.dll the reference package ships), whose layout the constants below
+// describe. This was 0.2.14 -- 3c9ca13f... -- and every offset was that build's; the two
+// layouts share no addresses at all.
 constexpr uint8_t kRuntimeSha256[32] = {
-	0x3c, 0x9c, 0xa1, 0x3f, 0x0f, 0x5f, 0xc3, 0x6a, 0x69, 0x0b, 0xa4, 0x24, 0xc4, 0x57,
-	0x00, 0x3b, 0xcf, 0xcc, 0x10, 0x80, 0xb4, 0xb7, 0x85, 0x97, 0x4c, 0xdd, 0x7e, 0x9a,
-	0xe2, 0xbc, 0x1d, 0xd8
+	0x83, 0x21, 0xca, 0xe7, 0x28, 0xd2, 0x8c, 0xb7, 0x63, 0x2d, 0x0d, 0x58, 0xd3, 0xd9,
+	0x13, 0xe9, 0x11, 0x32, 0xbf, 0x76, 0x45, 0xc1, 0x26, 0x50, 0x56, 0x98, 0xfb, 0xe4,
+	0xcd, 0x5a, 0x01, 0x38
 };
 
 constexpr const wchar_t* kRuntimeName = L"dlssnr_amd_pass1.dll";
@@ -113,15 +140,34 @@ struct Packet {
 	ID3D12Resource* exposure;
 	UINT exposureState;
 	float scaleX, scaleY;
-	UINT pad4c;
+	// 0.3.0 grew the packet by sixteen bytes. Sending the shorter one is not a near miss:
+	// the engine reads past the end of it, and the frame that comes back is black. These are
+	// the fields it added, and the last two are why this route was soft -- the engine is told
+	// the render extent and the sub-pixel phase of the colour it was handed, which it needs
+	// to reconstruct anything the sampling did not already average away.
+	uint8_t nativePre;
+	uint8_t pad4d[3];
+	UINT renderWidth, renderHeight;
+	float jitterX, jitterY;
 };
-static_assert(sizeof(Packet) == 0x50, "Packet must be 0x50 bytes");
+static_assert(sizeof(Packet) == 0x60, "Packet must be 0x60 bytes");
 static_assert(offsetof(Packet, scaleX) == 0x44, "scaleX must sit at 0x44");
+static_assert(offsetof(Packet, nativePre) == 0x4c, "nativePre must sit at 0x4c");
+static_assert(offsetof(Packet, renderWidth) == 0x50, "renderWidth must sit at 0x50");
+static_assert(offsetof(Packet, jitterX) == 0x58, "jitterX must sit at 0x58");
 
 using InitFn = bool(__fastcall*)(void*, const std::string*);
 using RecordFn = void(__fastcall*)(Packet*);
 using NotifyFn = void(__fastcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using HipSetFn = int (*)(int);
+
+// What the runtime calls when it wants work handed to the queue. Every supported installation
+// points the trampoline here: the submission is done by whoever drives the queue, and in this
+// backend that is Notify, called directly. Leaving it unfilled gives the runtime a null
+// pointer to call, which is not a state any working installation is in.
+void __fastcall AlreadySubmitted(
+	ID3D12CommandQueue*, UINT, ID3D12CommandList* const*
+) noexcept {}
 
 // The only shaders this backend owns: the two ends of a format conversion.
 //
@@ -204,18 +250,72 @@ void main(uint3 id : SV_DispatchThreadID)
 // The two shaders below are that lever. Neither is a plain resize: a naive downscale
 // aliases and a naive upscale softens, and the whole point of the effect is the detail it
 // adds. Both are taken from the reference, which arrived at the same problem.
+// The bit pattern of a float, for the places that hand one to a shader as a root constant.
+inline uint32_t BitsOfFloat(float v) noexcept {
+	uint32_t bits = 0;
+	std::memcpy(&bits, &v, 4);
+	return bits;
+}
+
+// The sub-pixel phases the sampling window visits, one per frame: a Halton (2, 3) sequence,
+// which spreads evenly over the unit square at every prefix length. That matters here because
+// the reconstruction gets something useful out of the first frames rather than only after a
+// full cycle, and there is no fixed cycle length to be caught out by.
+constexpr float kPhaseX[8]{ 0.5f, 0.25f, 0.75f, 0.125f, 0.625f, 0.375f, 0.875f, 0.0625f };
+constexpr float kPhaseY[8]{ 1.0f / 3, 2.0f / 3, 1.0f / 9, 4.0f / 9,
+	7.0f / 9, 2.0f / 9, 5.0f / 9, 8.0f / 9 };
+
+// Fills the shared input surface from Magpie's frame, on the D3D11 side.
+//
+// A plain CopyResource writes the pixels and this backend can read them back on the same
+// device, so it looks like it worked -- but the other device never sees them, and the whole
+// chain faithfully produces black from what it reads. Both implementations in this codebase
+// that cross this boundary successfully -- the AMD optical flow provider and the older DLSSNR
+// filter -- fill their shared surface through a compute shader writing a UAV rather than a
+// copy, and that is the one structural difference left between this chain and theirs.
+constexpr char kFillSharedShader[] = R"(
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+	uint w, h;
+	dst.GetDimensions(w, h);
+	if (id.x >= w || id.y >= h) return;
+	dst[id.xy] = src.Load(int3(id.xy, 0));
+}
+)";
+
 constexpr char kDownsampleShader[] = R"(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
-cbuffer Extent : register(b0) { uint w; uint h; uint sourceW; uint sourceH; };
+cbuffer Extent : register(b0) {
+	uint w; uint h; uint sourceW; uint sourceH;
+	uint pointSample; float jitterX; float jitterY;
+};
 [numthreads(8, 8, 1)]
 void main(uint3 p : SV_DispatchThreadID)
 {
 	if (p.x >= w || p.y >= h) return;
+	float2 scale = float2(sourceW, sourceH) / float2(w, h);
+	if (pointSample != 0) {
+		// One sample, placed by this frame's sub-pixel phase.
+		float2 at = (float2(p.xy) + 0.5 + float2(jitterX, jitterY)) * scale;
+		int2 ip = clamp(int2(at), int2(0, 0), int2(int(sourceW) - 1, int(sourceH) - 1));
+		dst[p.xy] = src.Load(int3(ip, 0));
+		return;
+	}
 	// Integrate the whole source footprint. A single bilinear sample loses narrow
 	// emissive lines once the model runs well below the input resolution.
-	float2 lo = float2(p.xy) * float2(sourceW, sourceH) / float2(w, h);
-	float2 hi = float2(p.xy + 1) * float2(sourceW, sourceH) / float2(w, h);
+	//
+	// The footprint is shifted whole by this frame's sub-pixel phase, which is what gives a
+	// run of frames something to accumulate: every frame carries the same information
+	// otherwise, and identical samples average into themselves. Moving the window rather than
+	// taking one sample from it also keeps each frame free of the aliasing a single sample
+	// would hand the reconstruction to clean up first -- and that cleanup costs detail. Which
+	// of the two survives is not something to reason about, so both are here.
+	float2 lo = (float2(p.xy) + float2(jitterX, jitterY)) * scale;
+	float2 hi = lo + scale;
 	int2 first = int2(floor(lo));
 	float4 sum = 0;
 	float total = 0;
@@ -357,10 +457,98 @@ cbuffer Settings : register(b0) {
 	// optical flow exists to supply was multiplied away. Declared as the integer it is.
 	uint w; uint h; uint weightMilli; uint historyValid;
 	uint useMotion; uint motionScaleXMilli; uint motionScaleYMilli;
+	// The residual controls, in the order the D3D11 route's ResampleConstants uses, so a slider
+	// means the same thing on both paths.
+	float residualMultiplier; float residualSaturation; float residualLightness;
+	float shadowStructure; float reflectionGlow;
 };
 
 float3 Guide(float3 c) { return c / (1 + abs(c)); }
 float MaxAbs(float3 v) { return max(abs(v.r), max(abs(v.g), abs(v.b))); }
+
+// ---- the residual controls ----
+//
+// Ported from the same-named pass in the D3D11 route so a slider means the same thing on both
+// paths, and applied where that route applies it: once per network-resolution pixel, to the raw
+// difference between what the engine produced and what it was given, before the history blend
+// and before any reprojection. The order is the point -- these controls decide which parts of
+// the edit survive at all, and the temporal blend then decides how long they persist.
+//
+// The multiplier scales the whole edit. The other four are a refinement that only engages once
+// one of them leaves 1.0: the edit is classified by the sign of its luminance change, so a
+// darkening edit answers to the shadow control and a brightening one to the reflection control,
+// and the result's saturation and lightness are then pulled toward or away from the original's.
+float3 ToLinear(float3 c) {
+	return float3(
+		c.r <= 0.04045 ? c.r / 12.92 : pow(max(c.r + 0.055, 0.0) / 1.055, 2.4),
+		c.g <= 0.04045 ? c.g / 12.92 : pow(max(c.g + 0.055, 0.0) / 1.055, 2.4),
+		c.b <= 0.04045 ? c.b / 12.92 : pow(max(c.b + 0.055, 0.0) / 1.055, 2.4));
+}
+
+float3 RGBToHSL(float3 color) {
+	float maximum = max(color.r, max(color.g, color.b));
+	float minimum = min(color.r, min(color.g, color.b));
+	float delta = maximum - minimum;
+	float lightness = (maximum + minimum) * 0.5;
+	if (delta <= 1e-6) return float3(0.0, 0.0, lightness);
+	float hue = 0.0;
+	if (maximum == color.r) {
+		hue = (color.g - color.b) / delta;
+		if (hue < 0.0) hue += 6.0;
+	} else if (maximum == color.g) {
+		hue = (color.b - color.r) / delta + 2.0;
+	} else {
+		hue = (color.r - color.g) / delta + 4.0;
+	}
+	float saturation = delta / max(1.0 - abs(2.0 * lightness - 1.0), 1e-6);
+	return float3(hue / 6.0, saturate(saturation), saturate(lightness));
+}
+
+float HueToRGB(float p, float q, float hue) {
+	hue = frac(hue);
+	if (hue < 1.0 / 6.0) return p + (q - p) * 6.0 * hue;
+	if (hue < 1.0 / 2.0) return q;
+	if (hue < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - hue) * 6.0;
+	return p;
+}
+
+float3 HSLToRGB(float3 hsl) {
+	if (hsl.y <= 1e-6) return float3(hsl.z, hsl.z, hsl.z);
+	float q = hsl.z < 0.5 ? hsl.z * (1.0 + hsl.y) : hsl.z + hsl.y - hsl.z * hsl.y;
+	float p = 2.0 * hsl.z - q;
+	return saturate(float3(HueToRGB(p, q, hsl.x + 1.0 / 3.0),
+		HueToRGB(p, q, hsl.x), HueToRGB(p, q, hsl.x - 1.0 / 3.0)));
+}
+
+float3 ApplyResidualControls(float3 original, float3 residual) {
+	residual *= residualMultiplier;
+	if (all(residual == 0.0)) return original;
+	float4 fine = float4(residualSaturation, residualLightness, shadowStructure,
+		reflectionGlow);
+	float3 output = saturate(original + residual);
+	[branch]
+	if (any(abs(fine - 1.0) >= 1e-6)) {
+		float deltaY = dot(ToLinear(output) - ToLinear(original),
+			float3(0.2126, 0.7152, 0.0722));
+		float directional = deltaY < 0.0 ? shadowStructure :
+			(deltaY > 0.0 ? reflectionGlow : 1.0);
+		float3 candidate = saturate(original + residual * directional);
+		[branch]
+		if (abs(residualSaturation - 1.0) >= 1e-6 ||
+			abs(residualLightness - 1.0) >= 1e-6) {
+			float3 originalHSL = RGBToHSL(original);
+			float3 candidateHSL = RGBToHSL(candidate);
+			candidateHSL.y = saturate(originalHSL.y +
+				(candidateHSL.y - originalHSL.y) * residualSaturation);
+			candidateHSL.z = saturate(originalHSL.z +
+				(candidateHSL.z - originalHSL.z) * residualLightness);
+			candidate = HSLToRGB(candidateHSL);
+		}
+		output = candidate;
+	}
+	return output;
+}
+
 
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -376,7 +564,10 @@ void main(uint3 id : SV_DispatchThreadID)
 	nextGuide[p] = float4(guide, finiteInput ? 1 : 0);
 	if (!finiteInput) { nextResidual[p] = 0; return; }
 
-	float3 current = raw.rgb - base.rgb;
+	// The engine's edit, after the controls. Everything downstream -- the history blend and
+	// the resolve -- sees the controlled residual, so one slider position means the same
+	// thing all the way through.
+	float3 current = ApplyResidualControls(base.rgb, raw.rgb - base.rgb) - base.rgb;
 	float3 result = current;
 
 	if (historyValid != 0 && weightMilli > 0) {
@@ -568,6 +759,40 @@ bool CallNotify(NotifyFn fn, ID3D12CommandQueue* queue, UINT count,
 	}
 }
 
+// The device's own account of what went wrong, kept only when the settings file asks for the
+// debug layer. This route has been failing at Close() with the device already gone, and Close
+// reports that fact rather than its cause; these messages carry the cause.
+winrt::com_ptr<ID3D12InfoQueue> g_deviceMessages;
+
+void DumpDeviceMessages(const char* where) noexcept {
+	if (!g_deviceMessages) {
+		return;
+	}
+	const UINT64 count = g_deviceMessages->GetNumStoredMessages();
+	for (UINT64 i = 0; i < count; ++i) {
+		SIZE_T length = 0;
+		if (FAILED(g_deviceMessages->GetMessage(i, nullptr, &length)) || !length) {
+			continue;
+		}
+		// The message is pointer-aligned and a byte buffer is not, so the storage is
+		// over-aligned rather than assumed to be. One message runs to a few hundred bytes.
+		alignas(D3D12_MESSAGE) uint8_t storage[8192];
+		if (length > sizeof(storage)) {
+			continue;
+		}
+		D3D12_MESSAGE* message = reinterpret_cast<D3D12_MESSAGE*>(storage);
+		if (FAILED(g_deviceMessages->GetMessage(i, message, &length))) {
+			continue;
+		}
+		const size_t text = message->DescriptionByteLength > 0
+			? message->DescriptionByteLength - 1 : 0;
+		Logger::Get().Warn(fmt::format("DLSSNR AMD device ({}): [{}] {}",
+			where, static_cast<int>(message->Severity),
+			std::string_view(message->pDescription ? message->pDescription : "", text)));
+	}
+	g_deviceMessages->ClearStoredMessages();
+}
+
 ID3D12Device* CreateDeviceOnAdapter(ID3D11Device* device11) noexcept {
 	// Each of the three ways this can fail says which it was, and the third says which adapter
 	// it was trying. They used to share one message further up, which made a session that
@@ -599,6 +824,44 @@ ID3D12Device* CreateDeviceOnAdapter(ID3D11Device* device11) noexcept {
 			"DLSSNR AMD: render adapter vendor 0x{:04x} device 0x{:04x}",
 			desc.VendorId, desc.DeviceId));
 	}
+	// Asked for by the settings file, not by the build, so an ordinary session is not paying
+	// for it:   [DlssNrOnAmd]   DebugLayer=1
+	if (GetPrivateProfileIntW(L"DlssNrOnAmd", L"DebugLayer", 0,
+			(ExeDirectory() / kIniName).c_str()) != 0) {
+		winrt::com_ptr<ID3D12Debug> debug;
+		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(debug.put())))) {
+			debug->EnableDebugLayer();
+			// The CPU-side layer cannot see a barrier the command list records and the GPU
+			// mishandles, which is exactly the shape of this route's failure.
+			winrt::com_ptr<ID3D12Debug1> debug1;
+			if (SUCCEEDED(debug->QueryInterface(IID_PPV_ARGS(debug1.put())))) {
+				debug1->SetEnableGPUBasedValidation(TRUE);
+			}
+			Logger::Get().Info("DLSSNR AMD: the debug layer is on");
+		} else {
+			Logger::Get().Warn("DLSSNR AMD: the debug layer was asked for but is not installed");
+		}
+	}
+	// DRED, before the device exists.
+	//
+	// The runtime asks for DRED itself and its log says so -- "DRED enabled (page-fault
+	// reporting; breadcrumbs off)" -- but it does that during its initialisation, long after
+	// this device was created, and these settings are only read at creation time. Forcing them
+	// on here is what lets that reporting name the unfinished command list, which is the one
+	// piece of evidence every other reading in this file cannot supply: something in the
+	// engine's initialisation stops this process's D3D12 from executing submitted work, and
+	// DRED is the only instrument in the process that can say which submission it was.
+	{
+		winrt::com_ptr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(dred.put())))) {
+			dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			Logger::Get().Info(
+				"DLSSNR AMD: DRED breadcrumbs and page faults forced on, before the device");
+		} else {
+			Logger::Get().Warn("DLSSNR AMD: the DRED settings are unavailable");
+		}
+	}
 	winrt::com_ptr<ID3D12Device> device12;
 	hr = D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_12_0,
 		IID_PPV_ARGS(device12.put()));
@@ -611,6 +874,8 @@ ID3D12Device* CreateDeviceOnAdapter(ID3D11Device* device11) noexcept {
 			static_cast<uint32_t>(hr)));
 		return nullptr;
 	}
+	// Nothing comes of it being absent: the layer writes here only when it is on.
+	(void)device12->QueryInterface(IID_PPV_ARGS(g_deviceMessages.put()));
 	return device12.detach();
 }
 
@@ -731,7 +996,92 @@ struct DlssnrAmdBackend::Impl {
 	winrt::com_ptr<ID3D12CommandQueue> queue;
 	winrt::com_ptr<ID3D12CommandAllocator> allocator;
 	winrt::com_ptr<ID3D12GraphicsCommandList> list;
+	// A second pair, for the compositing pass alone. The first pair is submitted to the engine
+	// and is still in flight while this frame's picture is built -- resetting its allocator
+	// before the GPU has finished with it fails, which is what turned the whole effect off.
+	// Two submissions, two allocators, and neither waits on the other.
+	winrt::com_ptr<ID3D12CommandAllocator> outAllocator;
+	winrt::com_ptr<ID3D12GraphicsCommandList> outList;
+	// A third pair, for readbacks alone. Measure used the main pair, which is being recorded
+	// into at the moment it is called -- it reset an allocator the GPU still had, and every
+	// figure it produced was zero regardless of what the surface held. A control surface known
+	// to contain 1.0 read back as 0.0000, which is how that was found.
+	winrt::com_ptr<ID3D12CommandAllocator> crossTestAllocator;
+	winrt::com_ptr<ID3D12GraphicsCommandList> crossTestList;
+	winrt::com_ptr<ID3D12Fence> crossTestFence;
+	HANDLE crossTestEvent = nullptr;
+	uint64_t crossTestFenceValue = 0;
+	winrt::com_ptr<ID3D12CommandAllocator> measureAllocator;
+	winrt::com_ptr<ID3D12GraphicsCommandList> measureList;
+	// The readback's own queue, and the reason it exists.
+	//
+	// Measure used to submit its probe copy on the engine's queue -- the one the runtime hooks.
+	// A submission the hook does not recognise is not guaranteed to run, and the failure is not
+	// an error: the readback buffer simply keeps the previous call's contents. Every figure then
+	// returns the last texture's value, two surfaces of the same size read identically whatever
+	// they hold, and a chain that produced nothing is indistinguishable from one that works.
+	// A queue of this backend's own takes the probe out of that path entirely.
+	winrt::com_ptr<ID3D12CommandQueue> probeQueue;
+	winrt::com_ptr<ID3D12Fence> probeFence;
+	uint64_t probeFenceValue = 0;
+
+	// The queue's own ExecuteCommandLists, taken from its vtable before the engine initialises.
+	//
+	// Everything this backend submits stops executing once the runtime has initialised. A clear
+	// followed by a copy into a readback buffer reads back zero, on this queue and on one made
+	// afterwards alike, while the fence that follows still reaches its value -- the signature of
+	// an interception that consumes the call without forwarding it, since Signal is a different
+	// slot on the same vtable and still runs. The engine keeps reporting jobs throughout because
+	// its work runs on HIP and never goes through these queues at all.
+	//
+	// It also explains the engine's own inline complaint, "a store from the game's queue was NOT
+	// seen by the GPU wait": that store is recorded into this list, gets submitted, and never
+	// reaches the GPU.
+	//
+	// Taking the entry first and calling it directly is what the reference does for the same
+	// reason -- its bridge saves this same vtable slot before hooking the queue -- and index 10
+	// is where ExecuteCommandLists sits: past IUnknown, ID3D12Object, ID3D12DeviceChild, and the
+	// pageable base that adds no methods of its own.
+	using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT,
+		ID3D12CommandList* const*);
+	ExecuteFn executeOriginal = nullptr;
+	void SubmitTo(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) const noexcept {
+		if (executeOriginal) {
+			executeOriginal(q, n, lists);
+		} else {
+			q->ExecuteCommandLists(n, lists);
+		}
+	}
 	winrt::com_ptr<ID3D12Fence> fence;
+	// The handshake the two devices need before anything crosses. Each keeps its own view of
+	// one fence, and the D3D11 side waits on it where the work was submitted, so the read that
+	// follows is ordered after the write rather than merely later than it.
+	//
+	// Waiting here on the CPU was not enough, and the shape of that failure is what took a
+	// session to see: the queue had finished, the data was written, the read still happened
+	// against a surface the other device had not been told about, and the driver removed the
+	// device. It went unnoticed for a while because turning the debug layer on slows this side
+	// down enough that the two never actually overlapped.
+	winrt::com_ptr<ID3D11Fence> crossFence11;
+	winrt::com_ptr<ID3D12Fence> crossFence12;
+	uint64_t crossValue = 0;
+	// How much of the encode list gets recorded, from the settings file. Four is the whole of
+	// it; each smaller number stops one call earlier, which is how this route was narrowed
+	// down after every reading of the source failed to explain it:
+	//   [DlssNrOnAmd]   EncodeSteps=1
+	// 5 is the whole of it: 1 barrier, 2 bind, 3 constants, 4 dispatch, 5 the copy across.
+	int encodeSteps = 5;
+	// This frame's sub-pixel phase, and where the sequence is. Only the reconstruction route
+	// advances it: it is the only consumer that accumulates across frames.
+	float frameJitterX = 0.0f;
+	float frameJitterY = 0.0f;
+	uint32_t jitterPhase = 0;
+	// Off only to measure what it is worth; see the reading printed on the first frame.
+	bool jitterEnabled = true;
+	// Whether the phase moves a single sample or the whole footprint. Two shapes for one idea,
+	// kept apart because sampled detail and averaged detail fail differently and the figures
+	// decide which one this route wants.
+	bool pointSample = true;
 
 	struct EventGuard {
 		HANDLE handle = nullptr;
@@ -762,18 +1112,116 @@ struct DlssnrAmdBackend::Impl {
 	uint64_t lastSubmitTick = 0;
 	bool resetHistory = true;
 
-	// The engine's surfaces.
-	// The engine works in place: the texture named in the packet is both what it reads
-	// and what it writes. There is one surface here, not two.
-	winrt::com_ptr<ID3D12Resource> net;
-	// The frame as the engine will not see it: full resolution, and holding the version
-	// from before the engine touched anything. `full` is what the resolve takes detail
-	// from, `baseline` is what it subtracts to isolate the edit.
-	winrt::com_ptr<ID3D12Resource> full;
-	winrt::com_ptr<ID3D12Resource> baseline;
+	// The surface being recorded into this frame, and the job number that was submitted for
+	// each one. The picture is built from the other slot -- the newest one the engine has
+	// actually finished -- and waiting on that job is what makes "finished" mean something.
+	uint32_t slot = 0;
+	// The slot the picture was built from, so the temporal pass reprojects against the same
+	// generation the resolve is reading rather than against a fixed neighbour.
+	uint32_t pictureSlot = 0;
+	// The generation the temporal history was last advanced for. Sentinel, so the first frame
+	// always runs it.
+	uint32_t temporalSourceSlot = 0xFFFFFFFFu;
+	uint32_t slotJob[kSlots]{};
+	// The fence value this queue reaches when the frame in that slot is finished on the GPU.
+	//
+	// This, and not the runtime's own counters, is what says a slot (or one of its passes) has
+	// actually retired. The runtime publishes progress of its own -- jobId/jobDone -- but with
+	// the asynchronous handshake the done counter is not advanced at all, which is what left
+	// this waiting on a number that never moved.
+	uint64_t slotFence[kSlots]{};
+	// Where the queue is when the last composited frame finished. The output list has its own
+	// submission, so it needs its own retirement point: resetting its allocator while the GPU
+	// still holds the previous one fails, and that failure turned the effect off entirely.
+	uint64_t outFence = 0;
+
+	// The reference's per-slot state, verbatim in meaning: a slot is recorded, then submitted,
+	// and only then eligible to retire. Between Record and the submission the slot is neither
+	// free nor usable -- that is the state which stops another frame being recorded into it,
+	// and the state that tells retirement not to look at it yet.
+	struct SlotState {
+		bool recorded = false;
+		bool submitted = false;
+		uint64_t recordedAt = 0;
+		uint64_t submittedAt = 0;
+		void Record(uint64_t now) noexcept {
+			*this = {};
+			recorded = true;
+			recordedAt = now;
+		}
+		void Submit(uint64_t now) noexcept {
+			submitted = true;
+			submittedAt = now;
+		}
+		// Recorded but not yet submitted: this slot must not be recorded into again.
+		bool BlocksRecord() const noexcept { return recorded && !submitted; }
+		// D3D12 reports UINT64_MAX on device removal, not successful completion.
+		bool CanRetire(bool nativeDone, uint64_t completed, uint64_t target) const noexcept {
+			return recorded && submitted && target != 0 && nativeDone &&
+				completed != (std::numeric_limits<uint64_t>::max)() && completed >= target;
+		}
+	};
+	std::array<SlotState, kSlots> slotState{};
+	// One ordered timeline across every slot, as the reference keeps it: each submission takes
+	// the next number and signals the fence with it.
+	uint64_t serial = 0;
+	// Which adapter each device actually landed on. Shared handles are created on one device
+	// and opened on the other, and that succeeds even when the two are not the same physical
+	// adapter -- the failure then is silent: every read comes back as the surface's initial
+	// contents, which is zero. Nothing else in this chain explains both directions being empty
+	// at once while every handle and fence reports success.
+	LUID luid11{};
+	LUID luid12{};
+	// The adapter the renderer's device is on, kept for diagnostics that need to build a
+	// second device against the same hardware.
+	winrt::com_ptr<IDXGIAdapter> device11Adapter;
+
+	// The handshake across the device boundary, for the direction this backend actually uses:
+	// Magpie's frame is copied into a shared texture on D3D11 and read out of it on D3D12.
+	// Both devices touch the same memory, and being on the same machine does not order them --
+	// a flush on one device is a submission, not a completion. Without this the far side reads
+	// whatever was there before the copy, which at startup is nothing at all, and every stage
+	// downstream faithfully produces black from it.
+	// The D3D11 side of the crossing: a compute shader that fills the shared input surface,
+	// and the views it needs. See kFillSharedShader for why a copy is not enough.
+	winrt::com_ptr<ID3D11ComputeShader> fillSharedShader;
+	winrt::com_ptr<ID3D11UnorderedAccessView> sharedInUav;
+	winrt::com_ptr<ID3D11ShaderResourceView> frameSrv;
+	ID3D11Texture2D* frameSrvSource = nullptr;
+
+	winrt::com_ptr<ID3D11Fence> inFence11;
+	winrt::com_ptr<ID3D12Fence> inFence12;
+	uint64_t inFenceValue = 0;
+	// The other direction, and a fence of its own. A fence carries one value, so a second
+	// direction signalling the same object lets whichever side runs ahead satisfy the other's
+	// wait the moment it does -- which is the same as not waiting at all, and is why the
+	// crossing read as present in the code and absent in the picture.
+	winrt::com_ptr<ID3D11Fence> outFence11;
+	winrt::com_ptr<ID3D12Fence> outFence12;
+	uint64_t outFenceValue = 0;
+	// The picture is produced on D3D12 and read on D3D11, and this queue finishing says nothing
+	// about the other device being able to see it: waiting on our own fence proves our work is
+	// done, not that it is visible elsewhere.
+	winrt::com_ptr<ID3D11DeviceContext4> context11x;
+
+	// The engine's surfaces, and there are two of each.
+	//
+	// The engine works in place: the texture named in the packet is both what it reads and
+	// what it writes. It also returns before it is finished -- "mode async (residual from an
+	// earlier frame)" -- so the packet's texture must not be the one the picture is built
+	// from, or the next frame overwrites a frame still being read. One set for the frame
+	// being recorded, one holding the frame that finished.
+	//
+	// `full` and `baseline` belong to the same generation as the surface they pair with: the
+	// resolve subtracts baseline from what the engine produced to isolate the edit, and puts
+	// that over the detail in `full`. Mixing generations there would align one frame's edit
+	// against another frame's picture.
+	winrt::com_ptr<ID3D12Resource> net[kSlots];
+	winrt::com_ptr<ID3D12Resource> full[kSlots];
+	winrt::com_ptr<ID3D12Resource> baseline[kSlots];
 	winrt::com_ptr<ID3D12Resource> resolved;
-	winrt::com_ptr<ID3D12Resource> motion;
-	winrt::com_ptr<ID3D12Resource> depth;
+	winrt::com_ptr<ID3D12Resource> motion[kSlots];
+	winrt::com_ptr<ID3D12Resource> depth[kSlots];
 	// One pixel, holding the exposure the engine is told to use instead of adapting one.
 	winrt::com_ptr<ID3D12Resource> exposureTexture;
 	winrt::com_ptr<ID3D12DescriptorHeap> heap;
@@ -832,6 +1280,16 @@ struct DlssnrAmdBackend::Impl {
 #endif
 	winrt::com_ptr<ID3D11Texture2D> netShared11;
 	winrt::com_ptr<ID3D12Resource> netShared12;
+	// Where the encode lands before it crosses. A texture this device owns outright, so the
+	// encoding pass writes somewhere no other device has an interest in; the crossing is a
+	// plain copy afterwards, which is the shape this backend has always used and the only one
+	// it has never taken the device down with.
+	//
+	// Encoding straight into the shared texture was the first attempt, and it removed the
+	// device every time. That surface is not inert: the upscaler holds it and reads it as a
+	// shader resource on its own device, while this queue turns it into a UAV to write it.
+	// One surface in both roles at once is what the driver refused.
+	winrt::com_ptr<ID3D12Resource> encoded;
 	// Motion at the network's extent, for the upscaler to reproject with.
 	//
 	// It asks the frame guidance for motion, and it checks that what it is handed matches its
@@ -839,22 +1297,7 @@ struct DlssnrAmdBackend::Impl {
 	// guidance this backend is given is produced at the captured extent, so it cannot be
 	// passed through; what goes over instead is a view built here, at the network's size,
 	// carrying the motion this backend already resamples to exactly that extent.
-	// Where the upscaler writes, at the captured size and in the engine's own format, so that
-	// the frame can go through the output stage every other route ends in. Handed the display
-	// texture directly it wrote linear values straight into it, and the stage that maps linear
-	// values onto what a display expects -- the shoulder and the sRGB encode -- never ran.
-	// That is the whole of the darkness: linear read as sRGB crushes the shadows and pins the
-	// highlights.
-	// The ordering between the upscaler's writes and this backend's reads. They are on two
-	// devices, and a shared resource used by two devices without one is what the driver
-	// answers with DXGI_ERROR_DRIVER_INTERNAL_ERROR and a removed device -- which is exactly
-	// what happened when the upscaler's output was read straight back on this queue.
-	winrt::com_ptr<ID3D11Fence> reconFence11;
-	winrt::com_ptr<ID3D12Fence> reconFence12;
-	winrt::com_ptr<ID3D11DeviceContext4> context4;
-	uint64_t reconFenceValue = 0;
-	winrt::com_ptr<ID3D11Texture2D> reconOut11;
-	winrt::com_ptr<ID3D12Resource> reconOut12;
+
 	winrt::com_ptr<ID3D11Texture2D> motionShared11;
 	winrt::com_ptr<ID3D12Resource> motionShared12;
 	// The three the check needs and the dispatch does not read: the upscaler supplies its own
@@ -942,6 +1385,7 @@ struct DlssnrAmdBackend::Impl {
 	winrt::com_ptr<ID3D12Resource> probe;
 	uint64_t probeBytes = 0;
 	bool probed = false;
+	bool profiled = false;
 	// The previous call's samples, for the flicker measure. Never used for anything else.
 	std::vector<float> sample;
 	std::vector<float> previousSample;
@@ -958,6 +1402,12 @@ struct DlssnrAmdBackend::Impl {
 	// optimising anything. These are the same stages, timed here.
 	uint64_t phaseAccum[7] = {};
 	uint64_t phaseAt[7] = {};
+
+	// Where the composite stage's own time goes. That stage is the whole frame here, and it
+	// holds two separate blocking waits plus the passes between them, so the stage total
+	// cannot say which of them is the cost. Indices: out-wait, temporal, resolve, submit,
+	// drain.
+	uint64_t compositeAccum[5] = {};
 
 	// Frame-to-frame intervals, for the window the phase log covers.
 	//
@@ -1009,9 +1459,15 @@ struct DlssnrAmdBackend::Impl {
 		}
 	}
 
-	D3D12_CPU_DESCRIPTOR_HANDLE Cpu(uint32_t slot) const noexcept {
+	D3D12_GPU_DESCRIPTOR_HANDLE Gpu(uint32_t index) const noexcept {
+		D3D12_GPU_DESCRIPTOR_HANDLE h = heap->GetGPUDescriptorHandleForHeapStart();
+		h.ptr += UINT64(index) * descriptorStride;
+		return h;
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE Cpu(uint32_t index) const noexcept {
 		D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
-		h.ptr += SIZE_T(slot) * descriptorStride;
+		h.ptr += SIZE_T(index) * descriptorStride;
 		return h;
 	}
 
@@ -1021,25 +1477,35 @@ struct DlssnrAmdBackend::Impl {
 	bool CreateSized(uint32_t w, uint32_t h, DXGI_FORMAT inFmt, DXGI_FORMAT outFmt) noexcept;
 	bool InitEngine(const std::filesystem::path& weightsPath) noexcept;
 	bool CreateExposure() noexcept;
-	void Bind(uint32_t slot, ID3D12Resource* srv, DXGI_FORMAT srvFormat,
+	void Bind(uint32_t tableSlot, ID3D12Resource* srv, DXGI_FORMAT srvFormat,
 		ID3D12Resource* uav, DXGI_FORMAT uavFormat) noexcept;
-	void BindResolve(uint32_t slot, ID3D12Resource* srv, ID3D12Resource* uav,
+	void BindResolve(uint32_t tableSlot, ID3D12Resource* srv, ID3D12Resource* uav,
 		ID3D12Resource* baselineTexture, ID3D12Resource* edited) noexcept;
-	void BindTemporal(uint32_t slot, ID3D12Resource* edited, ID3D12Resource* nextResidual,
+	void BindTemporal(uint32_t tableSlot, ID3D12Resource* edited, ID3D12Resource* nextResidual,
 		ID3D12Resource* nextGuide, ID3D12Resource* baselineTexture,
 		ID3D12Resource* historyResidualTexture,
 		ID3D12Resource* historyGuideTexture, ID3D12Resource* motionTexture) noexcept;
 	void CreateSrv(ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE where) noexcept;
 	bool RunTemporal(const NativeEffectDrawContext& context) noexcept;
-	void Dispatch(ID3D12PipelineState* pso, uint32_t slot) noexcept;
+	void Dispatch(ID3D12PipelineState* pso, uint32_t tableSlot) noexcept;
 	// `residualTableSlot` is where the second descriptor table starts, or 0 for a pass that
 	// has no second table. It is a slot rather than a flag because the passes lay their
 	// descriptors out differently: the temporal pass writes two UAVs before its extra
 	// sources, the resolve writes one.
-	void DispatchSized(ID3D12PipelineState* pso, uint32_t slot, uint32_t dw, uint32_t dh,
+	void DispatchSized(ID3D12PipelineState* pso, uint32_t tableSlot, uint32_t dw, uint32_t dh,
 		uint32_t residualTableSlot, const UINT* constants = nullptr,
 		uint32_t constantCount = 4) noexcept;
-	bool WaitForEngine(uint64_t deadlineMs) noexcept;
+	// Waits until the engine reports it has finished job number `wanted`. The counter is the
+	// engine's own published progress, so it is global rather than per slot -- the job number
+	// is what says which frame has landed.
+	bool WaitForEngine(uint32_t wanted, uint64_t deadlineMs) noexcept;
+	// Frees every slot whose work has both finished on the engine and retired on this queue.
+	// The reference runs this after every submission and on every status query; it is what
+	// turns a slot from "in flight" back into "available", and it is the only place a slot
+	// becomes reusable.
+	void RetireSubmission(const char* source) noexcept;
+	// One-off check of the device boundary in both directions. Diagnostic only.
+	void CrossTest() noexcept;
 	bool SubmitEngineJob() noexcept;
 	// Brings up the FSR3 upscaler over a shared copy of the engine's frame, when the route is
 	// selected. A no-op otherwise, and a no-op when the SDK is not in this build.
@@ -1047,6 +1513,12 @@ struct DlssnrAmdBackend::Impl {
 	// Hands the engine's edited frame to it and lets it write the output.
 	bool RunReconstruction(const NativeEffectDrawContext& context) noexcept;
 	void DestroySized() noexcept;
+	// What actually reached the display, read back once. The route's whole claim is that the
+	// picture is display-referred -- that the shoulder and the encode happen before the
+	// reconstruction rather than after it, which is what the darker version of this route got
+	// wrong. This is how that claim is checked without a person looking at a screen.
+	float MeanOfOutput(ID3D11Texture2D* tex, float* detail = nullptr) noexcept;
+
 	float Measure(ID3D12Resource* res, DXGI_FORMAT format,
 		D3D12_RESOURCE_STATES before, uint64_t* nonFinite = nullptr,
 		float* meanAbsDelta = nullptr) noexcept;
@@ -1122,6 +1594,25 @@ bool DlssnrAmdBackend::Impl::CreateHip() noexcept {
 		return false;
 	}
 
+	// The engine's own inline diagnostic reports "HIP runtime 0" where a working system reports
+	// 70260201, and it reads that as a driver too old to be supported -- which is the reason it
+	// gives for the inline wait timing out. Asking the same question here says whether the
+	// reading is right, or whether it is an artefact of when the engine asks.
+	{
+		auto runtimeVersion = reinterpret_cast<int (*)(int*)>(
+			GetProcAddress(hip, "hipRuntimeGetVersion"));
+		auto driverVersion = reinterpret_cast<int (*)(int*)>(
+			GetProcAddress(hip, "hipDriverGetVersion"));
+		int runtimeAnswer = -1;
+		int driverAnswer = -1;
+		const int runtimeCall = runtimeVersion ? runtimeVersion(&runtimeAnswer) : -99;
+		const int driverCall = driverVersion ? driverVersion(&driverAnswer) : -99;
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: HIP runtime version {} (call {}), driver version {} (call {}), "
+			"devices {}",
+			runtimeAnswer, runtimeCall, driverAnswer, driverCall, count));
+	}
+
 	// The D3D12 device has to be on the same physical card as the HIP kernels, or the
 	// textures handed to the engine live in memory it cannot reach. hipDeviceProp_tR0600
 	// carries the adapter LUID for exactly this comparison -- and it is around a
@@ -1163,6 +1654,648 @@ bool DlssnrAmdBackend::Impl::CreateHip() noexcept {
 		return false;
 	}
 	return true;
+}
+
+void DlssnrAmdBackend::Impl::RetireSubmission(const char* source) noexcept {
+	(void)source;
+	const uint64_t completed = fence ? fence->GetCompletedValue() : 0;
+	for (uint32_t k = 0; k < kSlots; ++k) {
+		SlotState& st = slotState[k];
+		if (!st.recorded) {
+			continue;
+		}
+		// The engine's own completion for this slot. With the asynchronous handshake it does
+		// not advance, and that is not a reason to keep the slot forever -- the queue's fence
+		// is the authority here, exactly as it is for the picture.
+		const uint64_t target = slotFence[k];
+		if (st.CanRetire(true, completed, target)) {
+			st = {};
+		}
+	}
+}
+
+void DlssnrAmdBackend::Impl::CrossTest() noexcept {
+	// The crossing, both ways, with a value nothing can fake. D3D12 writes a constant into the
+	// shared output surface, then D3D11 reads it back with the measure that is known to work.
+	// One direction working says which side is broken; neither working says the shared surface
+	// is not doing what it is supposed to do. Run once, outside the frame loop, so it cannot
+	// disturb the per-frame fence accounting.
+	if (!crossTestList) {
+		const HRESULT h1 = device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+			IID_PPV_ARGS(crossTestAllocator.put()));
+		const HRESULT h2 = SUCCEEDED(h1) ? device12->CreateCommandList(0,
+			D3D12_COMMAND_LIST_TYPE_DIRECT, crossTestAllocator.get(), nullptr,
+			IID_PPV_ARGS(crossTestList.put())) : h1;
+		if (FAILED(h1) || FAILED(h2)) {
+			Logger::Get().Error(fmt::format("CROSS TEST: list creation failed 0x{:08x}/0x{:08x}",
+				static_cast<uint32_t>(h1), static_cast<uint32_t>(h2)));
+			return;
+		}
+		crossTestList->Close();
+	}
+	if (crossTestFenceValue == 0) {
+		const HRESULT hf = device12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+			IID_PPV_ARGS(crossTestFence.put()));
+		if (FAILED(hf)) {
+			Logger::Get().Error(fmt::format("CROSS TEST: fence failed 0x{:08x}",
+				static_cast<uint32_t>(hf)));
+			return;
+		}
+	}
+	const HRESULT hr1 = crossTestAllocator->Reset();
+	const HRESULT hr2 = SUCCEEDED(hr1)
+		? crossTestList->Reset(crossTestAllocator.get(), nullptr) : hr1;
+	if (FAILED(hr1) || FAILED(hr2)) {
+		Logger::Get().Error(fmt::format("CROSS TEST: reset failed 0x{:08x}/0x{:08x}",
+			static_cast<uint32_t>(hr1), static_cast<uint32_t>(hr2)));
+		return;
+	}
+	// Closed straight away because nothing below records into it: this function does all its
+	// work on lists of its own. An allocator cannot be reset while a list built from it is
+	// still open, so leaving this one open made the second call -- the one that runs after the
+	// runtime has installed its hooks, which is the call that matters -- fail before it began.
+	crossTestList->Close();
+	const uint32_t descSlot = 30;
+	D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+	u.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+	// A brand new pair at a small size, so nothing about the large surfaces or their reuse can
+	// be blamed. This is the smallest possible statement of "can these two devices share".
+	winrt::com_ptr<ID3D11Texture2D> small11;
+	winrt::com_ptr<ID3D12Resource> small12;
+	D3D11_TEXTURE2D_DESC sd{};
+	sd.Width = 64; sd.Height = 64; sd.MipLevels = 1; sd.ArraySize = 1;
+	sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sd.SampleDesc.Count = 1;
+	sd.Usage = D3D11_USAGE_DEFAULT;
+	sd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	sd.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	// A second, entirely independent D3D11 device on the same adapter. If a texture made and
+	// filled on THAT device is visible to D3D12 while Magpie's own is not, the problem is in
+	// how the renderer's device was created; if neither is visible, it is the platform.
+	winrt::com_ptr<ID3D11Device> probe11;
+	winrt::com_ptr<ID3D11DeviceContext> probeDC;
+	winrt::com_ptr<ID3D11Texture2D> probeTex;
+	bool probeOk = false;
+	{
+		D3D_FEATURE_LEVEL fl{};
+		const D3D_FEATURE_LEVEL want[]{ D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+		// Found by enumeration, the way the standalone test that works does it, rather than
+		// through the renderer's device: the point is a device this backend did not influence.
+		winrt::com_ptr<IDXGIFactory4> fac;
+		winrt::com_ptr<IDXGIAdapter1> pick;
+		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(fac.put())))) {
+			for (UINT i = 0; fac->EnumAdapters1(i, pick.put()) == S_OK; ++i) {
+				DXGI_ADAPTER_DESC1 d{};
+				pick->GetDesc1(&d);
+				if (d.VendorId == 0x1002) break;
+				pick = nullptr;
+			}
+		}
+		HRESULT hprobe = E_FAIL;
+		if (pick) {
+			hprobe = D3D11CreateDevice(pick.get(), D3D_DRIVER_TYPE_UNKNOWN,
+				nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, want, 2, D3D11_SDK_VERSION,
+				probe11.put(), &fl, probeDC.put());
+		}
+		Logger::Get().Info(fmt::format("CROSS TEST: probe device hr=0x{:08x} adapter={}",
+			static_cast<uint32_t>(hprobe), pick ? "found" : "NONE"));
+		if (pick && SUCCEEDED(hprobe)) {
+			D3D11_TEXTURE2D_DESC pd = sd;
+			if (SUCCEEDED(probe11->CreateTexture2D(&pd, nullptr, probeTex.put()))) {
+				// Filled through a staging copy, the way the standalone test does it: a UAV-capable
+				// texture cannot take initial data directly.
+				D3D11_TEXTURE2D_DESC st = sd;
+				st.Usage = D3D11_USAGE_STAGING;
+				st.BindFlags = 0;
+				st.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+				st.MiscFlags = 0;
+				winrt::com_ptr<ID3D11Texture2D> stage;
+				if (SUCCEEDED(probe11->CreateTexture2D(&st, nullptr, stage.put()))) {
+					D3D11_MAPPED_SUBRESOURCE m{};
+					if (SUCCEEDED(probeDC->Map(stage.get(), 0, D3D11_MAP_WRITE, 0, &m))) {
+						for (UINT y = 0; y < st.Height; ++y) {
+							uint8_t* row = static_cast<uint8_t*>(m.pData) + size_t(y) * m.RowPitch;
+							for (UINT x = 0; x < st.Width; ++x) {
+								row[x * 4 + 0] = 128;
+								row[x * 4 + 1] = 128;
+								row[x * 4 + 2] = 128;
+								row[x * 4 + 3] = 255;
+							}
+						}
+						probeDC->Unmap(stage.get(), 0);
+						probeDC->CopyResource(probeTex.get(), stage.get());
+						probeDC->Flush();
+						probeOk = true;
+					}
+				}
+			}
+		}
+	}
+	Logger::Get().Info(fmt::format("CROSS TEST: independent D3D11 device {}", probeOk ? "ok" : "FAILED"));
+	// If it exists, run the same crossing on IT. A texture made and filled on a device this
+	// backend did not create, read back on D3D12, separates "the renderer's device" from
+	// "the platform" with no other variable in play.
+	if (probeOk) {
+		winrt::com_ptr<IDXGIResource1> pxr;
+		HANDLE ph = nullptr;
+		winrt::com_ptr<ID3D12Resource> probe12;
+		bool shared = false;
+		if (SUCCEEDED(probeTex->QueryInterface(IID_PPV_ARGS(pxr.put()))) &&
+			SUCCEEDED(pxr->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &ph))) {
+			wil::unique_handle phh(ph);
+			if (SUCCEEDED(device12->OpenSharedHandle(phh.get(), IID_PPV_ARGS(probe12.put())))) {
+				shared = true;
+			}
+		}
+		Logger::Get().Info(fmt::format(
+			"CROSS TEST: independent device's texture opened by D3D12: {}",
+			shared ? "yes" : "NO"));
+		// The full round trip on the independent pair: D3D12 writes a known value into the
+		// independent device's shared texture, that device reads it back. Magpie's own devices
+		// and contexts are not involved at any point, so a failure here can only be about the
+		// D3D12 device this backend created.
+		{
+			winrt::com_ptr<ID3D12Resource> indep12;
+			winrt::com_ptr<IDXGIResource1> ixr;
+			// A queue of its own, so nothing submitted here goes through the engine's
+			// interception of the backend's own queue.
+			winrt::com_ptr<ID3D12CommandQueue> altQueue;
+			winrt::com_ptr<ID3D12CommandAllocator> altAlloc;
+			winrt::com_ptr<ID3D12GraphicsCommandList> altList;
+			winrt::com_ptr<ID3D12Fence> altFence;
+			{
+				D3D12_COMMAND_QUEUE_DESC aqd{};
+				aqd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+				device12->CreateCommandQueue(&aqd, IID_PPV_ARGS(altQueue.put()));
+				device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+					IID_PPV_ARGS(altAlloc.put()));
+				device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+					altAlloc.get(), nullptr, IID_PPV_ARGS(altList.put()));
+				device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(altFence.put()));
+			}
+			HANDLE ih = nullptr;
+			bool roundTripRan = false;
+			if (SUCCEEDED(probeTex->QueryInterface(IID_PPV_ARGS(ixr.put()))) &&
+				SUCCEEDED(ixr->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &ih))) {
+				wil::unique_handle ihh(ih);
+				if (SUCCEEDED(device12->OpenSharedHandle(ihh.get(),
+						IID_PPV_ARGS(indep12.put())))) {
+					D3D12_UNORDERED_ACCESS_VIEW_DESC iu{};
+					iu.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+					iu.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+					device12->CreateUnorderedAccessView(indep12.get(), nullptr, &iu, Cpu(descSlot));
+					Barrier(altList.get(), indep12.get(), D3D12_RESOURCE_STATE_COMMON,
+						D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+					const float kv[4]{ 0.25f, 0.25f, 0.25f, 1.0f };
+					altList->ClearUnorderedAccessViewFloat(Gpu(descSlot), Cpu(descSlot),
+						indep12.get(), kv, 0, nullptr);
+					Barrier(altList.get(), indep12.get(),
+						D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+					altList->Close();
+					ID3D12CommandList* icl[]{ altList.get() };
+					altQueue->ExecuteCommandLists(1, icl);
+					const uint64_t isig = ++crossTestFenceValue;
+					altQueue->Signal(altFence.get(), isig);
+					altFence->SetEventOnCompletion(isig, crossTestEvent);
+					WaitForSingleObject(crossTestEvent, 3000);
+					roundTripRan = true;
+					altAlloc->Reset();
+					altList->Reset(altAlloc.get(), nullptr);
+				}
+			}
+			probeDC->Flush();
+			Logger::Get().Info(fmt::format(
+				"CROSS TEST: independent pair round trip ran={}", roundTripRan));
+			D3D11_TEXTURE2D_DESC rs = sd;
+			rs.Usage = D3D11_USAGE_STAGING;
+			rs.BindFlags = 0;
+			rs.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			rs.MiscFlags = 0;
+			winrt::com_ptr<ID3D11Texture2D> rst;
+			if (SUCCEEDED(probe11->CreateTexture2D(&rs, nullptr, rst.put()))) {
+				probeDC->CopyResource(rst.get(), probeTex.get());
+				D3D11_MAPPED_SUBRESOURCE rm{};
+				if (SUCCEEDED(probeDC->Map(rst.get(), 0, D3D11_MAP_READ, 0, &rm))) {
+					const uint8_t* rp = static_cast<const uint8_t*>(rm.pData);
+					Logger::Get().Info(fmt::format(
+						"CROSS TEST: independent device read = {} (128 = untouched, 64 = D3D12's "
+						"write arrived)", rp[0]));
+					probeDC->Unmap(rst.get(), 0);
+				}
+			}
+		}
+	}
+
+	if (FAILED(device11->CreateTexture2D(&sd, nullptr, small11.put()))) {
+		Logger::Get().Error("CROSS TEST: small texture creation failed");
+		return;
+	}
+	winrt::com_ptr<IDXGIResource1> xr;
+	HANDLE h = nullptr;
+	if (FAILED(small11->QueryInterface(IID_PPV_ARGS(xr.put()))) ||
+		FAILED(xr->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &h))) {
+		Logger::Get().Error("CROSS TEST: small texture could not be shared");
+		return;
+	}
+	{
+		wil::unique_handle hh(h);
+		if (FAILED(device12->OpenSharedHandle(hh.get(), IID_PPV_ARGS(small12.put())))) {
+			Logger::Get().Error("CROSS TEST: D3D12 could not open the small texture");
+			return;
+		}
+	}
+	// A queue of our own, made here and used only here. The engine hooks the queue this
+	// backend runs on, so everything submitted through that one goes through the engine's
+	// interception -- if the write below only lands on this fresh queue, that interception
+	// is what the crossing has been fighting all along.
+	winrt::com_ptr<ID3D12CommandQueue> altQueue;
+	winrt::com_ptr<ID3D12CommandAllocator> altAlloc;
+	winrt::com_ptr<ID3D12GraphicsCommandList> altList;
+	winrt::com_ptr<ID3D12Fence> altFence;
+	{
+		D3D12_COMMAND_QUEUE_DESC aqd{};
+		aqd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		if (FAILED(device12->CreateCommandQueue(&aqd, IID_PPV_ARGS(altQueue.put()))) ||
+			FAILED(device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+				IID_PPV_ARGS(altAlloc.put()))) ||
+			FAILED(device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+				altAlloc.get(), nullptr, IID_PPV_ARGS(altList.put()))) ||
+			FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+				IID_PPV_ARGS(altFence.put())))) {
+			Logger::Get().Error("CROSS TEST: fresh queue unavailable");
+			return;
+		}
+	}
+	device12->CreateUnorderedAccessView(small12.get(), nullptr, &u, Cpu(descSlot));
+	Barrier(altList.get(), small12.get(), D3D12_RESOURCE_STATE_COMMON,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	const float known[4]{ 0.5f, 0.5f, 0.5f, 1.0f };
+	altList->ClearUnorderedAccessViewFloat(Gpu(descSlot), Cpu(descSlot),
+		small12.get(), known, 0, nullptr);
+	Barrier(altList.get(), small12.get(),
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+	altList->Close();
+	ID3D12CommandList* cl[]{ altList.get() };
+	altQueue->ExecuteCommandLists(1, cl);
+	const uint64_t sig = ++crossTestFenceValue;
+	altQueue->Signal(altFence.get(), sig);
+	if (!crossTestEvent) {
+		crossTestEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	}
+	if (altFence->GetCompletedValue() < sig) {
+		altFence->SetEventOnCompletion(sig, crossTestEvent);
+		WaitForSingleObject(crossTestEvent, 2000);
+	}
+	// The other direction, for contrast: D3D11 fills it, D3D12 reads it back.
+	// 'small' is a macro in windef.h (char); the name is avoided deliberately.
+	const float smallMean = MeanOfOutput(small11.get());
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD CROSS TEST (fresh queue): D3D12 wrote 0.5, D3D11 reads {:.4f}",
+		smallMean));
+
+	// ---- the instrument, and the direction the backend actually runs on ----
+	//
+	// Everything the profile reports on the D3D12 side goes through Measure, and Measure
+	// submits on the queue the engine intercepts. So a reading of zero has two possible
+	// authors -- the chain produced nothing, or the probe's own copy was the thing that got
+	// lost -- and until they are told apart every D3D12 figure in this backend is ambiguous.
+	//
+	// The first reading below settles the instrument: small12 was just cleared to 0.5 by D3D12
+	// itself, so Measure on it can only be wrong if Measure is.
+	const float measureOfKnown = Measure(small12.get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+		D3D12_RESOURCE_STATE_COMMON);
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD CROSS TEST: Measure on a value D3D12 wrote reads {:.4f} (expect 0.5020) "
+		"-- 0 means the probe, not the chain", measureOfKnown));
+
+	// The second is the direction this backend depends on and that nothing above covered:
+	// D3D11 fills the surface, D3D12 reads it. Filled through a staging copy, the fill the
+	// standalone test proves, so the crossing is the only variable. The D3D11 queue is drained
+	// with an event query before the read, which removes ordering as an excuse and leaves only
+	// the question of whether the two devices are looking at the same memory.
+	{
+		D3D11_TEXTURE2D_DESC st = sd;
+		st.Usage = D3D11_USAGE_STAGING;
+		st.BindFlags = 0;
+		st.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		st.MiscFlags = 0;
+		winrt::com_ptr<ID3D11Texture2D> stage;
+		bool filled = false;
+		if (SUCCEEDED(device11->CreateTexture2D(&st, nullptr, stage.put()))) {
+			D3D11_MAPPED_SUBRESOURCE m{};
+			if (SUCCEEDED(context11->Map(stage.get(), 0, D3D11_MAP_WRITE, 0, &m))) {
+				for (UINT y = 0; y < st.Height; ++y) {
+					uint8_t* row = static_cast<uint8_t*>(m.pData) + size_t(y) * m.RowPitch;
+					for (UINT x = 0; x < st.Width; ++x) {
+						row[x * 4 + 0] = 200;
+						row[x * 4 + 1] = 200;
+						row[x * 4 + 2] = 200;
+						row[x * 4 + 3] = 255;
+					}
+				}
+				context11->Unmap(stage.get(), 0);
+				context11->CopyResource(small11.get(), stage.get());
+
+				D3D11_QUERY_DESC qd{};
+				qd.Query = D3D11_QUERY_EVENT;
+				winrt::com_ptr<ID3D11Query> drained;
+				if (SUCCEEDED(device11->CreateQuery(&qd, drained.put()))) {
+					context11->End(drained.get());
+					context11->Flush();
+					const ULONGLONG deadline = GetTickCount64() + 2000;
+					while (context11->GetData(drained.get(), nullptr, 0, 0) == S_FALSE &&
+						GetTickCount64() < deadline) {
+						Sleep(0);
+					}
+					filled = true;
+				}
+			}
+		}
+		Logger::Get().Info(fmt::format(
+			"CROSS TEST: D3D11 filled the shared surface and drained: {}",
+			filled ? "yes" : "NO"));
+		if (filled) {
+			const float readD11 = MeanOfOutput(small11.get());
+			const float readD12 = Measure(small12.get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+				D3D12_RESOURCE_STATE_COMMON);
+			Logger::Get().Info(fmt::format(
+				"DLSSNR AMD CROSS TEST: D3D11 wrote 200 -- D3D11 reads {:.4f}, D3D12 reads {:.4f} "
+				"(expect 0.7843 both; D3D11 right and D3D12 0 is the crossing)",
+				readD11, readD12));
+		}
+	}
+
+	// The production surfaces themselves, with the same value.
+	//
+	// Every pair above is one this function made at 64x64 in R8G8B8A8, and those cross
+	// correctly. The pair the backend actually runs on does not -- D3D11 reads the frame out of
+	// sharedIn11 while D3D12 reads zero out of the same memory -- and only two things differ
+	// between them: the extent and the format. This says which, or that it is neither.
+	//
+	// Only runs once the surfaces exist, which is why the early call skips it.
+	//
+	// Read only, never written. An earlier version filled sharedIn11 to have a value nothing
+	// could fake, and it proved the point -- the production pair crossed correctly once the
+	// measurement state was right -- but it also replaced the frame the profile was about to
+	// report on, so the figures around it stopped describing the pipeline. The pair is read as
+	// it stands instead: two readings of the same memory, and whether they agree.
+	if (sharedIn11 && sharedIn12) {
+		const float readD11 = MeanOfOutput(sharedIn11.get());
+		const float readD12 = Measure(sharedIn12.get(), inputFormat,
+			D3D12_RESOURCE_STATE_COMMON);
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD CROSS TEST (production pair, as it stands): D3D11 reads {:.4f}, "
+			"D3D12 reads {:.4f} -- disagreeing means the crossing, not the chain",
+			readD11, readD12));
+	}
+
+	// Whether D3D12 writes anything at all once the engine is live.
+	//
+	// Every figure above that reads zero is read back through ID3D12Resource::Map on a readback
+	// heap, and every one of them would read zero just as well if the writes were landing
+	// somewhere this process can no longer see. This one writes into a surface the D3D11 device
+	// shares and reads it there, with the crossing's own fence between the two ends, so neither
+	// Map nor the input path can account for a zero.
+	//
+	// The answer decides whether moving the whole backend onto D3D12 is worth attempting: if
+	// D3D12 produces nothing here, it would produce nothing there either.
+	// Guarded because the crossing fences do not exist yet at the call made from CreatePipeline;
+	// signalling a null fence there ends the initialisation instead of the frame.
+	{
+		winrt::com_ptr<ID3D11Texture2D> shared11;
+		winrt::com_ptr<ID3D12Resource> shared12;
+		if (outFence11 && outFence12 && context11x &&
+			CreateSharedTexture(device11, device12.get(), 64, 64,
+				DXGI_FORMAT_R8G8B8A8_UNORM, true, shared11, shared12)) {
+			winrt::com_ptr<ID3D12CommandAllocator> probeAlloc;
+			winrt::com_ptr<ID3D12GraphicsCommandList> probeCl;
+			if (SUCCEEDED(device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+					IID_PPV_ARGS(probeAlloc.put()))) &&
+				SUCCEEDED(device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+					probeAlloc.get(), nullptr, IID_PPV_ARGS(probeCl.put())))) {
+				winrt::com_ptr<ID3D12DescriptorHeap> crossHeap;
+				D3D12_DESCRIPTOR_HEAP_DESC crossDesc{};
+				crossDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+				crossDesc.NumDescriptors = 1;
+				crossDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+				if (FAILED(device12->CreateDescriptorHeap(&crossDesc,
+						IID_PPV_ARGS(crossHeap.put())))) {
+					return;
+				}
+				const auto crossCpu = crossHeap->GetCPUDescriptorHandleForHeapStart();
+				const auto crossGpu = crossHeap->GetGPUDescriptorHandleForHeapStart();
+				D3D12_UNORDERED_ACCESS_VIEW_DESC sharedUav{};
+				sharedUav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				sharedUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+				device12->CreateUnorderedAccessView(shared12.get(), nullptr, &sharedUav,
+					crossCpu);
+				Barrier(probeCl.get(), shared12.get(), D3D12_RESOURCE_STATE_COMMON,
+					D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+				const float clearValue[4]{ 0.5f, 0.5f, 0.5f, 1.0f };
+				probeCl->ClearUnorderedAccessViewFloat(crossGpu, crossCpu,
+					shared12.get(), clearValue, 0, nullptr);
+				Barrier(probeCl.get(), shared12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+					D3D12_RESOURCE_STATE_COMMON);
+				probeCl->Close();
+				ID3D12CommandList* ls[]{ probeCl.get() };
+				SubmitTo(queue.get(), 1, ls);
+				const uint64_t crossing = ++outFenceValue;
+				queue->Signal(outFence12.get(), crossing);
+				const HRESULT awaited = context11x->Wait(outFence11.get(), crossing);
+				const float seen = MeanOfOutput(shared11.get());
+				Logger::Get().Info(fmt::format(
+					"DLSSNR AMD CROSS TEST (D3D12 cleared 0.5 into a shared surface, D3D11 reads "
+					"it): {:.4f} (expect 0.5020; 0 means D3D12 produces nothing at all with the "
+					"engine live, and moving the backend onto D3D12 could not help) wait=0x{:08x}",
+					seen, static_cast<uint32_t>(awaited)));
+			}
+		}
+	}
+
+	// Which queue stops working.
+	//
+	// With the readback no longer reuse-buffered, everything measured on D3D12 reads zero once
+	// the runtime has initialised -- a value D3D12 writes and D3D12 reads back comes back zero,
+	// on a queue made after the fact and on the shared surfaces alike. The engine keeps
+	// reporting jobs throughout, because its work runs on HIP and never touches these queues.
+	//
+	// So the question is which queue is being swallowed. The two submissions below are the same
+	// act, differing only in the queue that carries them: the engine's, which is the one the
+	// runtime was handed and hooks, and one this backend created for itself. Whichever reads its
+	// value back is a queue that still executes, and that decides the fix.
+	const auto probeSubmission = [&](ID3D12CommandQueue* q, const char* what) {
+		if (!q) {
+			Logger::Get().Info(fmt::format(
+				"DLSSNR AMD CROSS TEST ({}): no such queue", what));
+			return;
+		}
+		D3D12_HEAP_PROPERTIES hp{};
+		hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC rd{};
+		rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		rd.Width = 64;
+		rd.Height = 64;
+		rd.DepthOrArraySize = 1;
+		rd.MipLevels = 1;
+		rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		rd.SampleDesc.Count = 1;
+		rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+		winrt::com_ptr<ID3D12Resource> tex;
+		if (FAILED(device12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+				D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(tex.put())))) {
+			return;
+		}
+		// A descriptor heap of this test's own. It used to take a slot from the one this backend
+		// writes its passes into, and a frame overwrites that slot within forty frames -- so a
+		// clear aimed here would land on whatever resource the frame had just described, and the
+		// readback would be zero for a reason that has nothing to do with D3D12 executing.
+		winrt::com_ptr<ID3D12DescriptorHeap> ownHeap;
+		D3D12_DESCRIPTOR_HEAP_DESC hd{};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		hd.NumDescriptors = 1;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		if (FAILED(device12->CreateDescriptorHeap(&hd, IID_PPV_ARGS(ownHeap.put())))) {
+			return;
+		}
+		const auto ownCpu = ownHeap->GetCPUDescriptorHandleForHeapStart();
+		const auto ownGpu = ownHeap->GetGPUDescriptorHandleForHeapStart();
+		D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+		u.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		device12->CreateUnorderedAccessView(tex.get(), nullptr, &u, ownCpu);
+		D3D12_HEAP_PROPERTIES rh{};
+		rh.Type = D3D12_HEAP_TYPE_READBACK;
+		D3D12_RESOURCE_DESC rdesc{};
+		rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		rdesc.Width = 256ull * 64;
+		rdesc.Height = 1;
+		rdesc.DepthOrArraySize = 1;
+		rdesc.MipLevels = 1;
+		rdesc.Format = DXGI_FORMAT_UNKNOWN;
+		rdesc.SampleDesc.Count = 1;
+		rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		winrt::com_ptr<ID3D12Resource> rb;
+		winrt::com_ptr<ID3D12CommandAllocator> al;
+		winrt::com_ptr<ID3D12GraphicsCommandList> cl;
+		winrt::com_ptr<ID3D12Fence> fe;
+		if (FAILED(device12->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &rdesc,
+				D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(rb.put()))) ||
+			FAILED(device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+				IID_PPV_ARGS(al.put()))) ||
+			FAILED(device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al.get(),
+				nullptr, IID_PPV_ARGS(cl.put()))) ||
+			FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fe.put())))) {
+			return;
+		}
+		Barrier(cl.get(), tex.get(), D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		const float known[4]{ 0.5f, 0.5f, 0.5f, 1.0f };
+		cl->ClearUnorderedAccessViewFloat(ownGpu, ownCpu, tex.get(), known, 0, nullptr);
+		Barrier(cl.get(), tex.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_TEXTURE_COPY_LOCATION src{};
+		src.pResource = tex.get();
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		D3D12_TEXTURE_COPY_LOCATION dst{};
+		dst.pResource = rb.get();
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		dst.PlacedFootprint.Footprint.Width = 64;
+		dst.PlacedFootprint.Footprint.Height = 64;
+		dst.PlacedFootprint.Footprint.Depth = 1;
+		dst.PlacedFootprint.Footprint.RowPitch = 256;
+		cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+		cl->Close();
+		ID3D12CommandList* submitted[]{ cl.get() };
+		// Through the saved entry, so this measures the queue's execution rather than the
+		// interception of it: a submission made the ordinary way here would be testing the
+		// hook, which is the thing under suspicion.
+		SubmitTo(q, 1, submitted);
+		q->Signal(fe.get(), 1);
+		HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		fe->SetEventOnCompletion(1, ev);
+		const DWORD waited = WaitForSingleObject(ev, 3000);
+		CloseHandle(ev);
+		int first = -1;
+		void* mapped = nullptr;
+		const D3D12_RANGE range{ 0, 256ull * 64 };
+		if (SUCCEEDED(rb->Map(0, &range, &mapped))) {
+			first = static_cast<const uint8_t*>(mapped)[0];
+			rb->Unmap(0, nullptr);
+		}
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD CROSS TEST ({}): cleared 128, read back {} (fence satisfied={}) "
+			"deviceRemovedReason=0x{:08x} -- 128 means this queue still executes the work it is "
+			"given",
+			what, first, waited == WAIT_OBJECT_0,
+			static_cast<uint32_t>(device12->GetDeviceRemovedReason())));
+	};
+	probeSubmission(queue.get(), "the engine queue the runtime was given");
+	probeSubmission(probeQueue.get(), "a queue this backend made for itself");
+
+	// Which of the two it is.
+	//
+	// The pair at the top of this function is 64x64 in R8G8B8A8 and crosses correctly; the
+	// production pair is the frame's own extent in B8G8R8A8 and does not. One more pair at each
+	// end of the axis separates the extent from the format, so the fix is aimed at a cause
+	// rather than at the shape that happens to exhibit it.
+	const auto probePair = [&](uint32_t pw, uint32_t ph, DXGI_FORMAT pf, const char* what) {
+		winrt::com_ptr<ID3D11Texture2D> p11;
+		winrt::com_ptr<ID3D12Resource> p12;
+		if (!CreateSharedTexture(device11, device12.get(), pw, ph, pf, true, p11, p12)) {
+			Logger::Get().Info(fmt::format("DLSSNR AMD CROSS TEST ({}): pair not created", what));
+			return;
+		}
+		D3D11_TEXTURE2D_DESC pd{};
+		p11->GetDesc(&pd);
+		D3D11_TEXTURE2D_DESC st = pd;
+		st.Usage = D3D11_USAGE_STAGING;
+		st.BindFlags = 0;
+		st.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		st.MiscFlags = 0;
+		winrt::com_ptr<ID3D11Texture2D> stage;
+		if (FAILED(device11->CreateTexture2D(&st, nullptr, stage.put()))) {
+			return;
+		}
+		D3D11_MAPPED_SUBRESOURCE mm{};
+		if (FAILED(context11->Map(stage.get(), 0, D3D11_MAP_WRITE, 0, &mm))) {
+			return;
+		}
+		const uint32_t bpp = pf == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+		for (UINT y = 0; y < st.Height; ++y) {
+			uint8_t* row = static_cast<uint8_t*>(mm.pData) + size_t(y) * mm.RowPitch;
+			for (UINT x = 0; x < st.Width; ++x) {
+				row[x * bpp + 0] = 200;
+				row[x * bpp + 1] = 200;
+				row[x * bpp + 2] = 200;
+				row[x * bpp + 3] = 255;
+			}
+		}
+		context11->Unmap(stage.get(), 0);
+		context11->CopyResource(p11.get(), stage.get());
+		D3D11_QUERY_DESC qd{};
+		qd.Query = D3D11_QUERY_EVENT;
+		winrt::com_ptr<ID3D11Query> drained;
+		if (FAILED(device11->CreateQuery(&qd, drained.put()))) {
+			return;
+		}
+		context11->End(drained.get());
+		context11->Flush();
+		const ULONGLONG deadline = GetTickCount64() + 3000;
+		while (context11->GetData(drained.get(), nullptr, 0, 0) == S_FALSE &&
+			GetTickCount64() < deadline) {
+			Sleep(0);
+		}
+		const float r11 = MeanOfOutput(p11.get());
+		const float r12 = Measure(p12.get(), pf, D3D12_RESOURCE_STATE_COMMON);
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD CROSS TEST ({}): {}x{} fmt {} -- D3D11 reads {:.4f}, D3D12 reads {:.4f}",
+			what, pw, ph, static_cast<uint32_t>(pf), r11, r12));
+	};
+	probePair(64, 64, DXGI_FORMAT_B8G8R8A8_UNORM, "small extent, production format");
+	probePair(width ? width : 3840u, height ? height : 2160u,
+		DXGI_FORMAT_R8G8B8A8_UNORM, "production extent, small-pair format");
 }
 
 bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
@@ -1287,11 +2420,82 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 	// surfaces are always RGBA16F, so a conversion sits at whichever end differs --
 	// often both. The channel order those eight-bit formats name is part of the format,
 	// not something the conversion has to fix up, so no conversion swaps anything.
-	if (!CreateSharedTexture(device11, device12.get(), w, h, inFmt, false,
+	// The shader that fills the shared input, and the view it writes through. Both are built
+	// once here, since neither depends on the frame.
+	{
+		winrt::com_ptr<ID3DBlob> blob;
+		if (!Magpie::DirectXHelper::CompileComputeShader(
+				kFillSharedShader, "main", blob.put(), "DLSSNRFillShared")) {
+			Logger::Get().Error("DLSSNR AMD: the shared-input fill shader failed");
+			return false;
+		}
+		if (FAILED(device11->CreateComputeShader(blob->GetBufferPointer(),
+				blob->GetBufferSize(), nullptr, fillSharedShader.put()))) {
+			Logger::Get().Error("DLSSNR AMD: could not create the fill shader");
+			return false;
+		}
+	}
+
+	// Before the runtime is loaded. It hooks DXGI and the D3D12 command queue when it arrives,
+	// and if the crossing works here and not afterwards, that hook is the whole difference.
+	CrossTest();
+
+	// The fence the two devices agree on, before either is used. It is created on D3D11 and
+	// opened on D3D12, the same way the textures are, so both sides are talking about the same
+	// object rather than each about its own idea of where the other has got to.
+	{
+		// One fence per direction, both made the same way: created on D3D11 and opened on
+		// D3D12 so the two sides are talking about the same object rather than each about its
+		// own idea of where the other has got to.
+		const auto makeCrossingFence = [&](const char* what,
+				winrt::com_ptr<ID3D11Fence>& fence11,
+				winrt::com_ptr<ID3D12Fence>& fence12) {
+			if (FAILED(device11->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+					IID_PPV_ARGS(fence11.put())))) {
+				Logger::Get().Error(fmt::format(
+					"DLSSNR AMD: could not create the {} fence", what));
+				return false;
+			}
+			HANDLE raw = nullptr;
+			if (FAILED(fence11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &raw))) {
+				Logger::Get().Error(fmt::format(
+					"DLSSNR AMD: could not share the {} fence", what));
+				return false;
+			}
+			wil::unique_handle handle(raw);
+			if (FAILED(device12->OpenSharedHandle(handle.get(),
+					IID_PPV_ARGS(fence12.put())))) {
+				Logger::Get().Error(fmt::format(
+					"DLSSNR AMD: could not open the {} fence", what));
+				return false;
+			}
+			return true;
+		};
+		if (!makeCrossingFence("input crossing", inFence11, inFence12) ||
+			!makeCrossingFence("output crossing", outFence11, outFence12)) {
+			return false;
+		}
+		if (FAILED(context11->QueryInterface(IID_PPV_ARGS(context11x.put())))) {
+			Logger::Get().Error("DLSSNR AMD: the renderer's context cannot wait on a fence");
+			return false;
+		}
+	}
+
+	// allowUav on the input pair, though this backend writes it with CopyResource and never
+	// binds a UAV: both implementations in this codebase that cross this boundary successfully
+	// -- the AMD optical flow provider and the older DLSSNR filter -- declare it that way, and
+	// neither uses a plain copy. This is the smallest step that matches them before rewriting
+	// the fill path itself.
+	if (!CreateSharedTexture(device11, device12.get(), w, h, inFmt, true,
 			sharedIn11, sharedIn12) ||
 		!CreateSharedTexture(device11, device12.get(), w, h, outFmt, true,
 			sharedOut11, sharedOut12)) {
 		Logger::Get().Error("DLSSNR AMD: could not share the frame between the devices");
+		return false;
+	}
+	if (FAILED(device11->CreateUnorderedAccessView(sharedIn11.get(), nullptr,
+			sharedInUav.put()))) {
+		Logger::Get().Error("DLSSNR AMD: could not make the shared input writable");
 		return false;
 	}
 
@@ -1321,25 +2525,33 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 	// The frame at full resolution, in the engine's own format. It is what the capture is
 	// converted into, what the resolve takes its detail from, and at 100% scale it is also
 	// what the network is handed.
-	if (!CreateEngineTexture(device12.get(), w, h,
-			DXGI_FORMAT_R16G16B16A16_FLOAT, full)) {
-		return false;
+	for (uint32_t i = 0; i < kSlots; ++i) {
+		if (!CreateEngineTexture(device12.get(), w, h,
+				DXGI_FORMAT_R16G16B16A16_FLOAT, full[i])) {
+			return false;
+		}
 	}
 
 	// The engine's surface. It works in place: the texture named in the packet is both what
 	// it reads and what it writes, so there is one surface there, not two. The reference
 	// hands over exactly one such pointer as `Packet::colour`.
-	if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
-			DXGI_FORMAT_R16G16B16A16_FLOAT, net)) {
-		return false;
+	for (uint32_t i = 0; i < kSlots; ++i) {
+		if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
+				DXGI_FORMAT_R16G16B16A16_FLOAT, net[i])) {
+			return false;
+		}
 	}
 	if (scaled) {
 		// The network's output for this frame before the engine ran, and where the resolve
 		// writes. The resolve subtracts the first from what the engine produced to isolate
 		// the edit, and needs `full` to put the untouched detail back underneath it.
-		if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
-				DXGI_FORMAT_R16G16B16A16_FLOAT, baseline) ||
-			!CreateEngineTexture(device12.get(), w, h,
+		for (uint32_t i = 0; i < kSlots; ++i) {
+			if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
+					DXGI_FORMAT_R16G16B16A16_FLOAT, baseline[i])) {
+				return false;
+			}
+		}
+		if (!CreateEngineTexture(device12.get(), w, h,
 				DXGI_FORMAT_R16G16B16A16_FLOAT, resolved)) {
 			return false;
 		}
@@ -1360,11 +2572,13 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 	// either, and zero-filled buffers are what the reference feeds when a game offers
 	// neither; depth stays disabled on the engine side to match. They follow the network's
 	// extent rather than the capture's.
-	if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
-			DXGI_FORMAT_R16G16_FLOAT, motion) ||
-		!CreateEngineTexture(device12.get(), netWidth, netHeight,
-			DXGI_FORMAT_R32_FLOAT, depth)) {
-		return false;
+	for (uint32_t i = 0; i < kSlots; ++i) {
+		if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
+				DXGI_FORMAT_R16G16_FLOAT, motion[i]) ||
+			!CreateEngineTexture(device12.get(), netWidth, netHeight,
+				DXGI_FORMAT_R32_FLOAT, depth[i])) {
+			return false;
+		}
 	}
 	// Held steady rather than adapted; the reason and the measurements are on kExposureValue.
 	if (!CreateExposure()) {
@@ -1388,11 +2602,6 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		"upscaler; falling back to the resolve");
 	return true;
 #else
-	if (!CreateSharedTexture(device11, device12.get(), netWidth, netHeight,
-			DXGI_FORMAT_R16G16B16A16_FLOAT, false, netShared11, netShared12)) {
-		Logger::Get().Error("DLSSNR AMD: the reconstruction input could not be shared");
-		return false;
-	}
 	// The placeholders: two that are never read, one that stands in for motion until the
 	// provider has produced any. None of them needs contents.
 	auto makePlain = [this](DXGI_FORMAT format, winrt::com_ptr<ID3D11Texture2D>& out) noexcept {
@@ -1407,9 +2616,24 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 		return SUCCEEDED(device11->CreateTexture2D(&desc, nullptr, out.put()));
 	};
-	if (!CreateSharedTexture(device11, device12.get(), width, height,
-			DXGI_FORMAT_R16G16B16A16_FLOAT, true, reconOut11, reconOut12)) {
-		Logger::Get().Error("DLSSNR AMD: the reconstruction could not share its output");
+	// The colour the upscaler reads: written here, read by the other device -- the direction
+	// sharedOut has always used. It carries the shoulder and the sRGB encode, applied before
+	// the upscaler rather than after it, for two reasons: what it reconstructs from is then
+	// display-referred, which is what it expects by default, and the result needs no journey
+	// back, because the upscaler writes the display texture itself -- which is what the first
+	// version of this route did, and the only version that ever ran clean.
+	//
+	// Everything this replaces came from reading its output back on this queue: a surface
+	// written by one device and read by the other in that direction, which is the one crossing
+	// this backend has never done and which took the device down every time.
+	if (!CreateSharedTexture(device11, device12.get(), netWidth, netHeight,
+			DXGI_FORMAT_R16G16B16A16_FLOAT, false, netShared11, netShared12)) {
+		Logger::Get().Error("DLSSNR AMD: the reconstruction could not share its colour");
+		return false;
+	}
+	if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
+			DXGI_FORMAT_R16G16B16A16_FLOAT, encoded)) {
+		Logger::Get().Error("DLSSNR AMD: the encode could not get a surface of its own");
 		return false;
 	}
 	if (!CreateSharedTexture(device11, device12.get(), netWidth, netHeight,
@@ -1423,20 +2647,40 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		Logger::Get().Error("DLSSNR AMD: the reconstruction could not build its guide");
 		return false;
 	}
+	if (FAILED(device11->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+			IID_PPV_ARGS(crossFence11.put())))) {
+		Logger::Get().Error("DLSSNR AMD: the crossing could not create its fence");
+		return false;
+	}
+	HANDLE rawCross = nullptr;
+	if (FAILED(crossFence11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &rawCross))) {
+		Logger::Get().Error("DLSSNR AMD: the crossing could not share its fence");
+		return false;
+	}
+	{
+		wil::unique_handle crossHandle(rawCross);
+		if (FAILED(device12->OpenSharedHandle(crossHandle.get(),
+				IID_PPV_ARGS(crossFence12.put())))) {
+			Logger::Get().Error("DLSSNR AMD: the crossing could not open its fence");
+			return false;
+		}
+	}
+	// Version 3.1.5, deliberately: FSR 4.1.1 is the FSR4\FSR4_SR effect's own business, and
+	// that effect already asks for it. This route is the reconstruction the DLSSNR network
+	// feeds, not a super-resolution mode of its own.
 	auto upscaler = std::make_unique<FSR3Upscaler>();
-	if (!upscaler->Initialize(resources, netShared11.get(), reconOut11.get(),
+	if (!upscaler->Initialize(resources, netShared11.get(), output,
 			settings.motionRequest)) {
 		Logger::Get().Error("DLSSNR AMD: the FSR3 upscaler refused to initialise");
 		return false;
 	}
-	// The protocol the renderer would have set if this upscaler were a link in the chain
-	// rather than something this backend drives. It is not decoration: with hdrColorInput at
-	// its default of false the upscaler is told its colour is sRGB and applies that transfer
-	// function to values this backend has already made linear, which crushes the picture.
-	// The flag follows srgbInput for exactly that reason -- it describes what is being handed
-	// over, not what the display is.
+	// The protocol the renderer would have set if this upscaler were a link in the chain.
+	// What it is handed carries the shoulder and the sRGB encode, applied before it rather
+	// than after, so it is told it is reading display-referred colour: hdrColorInput stays
+	// false, which is also the default it would have had. The stage that used to run after it
+	// is gone, and with it the only reason this flag ever needed to be true.
 	upscaler->SetFsrHdrProtocol(FsrHdrProtocol{
-		.hdrColorInput = srgbInput,
+		.hdrColorInput = false,
 		.transfer = GroupBTransfer::Linear,
 		.preExposure = 1.0f,
 		.exposure = 1.0f,
@@ -1445,37 +2689,16 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 		.useReactiveMask = false,
 		.useTransparencyMask = false,
 	});
-	// The fence pair the two devices share, built the way the upscaler builds its own.
-	if (FAILED(device11->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
-			IID_PPV_ARGS(reconFence11.put())))) {
-		Logger::Get().Error("DLSSNR AMD: the reconstruction could not create its fence");
-		return false;
-	}
-	HANDLE rawFence = nullptr;
-	if (FAILED(reconFence11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &rawFence))) {
-		Logger::Get().Error("DLSSNR AMD: the reconstruction could not share its fence");
-		return false;
-	}
-	wil::unique_handle fenceHandle(rawFence);
-	if (FAILED(device12->OpenSharedHandle(fenceHandle.get(),
-			IID_PPV_ARGS(reconFence12.put())))) {
-		Logger::Get().Error("DLSSNR AMD: the reconstruction could not open its fence");
-		return false;
-	}
-	if (FAILED(context11->QueryInterface(IID_PPV_ARGS(context4.put())))) {
-		Logger::Get().Error("DLSSNR AMD: the renderer's context cannot signal a fence");
-		return false;
-	}
+
 	reconstruction = std::move(upscaler);
 	// Said out loud because the sizes are the whole point of the route: the engine edits at
 	// netWidth by netHeight and the accumulator reconstructs the captured size from it.
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD: reconstruction on -- FSR3 upscaler from {}x{} to the captured size, "
-		"motion {}, colour {}",
+		"motion {}, colour shoulder + sRGB encoded before it, output written by it",
 		netWidth, netHeight,
 		settings.motionRequest.method == OpticalFlowMethod::None ? "none (zero-MV route)"
-			: "from the frame guidance",
-		srgbInput ? "linear (the sRGB transfer function is off)" : "sRGB-encoded"));
+			: "from the frame guidance"));
 	return true;
 #endif
 }
@@ -1490,7 +2713,8 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	// Each exit names itself. The first version reported them all as one message, and that
 	// cost a round trip: the route failed, the log said only that it had, and the answer was
 	// a contract check two layers down inside the upscaler.
-	const auto fail = [this](const char* where) noexcept {
+	const auto fail = [this](const std::string& where) noexcept {
+		DumpDeviceMessages(where.c_str());
 		if (++reconstructionFailures <= 6) {
 			Logger::Get().Warn(fmt::format(
 				"DLSSNR AMD: the reconstruction stopped at {}", where));
@@ -1509,33 +2733,108 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 		FAILED(list->Reset(allocator.get(), nullptr))) {
 		return fail("resetting the allocator");
 	}
-	// The engine leaves its surface readable; a copy to a surface the other device reads goes
-	// through COMMON, which is the rule every crossing in this backend follows.
-	Barrier(list.get(), netShared12.get(), D3D12_RESOURCE_STATE_COMMON,
-		D3D12_RESOURCE_STATE_COPY_DEST);
-	list->CopyResource(netShared12.get(), net.get());
-	Barrier(list.get(), netShared12.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-		D3D12_RESOURCE_STATE_COMMON);
+	// The engine's frame through the same shoulder and encode the output stage applies -- run
+	// here, at the network's resolution, so the upscaler reconstructs from display-referred
+	// colour.
+	// Recorded in as many steps as the settings file asks for. Stopping between them is the
+	// only way this was narrowed down: every step is a call the working path also makes, and
+	// only one of them takes the device with it.
+	Barrier(list.get(), encoded.get(), kStateShaderRead,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	if (encodeSteps >= 2) {
+		Bind(6, net[slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT, encoded.get(),
+			DXGI_FORMAT_R16G16B16A16_FLOAT);
+	}
+	if (encodeSteps >= 4) {
+		// The shoulder travels as the dispatch's own constants, not as a root value recorded
+		// before it. That distinction is the whole of why this route kept removing the device:
+		// a root value written to a list that has no root signature yet is written to nothing,
+		// and the driver takes the device away for it. The pipeline and the root signature are
+		// bound inside the dispatch, so anything the shader reads has to be handed over there.
+		//
+		// Sized to the network as well, not to the capture: this pass runs on the surface it
+		// writes here, which is the network's extent, and the plain Dispatch would have
+		// launched it over the whole frame.
+		const UINT encodeSettings[1]{ shoulderMilli };
+		DispatchSized(srgbInput ? convertOutSrgb.get() : convertOut.get(), 6,
+			netWidth, netHeight, 0, encodeSettings, 1);
+	}
+	Barrier(list.get(), encoded.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		kStateShaderRead);
+	if (encodeSteps >= 5) {
+		// The crossing, as a copy and nothing more.
+		Barrier(list.get(), encoded.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		Barrier(list.get(), netShared12.get(), D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		list->CopyResource(netShared12.get(), encoded.get());
+		Barrier(list.get(), netShared12.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			D3D12_RESOURCE_STATE_COMMON);
+		Barrier(list.get(), encoded.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+			kStateShaderRead);
+	}
+	// Said once a frame in case the debug layer is on: it reports what the call above did
+	// wrong here rather than at the point the device finally goes.
+	if (reconstructionDraws == 0) {
+		DumpDeviceMessages("encode steps");
+	}
+	// Submitted on its own. The route failed at Close() with no hint of which of the calls
+	// above it disliked -- Close reports what the list recorded, and a list that has recorded
+	// several things says only that one of them was wrong. Split here, the message names the
+	// half.
+	const HRESULT encodeResult = list->Close();
+	if (FAILED(encodeResult)) {
+		return fail(fmt::format("closing the encode list (0x{:08x})",
+			static_cast<uint32_t>(encodeResult)));
+	}
+	ID3D12CommandList* encodeLists[] = { list.get() };
+	SubmitTo(queue.get(), 1, encodeLists);
+	const uint64_t encodeDone = ++fenceValue;
+	queue->Signal(fence.get(), encodeDone);
+	if (fence->GetCompletedValue() < encodeDone) {
+		fence->SetEventOnCompletion(encodeDone, fenceEvent.get());
+		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
+			return fail("waiting for the encode");
+		}
+	}
+	if (FAILED(allocator->Reset()) ||
+		FAILED(list->Reset(allocator.get(), nullptr))) {
+		return fail("resetting the allocator for the motion");
+	}
 	// The motion this backend resampled to the network's extent, on the same submission, so
 	// the single fence below covers both and the upscaler reads a finished pair.
 	if (motionReady) {
 		Barrier(list.get(), motionShared12.get(), D3D12_RESOURCE_STATE_COMMON,
 			D3D12_RESOURCE_STATE_COPY_DEST);
-		list->CopyResource(motionShared12.get(), motion.get());
+		list->CopyResource(motionShared12.get(), motion[slot].get());
 		Barrier(list.get(), motionShared12.get(), D3D12_RESOURCE_STATE_COPY_DEST,
 			D3D12_RESOURCE_STATE_COMMON);
 	}
-	if (FAILED(list->Close())) {
-		return fail("closing the copy list");
+	const HRESULT copiedList = list->Close();
+	if (FAILED(copiedList)) {
+		return fail(fmt::format("closing the copy list (0x{:08x})",
+			static_cast<uint32_t>(copiedList)));
 	}
 	ID3D12CommandList* lists[] = { list.get() };
-	queue->ExecuteCommandLists(1, lists);
+	SubmitTo(queue.get(), 1, lists);
 	const uint64_t copied = ++fenceValue;
 	queue->Signal(fence.get(), copied);
 	if (fence->GetCompletedValue() < copied) {
 		fence->SetEventOnCompletion(copied, fenceEvent.get());
 		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
 			return fail("waiting for the copy");
+		}
+	}
+
+	// The handshake, before anything reads what was just written. The queue has finished, which
+	// says the writes are done; it does not say the other device can see them. A shared surface
+	// needs the two sides to agree on the point in the stream where one's writes become the
+	// other's reads, and that agreement is this fence.
+	{
+		const uint64_t crossing = ++crossValue;
+		queue->Signal(crossFence12.get(), crossing);
+		if (FAILED(context11->Wait(crossFence11.get(), crossing))) {
+			return fail("the other device refusing the crossing");
 		}
 	}
 
@@ -1555,11 +2854,16 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	guidance.confidence = { guideConfidence11.get(), DXGI_FORMAT_R8_UNORM, meta };
 	guidance.requiresHistoryReset = context.frameGuidance.requiresHistoryReset;
 
+	// The phase the downsample was given, passed on so the upscaler can put this frame back on
+	// the grid it came from. Without it every frame looks like the same sample of the same
+	// place and accumulates into nothing.
+	reconstruction->SetJitter(frameJitterX, frameJitterY);
+
 	// The upscaler does its own copying, its own fences and its own barriers from here: it is
 	// handed the shared texture, not a command list.
 	const NativeEffectDrawContext hand{
 		.input = netShared11.get(),
-		.output = reconOut11.get(),
+		.output = context.output,
 		.frameId = context.frameId,
 		.inputRevision = context.inputRevision,
 		.frameGuidance = guidance,
@@ -1573,75 +2877,35 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	if (!reconstruction->Draw(hand)) {
 		return fail("the upscaler returning false with a valid guide");
 	}
-	// The upscaler has written linear values into the surface above. What is left is the stage
-	// every other route in this backend ends with: the shoulder, and the encode that takes the
-	// picture out of linear and into what the output format means. Skipping it is what made
-	// the route dark -- see the note on the surface.
+	// Nothing to do afterwards. The upscaler wrote the display texture itself, which is what it
+	// is built to do -- in the chain its output is the next link's input, and here it is the
+	// frame.
 	//
-	// Order the two devices: the upscaler's copy into the shared surface is D3D11 work, and
-	// this queue is about to read the D3D12 side of it. Flushing submits that work but says
-	// nothing about when it finishes, so the fence is signalled where the work is and waited
-	// on where the result is read.
-	const uint64_t reconReady = ++reconFenceValue;
-	if (FAILED(context4->Signal(reconFence11.get(), reconReady))) {
-		return fail("signalling the reconstruction fence");
+	// The reading is taken here, after both submissions, because measuring resets the
+	// allocator and re-records the list. Placed any earlier it discards the recording that is
+	// still open -- which is not a small mistake: it silently throws the encode away and the
+	// upscaler then reconstructs from a frame nothing wrote to.
+	// Not the first frame: the upscaler starts its history there and a sequence has to build
+	// before there is anything to measure. The hundred-and-twentieth is settled.
+	if (reconstructionDraws == 120) {
+		// Three points on one frame: what the network produced, what the upscaler was handed,
+		// and what came out. The encode is meant to lift the first into the second, and the
+		// third should land near the second -- a picture much darker than its own input is the
+		// symptom this ordering was chosen to avoid.
+		const float netMean = Measure(net[slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+			kStateShaderRead);
+		const float handedMean = encodeSteps >= 5
+			? Measure(netShared12.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+				D3D12_RESOURCE_STATE_COMMON)
+			: -1.0f;
+		float detail = -1.0f;
+		const float onScreen = MeanOfOutput(context.output, &detail);
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: settled reconstruction (frame {}) -- network {:.4f}, handed over "
+			"{:.4f}, on screen {:.4f}, detail {:.5f} (jitter {})",
+			reconstructionDraws,
+			netMean, handedMean, onScreen, detail, jitterEnabled ? "on" : "off"));
 	}
-	context11->Flush();
-	if (FAILED(allocator->Reset()) ||
-		FAILED(list->Reset(allocator.get(), nullptr))) {
-		return fail("resetting the allocator for the output");
-	}
-	queue->Wait(reconFence12.get(), reconReady);
-	if (outputIsFp16) {
-		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_COMMON,
-			D3D12_RESOURCE_STATE_COPY_SOURCE);
-		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_COMMON,
-			D3D12_RESOURCE_STATE_COPY_DEST);
-		list->CopyResource(sharedOut12.get(), reconOut12.get());
-		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_COPY_DEST,
-			D3D12_RESOURCE_STATE_COMMON);
-		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-			D3D12_RESOURCE_STATE_COMMON);
-	} else {
-		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_COMMON,
-			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_COMMON,
-			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		Bind(6, reconOut12.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
-			sharedOut12.get(), outputFormat);
-		list->SetComputeRoot32BitConstant(1, shoulderMilli, 0);
-		Dispatch(srgbInput ? convertOutSrgb.get() : convertOut.get(), 6);
-		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-			D3D12_RESOURCE_STATE_COMMON);
-		Barrier(list.get(), reconOut12.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-			D3D12_RESOURCE_STATE_COMMON);
-	}
-	const HRESULT closeHr = list->Close();
-	if (FAILED(closeHr)) {
-		// The HRESULT is the only thing that says why: the list latches the first invalid
-		// operation without saying which, and the debug layer's message does not reach this
-		// log. Logged with the device's own reason, which names a removal if that is what
-		// happened rather than a recording mistake.
-		if (++reconstructionFailures <= 6) {
-			Logger::Get().Warn(fmt::format(
-				"DLSSNR AMD: the output list would not close, 0x{:08x}; device reason "
-				"0x{:08x}", static_cast<uint32_t>(closeHr),
-				static_cast<uint32_t>(device12->GetDeviceRemovedReason())));
-		}
-		return false;
-	}
-	ID3D12CommandList* outLists[] = { list.get() };
-	queue->ExecuteCommandLists(1, outLists);
-	const uint64_t written = ++fenceValue;
-	queue->Signal(fence.get(), written);
-	if (fence->GetCompletedValue() < written) {
-		fence->SetEventOnCompletion(written, fenceEvent.get());
-		if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
-			return fail("waiting for the output");
-		}
-	}
-	context11->CopyResource(context.output, sharedOut11.get());
-
 	++reconstructionDraws;
 	if (reconstructionDraws == 1 || reconstructionDraws % 300 == 0) {
 		Logger::Get().Info(fmt::format(
@@ -1661,12 +2925,11 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	reconstruction.reset();
 	netShared11 = nullptr;
 	netShared12 = nullptr;
-	reconOut11 = nullptr;
-	reconOut12 = nullptr;
-	reconFence11 = nullptr;
-	reconFence12 = nullptr;
-	context4 = nullptr;
-	reconFenceValue = 0;
+	encoded = nullptr;
+	crossFence11 = nullptr;
+	crossFence12 = nullptr;
+	crossValue = 0;
+
 	motionShared11 = nullptr;
 	motionShared12 = nullptr;
 	zeroMotion11 = nullptr;
@@ -1676,9 +2939,25 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	sharedIn12 = nullptr;
 	sharedOut11 = nullptr;
 	sharedOut12 = nullptr;
-	net = nullptr;
-	full = nullptr;
-	baseline = nullptr;
+	inFence11 = nullptr;
+	inFence12 = nullptr;
+	inFenceValue = 0;
+	outFence11 = nullptr;
+	outFence12 = nullptr;
+	outFenceValue = 0;
+	for (uint32_t i = 0; i < kSlots; ++i) {
+		net[i] = nullptr;
+		full[i] = nullptr;
+		baseline[i] = nullptr;
+		motion[i] = nullptr;
+		depth[i] = nullptr;
+	}
+	slot = 0;
+	for (uint32_t i = 0; i < kSlots; ++i) {
+		slotJob[i] = 0;
+		slotFence[i] = 0;
+	}
+	outFence = 0;
 	resolved = nullptr;
 	for (int i = 0; i < 2; ++i) {
 		historyResidual[i] = nullptr;
@@ -1687,8 +2966,6 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	// A new extent means the history describes the wrong geometry.
 	resetHistory = true;
 	temporalValid = false;
-	motion = nullptr;
-	depth = nullptr;
 }
 
 void DlssnrAmdBackend::Impl::CreateSrv(ID3D12Resource* res,
@@ -1703,7 +2980,7 @@ void DlssnrAmdBackend::Impl::CreateSrv(ID3D12Resource* res,
 }
 
 void DlssnrAmdBackend::Impl::Bind(
-	uint32_t slot, ID3D12Resource* srv, DXGI_FORMAT srvFormat,
+	uint32_t tableSlot, ID3D12Resource* srv, DXGI_FORMAT srvFormat,
 	ID3D12Resource* uav, DXGI_FORMAT uavFormat
 ) noexcept {
 	D3D12_SHADER_RESOURCE_VIEW_DESC s{};
@@ -1711,31 +2988,31 @@ void DlssnrAmdBackend::Impl::Bind(
 	s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	s.Texture2D.MipLevels = 1;
-	device12->CreateShaderResourceView(srv, &s, Cpu(slot));
+	device12->CreateShaderResourceView(srv, &s, Cpu(tableSlot));
 
 	D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
 	u.Format = uavFormat;
 	u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-	device12->CreateUnorderedAccessView(uav, nullptr, &u, Cpu(slot + 1));
+	device12->CreateUnorderedAccessView(uav, nullptr, &u, Cpu(tableSlot + 1));
 }
 
-void DlssnrAmdBackend::Impl::Dispatch(ID3D12PipelineState* pso, uint32_t slot) noexcept {
-	DispatchSized(pso, slot, width, height, false);
+void DlssnrAmdBackend::Impl::Dispatch(ID3D12PipelineState* pso, uint32_t tableSlot) noexcept {
+	DispatchSized(pso, tableSlot, width, height, false);
 }
 
-void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t slot,
+void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t tableSlot,
 	uint32_t dw, uint32_t dh, uint32_t residualTableSlot, const UINT* constants,
 	uint32_t constantCount
 ) noexcept {
-	// `slot` matters more than it looks. Descriptors are read when the GPU executes the
-	// list, not when it is recorded, so two stages sharing a slot both end up reading
+	// `tableSlot` matters more than it looks. Descriptors are read when the GPU executes the
+	// list, not when it is recorded, so two stages sharing a tableSlot both end up reading
 	// whichever bind happened last. Each stage therefore gets its own set, and the root
 	// table is pointed at that set here.
 	ID3D12DescriptorHeap* h = heap.get();
 	list->SetComputeRootSignature(root.get());
 	list->SetDescriptorHeaps(1, &h);
 	D3D12_GPU_DESCRIPTOR_HANDLE table = heap->GetGPUDescriptorHandleForHeapStart();
-	table.ptr += UINT64(slot) * descriptorStride;
+	table.ptr += UINT64(tableSlot) * descriptorStride;
 	list->SetComputeRootDescriptorTable(0, table);
 	if (residualTableSlot != 0) {
 		// The extra sources live in a table of their own; where it starts depends on how many
@@ -1746,7 +3023,7 @@ void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t sl
 	}
 	list->SetPipelineState(pso);
 	// The downsample and the resolve are the only stages with an extent to pass, and they
-	// take it in the same four-slot shape the reference uses: destination width and height
+	// take it in the same four-tableSlot shape the reference uses: destination width and height
 	// followed by the source's.
 	if (constants) {
 		list->SetComputeRoot32BitConstants(1, constantCount, constants, 0);
@@ -1754,43 +3031,43 @@ void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t sl
 	list->Dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
 }
 
-void DlssnrAmdBackend::Impl::BindResolve(uint32_t slot, ID3D12Resource* srv,
+void DlssnrAmdBackend::Impl::BindResolve(uint32_t tableSlot, ID3D12Resource* srv,
 	ID3D12Resource* uav, ID3D12Resource* baselineTexture, ID3D12Resource* edited
 ) noexcept {
 	// t0/u0 through the usual pair, then t1 and t2 sitting immediately after it so the
 	// resolve's second root table finds them two descriptors along.
-	Bind(slot, srv, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, DXGI_FORMAT_R16G16B16A16_FLOAT);
+	Bind(tableSlot, srv, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, DXGI_FORMAT_R16G16B16A16_FLOAT);
 
-	CreateSrv(baselineTexture, Cpu(slot + 2));
-	CreateSrv(edited, Cpu(slot + 3));
+	CreateSrv(baselineTexture, Cpu(tableSlot + 2));
+	CreateSrv(edited, Cpu(tableSlot + 3));
 }
 
-void DlssnrAmdBackend::Impl::BindTemporal(uint32_t slot, ID3D12Resource* edited,
+void DlssnrAmdBackend::Impl::BindTemporal(uint32_t tableSlot, ID3D12Resource* edited,
 	ID3D12Resource* nextResidual, ID3D12Resource* nextGuide,
 	ID3D12Resource* baselineTexture, ID3D12Resource* historyResidualTexture,
 	ID3D12Resource* historyGuideTexture, ID3D12Resource* motionTexture
 ) noexcept {
 	// t0 and u0 through the usual pair, then u1 immediately after it, and the four sources
 	// from t1 in the table that follows -- which is why this pass's second table starts at
-	// slot + 3 while the resolve's starts at slot + 2.
-	Bind(slot, edited, DXGI_FORMAT_R16G16B16A16_FLOAT, nextResidual,
+	// tableSlot + 3 while the resolve's starts at tableSlot + 2.
+	Bind(tableSlot, edited, DXGI_FORMAT_R16G16B16A16_FLOAT, nextResidual,
 		DXGI_FORMAT_R16G16B16A16_FLOAT);
 
 	D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
 	u.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-	device12->CreateUnorderedAccessView(nextGuide, nullptr, &u, Cpu(slot + 2));
+	device12->CreateUnorderedAccessView(nextGuide, nullptr, &u, Cpu(tableSlot + 2));
 
-	CreateSrv(baselineTexture, Cpu(slot + 3));
-	CreateSrv(historyResidualTexture, Cpu(slot + 4));
-	CreateSrv(historyGuideTexture, Cpu(slot + 5));
+	CreateSrv(baselineTexture, Cpu(tableSlot + 3));
+	CreateSrv(historyResidualTexture, Cpu(tableSlot + 4));
+	CreateSrv(historyGuideTexture, Cpu(tableSlot + 5));
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC m{};
 	m.Format = DXGI_FORMAT_R16G16_FLOAT;
 	m.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	m.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	m.Texture2D.MipLevels = 1;
-	device12->CreateShaderResourceView(motionTexture, &m, Cpu(slot + 6));
+	device12->CreateShaderResourceView(motionTexture, &m, Cpu(tableSlot + 6));
 }
 
 // The residual for this frame: what the network changed, at the resolution it ran at, with
@@ -1818,16 +3095,27 @@ bool DlssnrAmdBackend::Impl::RunTemporal(const NativeEffectDrawContext& context)
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	Barrier(list.get(), historyGuide[to].get(), kStateShaderRead,
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-	BindTemporal(12, net.get(), historyResidual[to].get(), historyGuide[to].get(),
-		baseline.get(), historyResidual[from].get(), historyGuide[from].get(),
-		motion.get());
+	// The same generation the picture comes from: this pass reprojects a history against the
+	// frame the engine has finished, and pairing it with the frame still being recorded would
+	// align the past against something that does not exist yet.
+	const uint32_t sourceSlot = pictureSlot;
+	BindTemporal(12, net[sourceSlot].get(), historyResidual[to].get(), historyGuide[to].get(),
+		baseline[sourceSlot].get(), historyResidual[from].get(), historyGuide[from].get(),
+		motion[sourceSlot].get());
 	// Modes two and above reproject the history with the flow; one is static accumulation.
 	const uint32_t useMotion =
 		antiFlickerMode >= 2 && motionReady ? 1u : 0u;
-	const UINT constants[7]{ netWidth, netHeight, weightMilli, hasHistory ? 1u : 0u,
+	// The residual controls travel as the floats they are: the shader declares them float,
+	// so the bit pattern has to be forwarded rather than converted, which is what BitsOfFloat
+	// does and what every other float-carrying dispatch here already uses.
+	const UINT constants[12]{ netWidth, netHeight, weightMilli, hasHistory ? 1u : 0u,
 		useMotion,
-		uint32_t(motionScaleX * 1000.0f), uint32_t(motionScaleY * 1000.0f) };
-	DispatchSized(temporal.get(), 12, netWidth, netHeight, 15, constants, 7);
+		uint32_t(motionScaleX * 1000.0f), uint32_t(motionScaleY * 1000.0f),
+		BitsOfFloat(settings.residualMultiplier), BitsOfFloat(settings.residualSaturation),
+		BitsOfFloat(settings.residualLightness),
+		BitsOfFloat(settings.shadowStructureMultiplier),
+		BitsOfFloat(settings.reflectionGlowMultiplier) };
+	DispatchSized(temporal.get(), 12, netWidth, netHeight, 15, constants, 12);
 	Barrier(list.get(), historyResidual[to].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 		kStateShaderRead);
 	Barrier(list.get(), historyGuide[to].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1842,11 +3130,50 @@ bool DlssnrAmdBackend::Impl::RunTemporal(const NativeEffectDrawContext& context)
 }
 
 bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath) noexcept {
+	// Not captured here. The entry saved when the queue was created is the driver's; the one
+	// standing now is the runtime's hook, because its DLL was loaded before this function ran.
+	// Reported so the two can be told apart, since every submission this backend makes goes
+	// through the saved one.
+	{
+		const auto current = reinterpret_cast<uintptr_t>(
+			(*reinterpret_cast<void***>(queue.get()))[10]);
+		const auto saved = reinterpret_cast<uintptr_t>(executeOriginal);
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: the queue's vtable entry is {:x} now; {:x} was saved before the runtime "
+			"loaded; {}",
+			current, saved, current == saved ? "same -- nothing hooked it" :
+				"different -- the runtime hooked it, and submissions use the saved one"));
+	}
+	if (!executeOriginal) {
+		Logger::Get().Error("DLSSNR AMD: the queue has no ExecuteCommandLists to save");
+		return false;
+	}
+
+	// The engine holds these for the life of the process, so they are referenced rather than
+	// merely borrowed: the backend's own pointers are released when a session ends, and the
+	// engine is not part of that.
+	device12.get()->AddRef();
+	queue.get()->AddRef();
+	// Deliberately NOT written, and this is the finding of the whole investigation.
+	//
+	// The trampoline slot holds a pointer the runtime calls from notify, and the layout notes say
+	// to point it at a no-op because the host has already submitted. Writing that no-op here is
+	// what stops this process's D3D12 from executing anything at all: a crossing test placed
+	// either side of this one statement passes on its way in and fails on its way out, on both
+	// the engine's queue and one this backend made, through the driver's own
+	// ExecuteCommandLists, with the device healthy and its fences still advancing. Everything
+	// measured downstream of that write reads zero, which is the black screen.
+	//
+	// Left alone, the slot keeps whatever the runtime put there when it loaded.
+	// At<NotifyFn>(runtime, kRvaTrampoline) = &AlreadySubmitted;
 	At<ID3D12Device*>(runtime, kRvaDevice) = device12.get();
 	device12.get()->AddRef();
 	At<ID3D12CommandQueue*>(runtime, kRvaQueue) = queue.get();
 	queue.get()->AddRef();
 	At<int>(runtime, kRvaHipDevice) = hipDevice;
+	// Which of these writes is the one. Everything below is a plain store at an address from the
+	// layout table, so the group that kills it names the field, and the field names the
+	// mechanism.
 	// Inline stays pinned, and it is the one engine key this backend does not expose.
 	//
 	// It was unpinned once to try the runtime's asynchronous route, and the attempt is worth
@@ -1866,7 +3193,28 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// different completion mechanism and a composite that lags a frame, since the engine
 	// rewrites its surface in place and a lagged residual has to be paired with the baseline
 	// it was measured against. Neither is here, so the pin stays.
-	At<uint8_t>(runtime, kRvaInlineMode) = 1;
+	// The engine reads the frame through externally-shared memory, and this is the flag that
+	// says so. Without it the runtime has no way into the surfaces this backend hands it, and
+	// what comes back is a black frame -- the failure the reference installation never reaches
+	// because it sets this before init.
+	// One, as the reference sets it. Turned off once to see whether the external-memory interop
+	// it enables was what stopped this device executing submitted work: it is not. With this at
+	// zero the runtime falls back to "inputs readback, output upload; cpu staging" and every
+	// D3D12 submission still produces nothing, so interop is exonerated and the zero-copy path
+	// is kept, being both faster and what every working installation runs.
+	At<uint8_t>(runtime, kRvaInterop) = 1;
+	// -1 is what the reference passes: the tonemap is the engine's own choice rather than one
+	// of the fixed curves, which is what every working installation runs.
+	At<int>(runtime, kRvaTonemap) = -1;
+	// Inline is the mode the runtime ships and the one every working installation runs, but it
+	// depends on the driver letting a store from the queue be seen by the GPU-side wait, and
+	// the engine says so itself when it cannot: "Inline mode will time out on this driver".
+	// Pinned to 1 it is a black frame on such a driver with no way out from the ini, because
+	// this write lands after the runtime has read it. Left switchable so the fallback the
+	// engine names is reachable:   [DlssNrOnAmd]   Inline=0
+	At<uint8_t>(runtime, kRvaInlineMode) =
+		GetPrivateProfileIntW(L"DlssNrOnAmd", L"Inline", 1,
+			(ExeDirectory() / kIniName).c_str()) != 0 ? 1 : 0;
 	At<uint8_t>(runtime, kRvaEnabled) = 1;
 	// Deliberately *not* written here: Interop, which belongs to dlssnr_on_amd.ini the way
 	// Tonemap does. An earlier version of this function still pinned it to 1 while the
@@ -1910,6 +3258,13 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// could be tested -- and the result was a black frame, so Inline is pinned. Do not unpin
 	// it without testing one variable at a time.
 
+	// Where the queue stops executing.
+	//
+	// The crossing test that runs from CreatePipeline passes, and the one at frame forty fails,
+	// so the change is somewhere between them. Everything else between them is CreateSized,
+	// CreateReconstruction, and this function -- so running the test on both sides of the init
+	// call narrows the window to the call itself and to nothing else.
+
 	const std::string weights = weightsPath.string();
 	if (!CallInit(init,
 		reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(runtime) + kRvaInitCtx),
@@ -1918,7 +3273,8 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 		return false;
 	}
 
-	At<uint8_t>(runtime, kRvaFlag767f8) = 1;
+
+	At<uint8_t>(runtime, kRvaInitDone) = 1;
 	return true;
 }
 
@@ -2007,7 +3363,7 @@ bool DlssnrAmdBackend::Impl::CreateExposure() noexcept {
 		return false;
 	}
 	ID3D12CommandList* lists[] = { list.get() };
-	queue->ExecuteCommandLists(1, lists);
+	SubmitTo(queue.get(), 1, lists);
 	const uint64_t signal = ++fenceValue;
 	queue->Signal(fence.get(), signal);
 	if (fence->GetCompletedValue() < signal) {
@@ -2016,10 +3372,17 @@ bool DlssnrAmdBackend::Impl::CreateExposure() noexcept {
 			return false;
 		}
 	}
+	// Read it back immediately, while the queue is idle and nothing else is mid-recording.
+	// This is the one place a known value can be checked without anything else in the way, so
+	// it separates "the readback is unreliable where it is called" from "the surface really is
+	// empty" -- two very different problems that looked identical in the profile.
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD EXPOSURE CHECK (wrote {:.3f}): reads {:.4f}", exposureValue,
+		Measure(exposureTexture.get(), DXGI_FORMAT_R32_FLOAT, kStateShaderRead)));
 	return true;
 }
 
-bool DlssnrAmdBackend::Impl::WaitForEngine(uint64_t deadlineMs) noexcept {
+bool DlssnrAmdBackend::Impl::WaitForEngine(uint32_t wanted, uint64_t deadlineMs) noexcept {
 	// The network runs on the engine's own worker, so a fence on this queue says nothing
 	// about whether a result exists. The engine publishes its progress in its sync
 	// counter, and that is what the working implementation polls.
@@ -2034,7 +3397,6 @@ bool DlssnrAmdBackend::Impl::WaitForEngine(uint64_t deadlineMs) noexcept {
 	//
 	// The spin is short and entered every time: a completion that lands during it is taken
 	// without giving up the processor at all, which is the common case.
-	const uint32_t wanted = At<UINT>(runtime, kRvaJobCounter);
 	const uint64_t deadline = GetTickCount64() + deadlineMs;
 	uint32_t spins = 0;
 	while (At<UINT>(runtime, kRvaSyncCounter) < wanted) {
@@ -2080,6 +3442,15 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 		At<void*>(p.runtime, kRvaHistory) = nullptr;
 	}
 
+	// The engine's spin allowance for this frame, scaled with the pixels it is being asked to
+	// edit and clamped at the reference's own bounds. Too small and the runtime's wait budget
+	// collapses after a timeout -- which is the staircase the engine's own log shows -- and
+	// the reference scales it for exactly that reason.
+	if (p.netWidth && p.netHeight) {
+		const uint64_t allowance = 262144ull + (uint64_t(p.netWidth) * p.netHeight + 1) / 2;
+		At<UINT>(p.runtime, kRvaWatchdog) = static_cast<UINT>(allowance < 262144ull ? 262144ull :
+			(allowance > 2097152ull ? 2097152ull : allowance));
+	}
 	At<UINT>(p.runtime, kRvaDepthInverted) = 0;
 	At<uint8_t>(p.runtime, kRvaDepthExplicit) = 1;
 	// These are the runtime's own defaults, and an attempt to drive them from Magpie's
@@ -2181,8 +3552,8 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 	// an unordered-access target -- which is right for a filter that reads and writes one
 	// texture. The engine opens the resource for HIP access itself; this binding is here
 	// so the command list matches the one the engine was written against.
-	p.Bind(0, p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
-		p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+	p.Bind(0, p.net[p.slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+		p.net[p.slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
 	{
 		ID3D12DescriptorHeap* h = p.heap.get();
 		p.list->SetComputeRootSignature(p.root.get());
@@ -2198,11 +3569,11 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 	// that same texture. There is no second resource, and pointing this field at one --
 	// as an earlier version of this backend did -- leaves the engine staring at an empty
 	// texture, which is what its own log reports as "encoded mean 0.000".
-	packet.colour = p.net.get();
+	packet.colour = p.net[p.slot].get();
 	packet.colourState = kPacketState;
-	packet.motion = p.motion.get();
+	packet.motion = p.motion[p.slot].get();
 	packet.motionState = kPacketState;
-	packet.depth = p.depth.get();
+	packet.depth = p.depth[p.slot].get();
 	packet.depthState = kPacketState;
 	// An exposure rather than nullptr, so the engine uses it instead of adapting its own.
 	// Its adaptation is not stable; the measurements are on kExposureValue.
@@ -2213,6 +3584,25 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 	// where they have always been.
 	packet.scaleX = p.motionReady ? p.motionScaleX : 1.0f;
 	packet.scaleY = p.motionReady ? p.motionScaleY : 1.0f;
+	// The three fields 0.3.0 added to the packet.
+	//
+	// nativePre stays zero: that is the native FFX pre-SR path, which brings its own
+	// input/output semantics this backend does not use -- it hands over its own staging and
+	// takes the ordinary path, which is what the reference does for the same reason.
+	//
+	// The render extent is the size the model actually works at. It is not the capture size,
+	// and saying so is the point: the engine needs to know what resolution it is being asked
+	// to edit, and until now it was told nothing.
+	//
+	// Jitter is zero on purpose rather than left to whatever the stack held. This backend
+	// samples the network's input at the pixel centre every frame, so there is no sub-pixel
+	// phase to declare, and passing an uninitialised value as if there were one would move
+	// the picture by an amount nothing asked for.
+	packet.nativePre = 0;
+	packet.renderWidth = p.netWidth;
+	packet.renderHeight = p.netHeight;
+	packet.jitterX = 0.0f;
+	packet.jitterY = 0.0f;
 
 	// No transitions here. The engine is handed shader-readable surfaces, exactly as the
 	// reference hands it shader-readable surfaces, and it deals with hazards itself.
@@ -2229,32 +3619,41 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 		return false;
 	}
 	ID3D12CommandList* lists[] = { p.list.get() };
-	p.queue->ExecuteCommandLists(1, lists);
+	p.SubmitTo(p.queue.get(), 1, lists);
 	if (!CallNotify(p.notify, p.queue.get(), 1, lists)) {
 		p.failed = true;
 		return false;
 	}
-
 	phaseAt[3] = Impl::Qpc();
 
-	// 5 s while the engine is still warming up, 500 ms once it is going. Both are far
-	// above the steady-state cost (tens of milliseconds at this resolution) and bound
-	// how long a stalled job may hold the render thread.
-	const uint64_t budget = p.framesSeen < 3 ? 5000 : 500;
-	++p.framesSeen;
-	if (!p.WaitForEngine(budget)) {
-		// Skip this frame and let the next one try. Latching a failure here would mean
-		// one slow frame disables the effect until the profile is reloaded, which is a
-		// far worse outcome than a frame that came out unprocessed.
-		if (++p.timeouts <= 3) {
-			Logger::Get().Warn(fmt::format(
-				"DLSSNR AMD: engine did not finish within {} ms; frame passed through "
-				"({} so far)", budget, p.timeouts));
-		}
-		// A frame the engine gave up on leaves its history one step behind the scene.
-		p.resetHistory = true;
-		return false;
+	// The job number this submission produced, remembered against the slot it went into. It
+	// is deliberately not waited on here: the runtime returns as soon as the work is queued
+	// ("mode async"), and blocking would put the engine's cost back on the render thread,
+	// which is the whole thing the asynchronous mode buys. The wait happens where the result
+	// is needed, on the slot that holds it.
+	p.slotJob[p.slot] = At<UINT>(p.runtime, kRvaJobCounter);
+	p.slotState[p.slot].Record(GetTickCount64());
+	// What the runtime actually published, said once a frame for the first few: which job it
+	// thinks it was given, how far it says it has got, and whether it still holds the list.
+	if (p.framesSeen < 8) {
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD counters frame {}: jobId={} jobDone={} pending={} (slot {} job {})",
+			p.framesSeen,
+			At<UINT>(p.runtime, kRvaJobCounter),
+			At<UINT>(p.runtime, kRvaSyncCounter),
+			reinterpret_cast<uintptr_t>(At<void*>(p.runtime, kRvaPendingList)),
+			p.slot, p.slotJob[p.slot]));
 	}
+	++p.framesSeen;
+
+	// Signal where the GPU is so the frame this slot holds can be waited on later. The
+	// runtime's kernels ride this same queue, so reaching this value means they are done.
+	p.slotFence[p.slot] = ++p.serial;
+	p.queue->Signal(p.fence.get(), p.slotFence[p.slot]);
+	p.slotState[p.slot].Submit(GetTickCount64());
+	// Retire whatever has landed. The reference does this at the end of every submission, and
+	// it is what keeps a slot from being held for the rest of the session.
+	p.RetireSubmission("submitted");
 
 	phaseAt[4] = Impl::Qpc();
 
@@ -2318,9 +3717,16 @@ bool DlssnrAmdBackend::Initialize(
 	// Magpie's defaults for them are the inverse of the runtime's, so copying them across
 	// switched the engine's own filters off and the visible edit collapsed. See the note
 	// where the engine's state is written.
+	// The effect's two controls own this -- the checkbox and the 25-100% slider -- and they are
+	// read exactly as the interface leaves them. The file is only a fallback for a run that
+	// cannot reach the interface: an ini value is honoured when the checkbox is off, and
+	// ignored the moment someone turns scaling on, so the slider always wins once it is in use.
+	//   [DlssNrOnAmd]   InputResolutionPercent=40
+	const int scaleFromIni = GetPrivateProfileIntW(L"DlssNrOnAmd", L"InputResolutionPercent",
+		0, (ExeDirectory() / kIniName).c_str());
 	p.modelScale = settings.enableInputResolutionScaling
 		? float(std::clamp<uint32_t>(settings.inputResolutionPercent, 25, 100)) / 100.0f
-		: 1.0f;
+		: (scaleFromIni > 0 ? float(std::clamp(scaleFromIni, 25, 100)) / 100.0f : 1.0f);
 
 	// Whether the frame goes to the engine as linear values or exactly as it arrives.
 	//
@@ -2340,6 +3746,15 @@ bool DlssnrAmdBackend::Initialize(
 	}
 	Logger::Get().Info(fmt::format("DLSSNR AMD: srgb input {}",
 		p.srgbInput ? "yes" : "no"));
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		p.encodeSteps = static_cast<int>(GetPrivateProfileIntW(L"DlssNrOnAmd",
+			L"EncodeSteps", 5, iniPath.c_str()));
+		p.jitterEnabled = GetPrivateProfileIntW(L"DlssNrOnAmd",
+			L"Jitter", 1, iniPath.c_str()) != 0;
+		p.pointSample = GetPrivateProfileIntW(L"DlssNrOnAmd",
+			L"JitterShape", 1, iniPath.c_str()) != 0;
+	}
 
 	// How much of the network's edit to apply, in thousandths. Read from the same ini; the
 	// working implementation attenuates the edit to stop flicker at reduced scale and lists
@@ -2408,10 +3823,51 @@ bool DlssnrAmdBackend::Initialize(
 			IID_PPV_ARGS(p.allocator.put()))) ||
 		FAILED(p.device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
 			p.allocator.get(), nullptr, IID_PPV_ARGS(p.list.put()))) ||
+		FAILED(p.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+			IID_PPV_ARGS(p.outAllocator.put()))) ||
+		FAILED(p.device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+			p.outAllocator.get(), nullptr, IID_PPV_ARGS(p.outList.put()))) ||
+		FAILED(p.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+			IID_PPV_ARGS(p.measureAllocator.put()))) ||
+		FAILED(p.device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+			p.measureAllocator.get(), nullptr, IID_PPV_ARGS(p.measureList.put()))) ||
+		FAILED(p.measureList->Close()) ||
+		// A list is created open and must be closed once before it can ever be reset.
+		FAILED(p.outList->Close()) ||
 		FAILED(p.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
 			IID_PPV_ARGS(p.fence.put())))) {
 		Logger::Get().Error("DLSSNR AMD: could not create the D3D12 command objects");
 		return false;
+	}
+
+	// The queue's own ExecuteCommandLists, taken now -- before the runtime's DLL is loaded.
+	//
+	// It used to be taken at the top of InitEngine, and that was too late to mean anything: the
+	// runtime hooks this entry when its DLL loads, which happens well before InitEngine, so what
+	// was saved there was the hook rather than the original. Saving it here, while the vtable
+	// still belongs to the driver, is the only way to have an entry that actually executes --
+	// and the reason it matters is that the runtime's own entry stops executing anything at all
+	// once this backend has written its device, queue and enabled flags into the module.
+	p.executeOriginal = reinterpret_cast<DlssnrAmdBackend::Impl::ExecuteFn>(
+		(*reinterpret_cast<void***>(p.queue.get()))[10]);
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD: the queue's own ExecuteCommandLists is {:x} before the runtime loads",
+		reinterpret_cast<uintptr_t>(p.executeOriginal)));
+	// Record which adapter each side is on, once. Everything shared between them assumes the
+	// two are the same piece of hardware.
+	{
+		winrt::com_ptr<IDXGIDevice> dxgi;
+		if (SUCCEEDED(p.device11->QueryInterface(IID_PPV_ARGS(dxgi.put())))) {
+			winrt::com_ptr<IDXGIAdapter> adapter;
+			if (SUCCEEDED(dxgi->GetAdapter(adapter.put()))) {
+				DXGI_ADAPTER_DESC d{};
+				if (SUCCEEDED(adapter->GetDesc(&d))) {
+					p.luid11 = d.AdapterLuid;
+					p.device11Adapter = adapter;
+				}
+			}
+		}
+		p.luid12 = p.device12->GetAdapterLuid();
 	}
 	p.fenceEvent.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
 	if (!p.fenceEvent.valid() || FAILED(p.list->Close())) {
@@ -2443,6 +3899,25 @@ bool DlssnrAmdBackend::Initialize(
 #endif
 	p.motionRequest = settings.motionRequest;
 	p.settings = settings;
+	// Measurement overrides for the residual controls, in the file the rest of this backend's
+	// knobs live in. A missing key leaves the interface's value alone. They exist because
+	// those controls are a no-op at their defaults: a wiring mistake in the constant buffer
+	// -- the wrong type, the wrong slot -- looks exactly like correct wiring until something
+	// moves off 1.0, and these are what move it without the interface. Thousandths, because
+	// the profile API reads integers:
+	//   [DlssNrOnAmd]   ResidualMultiplierMilli=1500
+	{
+		const auto over = [&](const wchar_t* key, float& target) {
+			const int milli = GetPrivateProfileIntW(L"DlssNrOnAmd", key, -1,
+				(ExeDirectory() / kIniName).c_str());
+			if (milli >= 0) target = std::clamp(float(milli) / 1000.0f, 0.0f, 4.0f);
+		};
+		over(L"ResidualMultiplierMilli", p.settings.residualMultiplier);
+		over(L"ResidualSaturationMilli", p.settings.residualSaturation);
+		over(L"ResidualLightnessMilli", p.settings.residualLightness);
+		over(L"ShadowStructureMilli", p.settings.shadowStructureMultiplier);
+		over(L"ReflectionGlowMilli", p.settings.reflectionGlowMultiplier);
+	}
 	p.guidanceInterop = std::make_unique<FrameGuidanceD3D12Interop>();
 	if (!p.guidanceInterop->Initialize(p.device12.get(), p.fence.get())) {
 		Logger::Get().Error("DLSSNR AMD: guidance interop failed to initialise");
@@ -2462,6 +3937,14 @@ bool DlssnrAmdBackend::Initialize(
 	if (!p.InitEngine(ExeDirectory() / kWeightsName)) {
 		return false;
 	}
+
+	// The crossing, again, with the engine initialised and before a single frame has been drawn.
+	//
+	// The first crossing test runs before the engine initialises and the second at frame forty,
+	// so they differ in two things at once: whether the engine is live, and whether Magpie has
+	// been capturing and scaling. This one holds the second still. If the crossing is already
+	// dead here, the engine's initialisation is what kills it; if it is alive here and dead at
+	// frame forty, the engine is exonerated and something the frames do is responsible.
 
 	p.ready = true;
 	// The applied scale is printed alongside the requested one, because the floor can raise
@@ -2542,6 +4025,74 @@ bool DlssnrAmdBackend::Resize(
 	return p.CreateReconstruction(resources, output);
 }
 
+float DlssnrAmdBackend::Impl::MeanOfOutput(ID3D11Texture2D* tex, float* detail) noexcept {
+	D3D11_TEXTURE2D_DESC desc{};
+	tex->GetDesc(&desc);
+	if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+		desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+		// Only the eight-bit display formats are read here; a half-float one would need its own
+		// decode and this check exists for the eight-bit path.
+		return -1.0f;
+	}
+
+	D3D11_TEXTURE2D_DESC stagingDesc = desc;
+	stagingDesc.Usage = D3D11_USAGE_STAGING;
+	stagingDesc.BindFlags = 0;
+	stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	stagingDesc.MiscFlags = 0;
+	winrt::com_ptr<ID3D11Texture2D> staging;
+	if (FAILED(device11->CreateTexture2D(&stagingDesc, nullptr, staging.put()))) {
+		return -1.0f;
+	}
+	context11->CopyResource(staging.get(), tex);
+
+	D3D11_MAPPED_SUBRESOURCE mapped{};
+	if (FAILED(context11->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+		return -1.0f;
+	}
+	// A coarse grid rather than every pixel: this answers whether the picture is roughly where
+	// it should be, and a stride keeps a one-off read cheap.
+	double sum = 0.0;
+	uint64_t count = 0;
+	const uint8_t* base = static_cast<const uint8_t*>(mapped.pData);
+	const bool bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+	for (uint32_t y = 0; y < desc.Height; y += 16) {
+		const uint8_t* row = base + size_t(y) * mapped.RowPitch;
+		for (uint32_t x = 0; x < desc.Width; x += 16) {
+			const uint8_t* px = row + size_t(x) * 4;
+			const double r = bgra ? px[2] : px[0];
+			const double g = px[1];
+			const double b = bgra ? px[0] : px[2];
+			sum += (r + g + b) / (3.0 * 255.0);
+			++count;
+		}
+	}
+	// A tile read pixel by pixel, which is what a sharpness figure needs: only neighbouring
+	// samples carry the high frequencies that separate a resolved picture from a soft one. The
+	// coarse grid above would average them away, which is the one thing this number must not do.
+	if (detail) {
+		const uint32_t gw = desc.Width < 256 ? desc.Width : 256;
+		const uint32_t gh = desc.Height < 256 ? desc.Height : 256;
+		const uint32_t x0 = (desc.Width - gw) / 2;
+		const uint32_t y0 = (desc.Height - gh) / 2;
+		double gradSum = 0.0;
+		uint64_t gradCount = 0;
+		for (uint32_t y = 0; y < gh; ++y) {
+			const uint8_t* row = base + size_t(y0 + y) * mapped.RowPitch;
+			for (uint32_t x = 0; x + 1 < gw; ++x) {
+				const uint8_t* a = row + size_t(x0 + x) * 4;
+				const uint8_t* b = a + 4;
+				gradSum += (std::abs(int(a[0]) - int(b[0])) + std::abs(int(a[1]) - int(b[1]))
+					+ std::abs(int(a[2]) - int(b[2]))) / (3.0 * 255.0);
+				++gradCount;
+			}
+		}
+		*detail = gradCount ? float(gradSum / double(gradCount)) : -1.0f;
+	}
+	context11->Unmap(staging.get(), 0);
+	return count ? float(sum / double(count)) : -1.0f;
+}
+
 float DlssnrAmdBackend::Impl::Measure(
 	ID3D12Resource* res, DXGI_FORMAT format, D3D12_RESOURCE_STATES before,
 	uint64_t* nonFinite, float* meanAbsDelta
@@ -2564,7 +4115,15 @@ float DlssnrAmdBackend::Impl::Measure(
 	const uint64_t total = rowPitch * measured.Height;
 	const uint32_t mw = uint32_t(measured.Width), mh = measured.Height;
 
-	if (!probe || probeBytes < total) {
+	// Fresh every call, deliberately.
+	//
+	// It used to be reused whenever the new total fitted inside the old. A copy that then did
+	// not land left the previous texture's contents in place, and the figure that came back was
+	// the last surface's value rather than this one's -- two different surfaces of the same size
+	// read identically whatever they held, and a chain that produced nothing became
+	// indistinguishable from one that worked. One allocation of a few tens of megabytes, once a
+	// frame, is not worth that ambiguity.
+	{
 		probe = nullptr;
 		D3D12_HEAP_PROPERTIES hp{};
 		hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -2584,10 +4143,13 @@ float DlssnrAmdBackend::Impl::Measure(
 		probeBytes = total;
 	}
 
-	if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.get(), nullptr))) {
+	if (!measureList ||
+		FAILED(measureAllocator->Reset()) ||
+		FAILED(measureList->Reset(measureAllocator.get(), nullptr))) {
 		return -1.0f;
 	}
-	Barrier(list.get(), res, before, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	auto* const probeList = measureList.get();
+	Barrier(probeList, res, before, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
 	D3D12_TEXTURE_COPY_LOCATION src{};
 	src.pResource = res;
@@ -2602,18 +4164,31 @@ float DlssnrAmdBackend::Impl::Measure(
 	dst.PlacedFootprint.Footprint.Height = mh;
 	dst.PlacedFootprint.Footprint.Depth = 1;
 	dst.PlacedFootprint.Footprint.RowPitch = (UINT)rowPitch;
-	list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+	probeList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
-	Barrier(list.get(), res, D3D12_RESOURCE_STATE_COPY_SOURCE, before);
-	if (FAILED(list->Close())) {
+	Barrier(probeList, res, D3D12_RESOURCE_STATE_COPY_SOURCE, before);
+	if (FAILED(probeList->Close())) {
 		return -1.0f;
 	}
-	ID3D12CommandList* lists[] = { list.get() };
-	queue->ExecuteCommandLists(1, lists);
-	const uint64_t sig = ++fenceValue;
-	queue->Signal(fence.get(), sig);
-	if (fence->GetCompletedValue() < sig) {
-		fence->SetEventOnCompletion(sig, fenceEvent.get());
+	// The readback goes out on this backend's own queue, not the engine's: see the note on
+	// probeQueue. The engine's queue is ordered before it explicitly, so a surface the frame
+	// wrote is still read after the write regardless of which queue the copy runs on.
+	if (!probeQueue) {
+		D3D12_COMMAND_QUEUE_DESC qd{};
+		qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		if (FAILED(device12->CreateCommandQueue(&qd, IID_PPV_ARGS(probeQueue.put()))) ||
+			FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+				IID_PPV_ARGS(probeFence.put())))) {
+			return -1.0f;
+		}
+	}
+	probeQueue->Wait(fence.get(), fenceValue);
+	ID3D12CommandList* lists[] = { probeList };
+	SubmitTo(probeQueue.get(), 1, lists);
+	const uint64_t sig = ++probeFenceValue;
+	probeQueue->Signal(probeFence.get(), sig);
+	if (probeFence->GetCompletedValue() < sig) {
+		probeFence->SetEventOnCompletion(sig, fenceEvent.get());
 		if (WaitForSingleObject(fenceEvent.get(), 3000) != WAIT_OBJECT_0) {
 			return -1.0f;
 		}
@@ -2696,6 +4271,33 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 
 	constexpr D3D12_RESOURCE_STATES kCommon = D3D12_RESOURCE_STATE_COMMON;
 
+	// Move to the other slot for this frame, before anything is recorded. Doing it here
+	// rather than at the end means no exit path can skip it -- there are several returns
+	// below, and a missed flip would leave two consecutive frames writing the same surface
+	// while the engine reads it.
+	// Advance to the next slot for this frame, before anything is recorded. Doing it here
+	// rather than at the end means no exit path can skip it -- there are several returns
+	// below, and a missed advance would leave two consecutive frames writing the same surface
+	// while the engine reads it. A slot that is recorded but not yet submitted is skipped
+	// rather than taken, so nothing in flight is disturbed.
+	for (uint32_t step = 0; step < kSlots; ++step) {
+		p.slot = (p.slot + 1u) % kSlots;
+		if (!p.slotState[p.slot].BlocksRecord()) break;
+	}
+
+	// The sub-pixel phase for this frame, before anything is recorded, so the downsample and
+	// the upscaler are told the same one. Zero everywhere but the reconstruction route: the
+	// edit route takes the whole-footprint average it has always taken, and a phase would
+	// only make its input wander for no one's benefit.
+	if (p.reconstruct && p.jitterEnabled) {
+		p.frameJitterX = kPhaseX[p.jitterPhase] - 0.5f;
+		p.frameJitterY = kPhaseY[p.jitterPhase] - 0.5f;
+		p.jitterPhase = (p.jitterPhase + 1) & 7u;
+	} else {
+		p.frameJitterX = 0.0f;
+		p.frameJitterY = 0.0f;
+	}
+
 	// The frame's stages, on the performance counter. See phaseAccum in Impl for why this
 	// cannot be read off the engine's own job figures.
 	auto& phaseAt = p.phaseAt;
@@ -2739,12 +4341,47 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// A texture shared between two devices sits in COMMON on the D3D12 side and has to
 	// go back there before the other device may touch it again, so every crossing below
 	// is COMMON -> in use -> COMMON.
+	// Magpie's frame into the shared surface, through the shader rather than a copy.
+	//
+	// The SRV is rebuilt only when the frame the renderer hands over is a different texture,
+	// which is the usual case but not a guaranteed one, and it is cached because building a
+	// view per frame is pure overhead at this point in the frame.
+	// Filled by copy rather than by the compute shader that used to do it.
+	//
+	// The shader was a straight texel-for-texel copy -- dst[id.xy] = src.Load(id.xy) -- and the
+	// shared surface is created with the input's own format, so this says the same thing. What
+	// differs is whether the far device ever sees it. The crossing test fills a surface by a
+	// staging copy and D3D12 reads the value back exactly; the same surface written through a
+	// UAV reads as zero on D3D12 however long the fence is held. A UAV write into a surface
+	// shared with a second device has to be made visible by the driver, and on this one it is
+	// not -- which is why the network's input arrived empty and every stage downstream made a
+	// faithful black picture out of it.
 	p.context11->CopyResource(p.sharedIn11.get(), context.input);
+	// The input crossing, in the only order that works.
+	//
+	// This is the direction the backend actually depends on -- Magpie's frame is written into a
+	// shared surface on D3D11 and read out of it on D3D12 -- and it is the one that was missing.
+	// The flush is what submits the fill; the signal behind it is what the other device waits
+	// on. Without that wait the copy below reads a surface nothing has written yet: at startup
+	// that is nothing at all, and every stage downstream faithfully makes black out of it.
+	//
+	// Being on the same machine does not order the two queues, and a flush is a submission
+	// rather than a completion. Nothing here is a substitute for the fence.
+	const uint64_t inputSignal = ++p.inFenceValue;
+	if (FAILED(p.context11x->Signal(p.inFence11.get(), inputSignal))) {
+		Logger::Get().Error("DLSSNR AMD: the input crossing could not be signalled");
+		p.failed = true;
+		return false;
+	}
 	p.context11->Flush();
 
 	if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator.get(), nullptr))) {
 		return false;
 	}
+
+	// The far side of that crossing. Recorded into the list rather than waited on here, so the
+	// ordering costs the GPU a dependency instead of costing the frame its latency.
+	p.queue->Wait(p.inFence12.get(), inputSignal);
 
 	// ---- 1. Magpie's frame into a full-resolution RGBA16F surface ----
 	// The engine's format is RGBA16F and Magpie's usually is not, so this is where the two
@@ -2753,21 +4390,21 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// its detail back.
 	if (p.inputIsFp16) {
 		Barrier(p.list.get(), p.sharedIn12.get(), kCommon, D3D12_RESOURCE_STATE_COPY_SOURCE);
-		Barrier(p.list.get(), p.full.get(), kStateShaderRead,
+		Barrier(p.list.get(), p.full[p.slot].get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_COPY_DEST);
-		p.list->CopyResource(p.full.get(), p.sharedIn12.get());
+		p.list->CopyResource(p.full[p.slot].get(), p.sharedIn12.get());
 		Barrier(p.list.get(), p.sharedIn12.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, kCommon);
-		Barrier(p.list.get(), p.full.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		Barrier(p.list.get(), p.full[p.slot].get(), D3D12_RESOURCE_STATE_COPY_DEST,
 			kStateShaderRead);
 	} else {
 		Barrier(p.list.get(), p.sharedIn12.get(), kCommon, kStateShaderRead);
-		Barrier(p.list.get(), p.full.get(), kStateShaderRead,
+		Barrier(p.list.get(), p.full[p.slot].get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.Bind(2, p.sharedIn12.get(), p.inputFormat, p.full.get(),
+		p.Bind(2, p.sharedIn12.get(), p.inputFormat, p.full[p.slot].get(),
 			DXGI_FORMAT_R16G16B16A16_FLOAT);
 		p.Dispatch(p.srgbInput ? p.convertInSrgb.get() : p.convertIn.get(), 2);
 		Barrier(p.list.get(), p.sharedIn12.get(), kStateShaderRead, kCommon);
-		Barrier(p.list.get(), p.full.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		Barrier(p.list.get(), p.full[p.slot].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
 	}
 
@@ -2778,34 +4415,36 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// to happen before the engine runs, since the engine edits its surface in place and the
 	// resolve needs the difference.
 	if (p.downscaling) {
-		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+		Barrier(p.list.get(), p.net[p.slot].get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.Bind(4, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, p.net.get(),
+		p.Bind(4, p.full[p.slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT, p.net[p.slot].get(),
 			DXGI_FORMAT_R16G16B16A16_FLOAT);
-		const UINT dims[4]{ p.netWidth, p.netHeight, p.width, p.height };
-		p.DispatchSized(p.downsample.get(), 4, p.netWidth, p.netHeight, 0, dims);
-		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		const UINT dims[7]{ p.netWidth, p.netHeight, p.width, p.height,
+			p.reconstruct && p.pointSample ? 1u : 0u,
+			BitsOfFloat(p.frameJitterX), BitsOfFloat(p.frameJitterY) };
+		p.DispatchSized(p.downsample.get(), 4, p.netWidth, p.netHeight, 0, dims, 7);
+		Barrier(p.list.get(), p.net[p.slot].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
 	} else if (p.scaled) {
-		Barrier(p.list.get(), p.full.get(), kStateShaderRead,
+		Barrier(p.list.get(), p.full[p.slot].get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_COPY_SOURCE);
-		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+		Barrier(p.list.get(), p.net[p.slot].get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_COPY_DEST);
-		p.list->CopyResource(p.net.get(), p.full.get());
-		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		p.list->CopyResource(p.net[p.slot].get(), p.full[p.slot].get());
+		Barrier(p.list.get(), p.net[p.slot].get(), D3D12_RESOURCE_STATE_COPY_DEST,
 			kStateShaderRead);
-		Barrier(p.list.get(), p.full.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+		Barrier(p.list.get(), p.full[p.slot].get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
 			kStateShaderRead);
 	}
 	if (p.scaled) {
-		Barrier(p.list.get(), p.net.get(), kStateShaderRead,
+		Barrier(p.list.get(), p.net[p.slot].get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_COPY_SOURCE);
-		Barrier(p.list.get(), p.baseline.get(), kStateShaderRead,
+		Barrier(p.list.get(), p.baseline[p.slot].get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_COPY_DEST);
-		p.list->CopyResource(p.baseline.get(), p.net.get());
-		Barrier(p.list.get(), p.baseline.get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		p.list->CopyResource(p.baseline[p.slot].get(), p.net[p.slot].get());
+		Barrier(p.list.get(), p.baseline[p.slot].get(), D3D12_RESOURCE_STATE_COPY_DEST,
 			kStateShaderRead);
-		Barrier(p.list.get(), p.net.get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+		Barrier(p.list.get(), p.net[p.slot].get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
 			kStateShaderRead);
 	}
 
@@ -2830,13 +4469,13 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			const uint32_t sourceH = guidance.motion.metadata.sourceExtent.height;
 			p.guidanceInterop->Transition(p.list.get(), D3D12_RESOURCE_STATE_COMMON,
 				kStateShaderRead);
-			Barrier(p.list.get(), p.motion.get(), kStateShaderRead,
+			Barrier(p.list.get(), p.motion[p.slot].get(), kStateShaderRead,
 				D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 			p.Bind(20, p.guidanceInterop->Motion(), DXGI_FORMAT_R16G16_FLOAT,
-				p.motion.get(), DXGI_FORMAT_R16G16_FLOAT);
+				p.motion[p.slot].get(), DXGI_FORMAT_R16G16_FLOAT);
 			const UINT dims[4]{ p.netWidth, p.netHeight, sourceW, sourceH };
 			p.DispatchSized(p.motionResample.get(), 20, p.netWidth, p.netHeight, 0, dims);
-			Barrier(p.list.get(), p.motion.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			Barrier(p.list.get(), p.motion[p.slot].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 				kStateShaderRead);
 			p.guidanceInterop->Transition(p.list.get(), kStateShaderRead,
 				D3D12_RESOURCE_STATE_COMMON);
@@ -2865,7 +4504,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		// Bypassed: the full-resolution converted frame, not the network's surface, which at
 		// a reduced scale is the wrong size for this and would be a format-sized mismatch.
-		p.Bind(6, p.full.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+		p.Bind(6, p.full[p.slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
 		p.list->SetComputeRoot32BitConstants(1, 1, &p.shoulderMilli, 0);
 		p.Dispatch(p.srgbInput ? p.convertOutSrgb.get() : p.convertOut.get(), 6);
@@ -2873,7 +4512,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			kCommon);
 		p.list->Close();
 		ID3D12CommandList* bl[] = { p.list.get() };
-		p.queue->ExecuteCommandLists(1, bl);
+		p.SubmitTo(p.queue.get(), 1, bl);
 		const uint64_t bs = ++p.fenceValue;
 		p.queue->Signal(p.fence.get(), bs);
 		if (p.fence->GetCompletedValue() < bs) {
@@ -2882,11 +4521,20 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		}
 		p.context11->CopyResource(context.output, p.sharedOut11.get());
 
+		// The bypass returns before the main probe, so it needs its own: this is what says
+		// whether the output stage works when the engine is taken out of the picture.
+		if (!p.probed && p.framesSeen >= 40) {
+			p.probed = true;
+			Logger::Get().Info(fmt::format(
+				"DLSSNR AMD PROBE (bypass, engine skipped): magpie-input {:.4f} | shared-output {:.4f}",
+				p.MeanOfOutput(p.sharedIn11.get()), p.MeanOfOutput(p.sharedOut11.get())));
+		}
+
 		if (!p.probed && ++p.framesSeen >= 10) {
 			p.probed = true;
 			const float inMean = p.Measure(p.sharedIn12.get(), p.inputFormat,
 				D3D12_RESOURCE_STATE_COMMON);
-			const float netMean = p.Measure(p.full.get(),
+			const float netMean = p.Measure(p.full[p.slot].get(),
 				DXGI_FORMAT_R16G16B16A16_FLOAT, kStateShaderRead);
 			const float outMean = p.Measure(p.sharedOut12.get(), p.outputFormat,
 				D3D12_RESOURCE_STATE_COMMON);
@@ -2931,10 +4579,6 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		}
 	}
 
-	if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator.get(), nullptr))) {
-		p.failed = true;
-		return true;
-	}
 	// The engine leaves its surface readable, which is the state named below.
 	//
 	// At a reduced scale a resolve sits here: only the difference the engine made is
@@ -2942,17 +4586,160 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	// the low-resolution footprint. The picture is therefore the untouched full-resolution
 	// frame plus that edit -- which is what keeps a smaller model from costing detail. At
 	// 100% there is nothing to resolve and the engine's own surface is the picture.
-	ID3D12Resource* picture = p.net.get();
+	// Which slot the picture comes from.
+	//
+	// The engine was handed this frame's surface and returned without waiting for it, so the
+	// frame it has actually finished is the previous one -- "residual from an earlier frame"
+	// is what the runtime calls it. Reading the slot just submitted would take a surface the
+	// engine is still writing, which is black.
+	//
+	// The first frames are the exception: there is no earlier frame yet, so the picture waits
+	// for the one being submitted. That is also the only place a wait happens now, and it
+	// waits for a job number rather than an empty queue.
+	// The newest generation the engine has actually finished, across every slot.
+	//
+	// This is what the slots are for. The engine takes about three frames here, so the frame just
+	// submitted is never ready, and waiting on it ties this frame to the engine's rate -- that is
+	// the stutter, not the throughput. Take the newest that has retired instead: the edit is then
+	// a frame or two old, which is what asynchronous mode means and what the reference does, and
+	// the frame time belongs to the renderer again.
+	//
+	// A slot counts as retired once the fence has passed the value its submission signalled. The
+	// largest such value is the newest, because the timeline is one counter across all of them.
+	const uint64_t completed = p.fence->GetCompletedValue();
+	uint32_t best = p.pictureSlot;
+	uint64_t bestFence = 0;
+	for (uint32_t i = 0; i < kSlots; ++i) {
+		const uint64_t target = p.slotFence[i];
+		if (target == 0 || completed == (std::numeric_limits<uint64_t>::max)() ||
+			completed < target) {
+			continue;
+		}
+		if (target > bestFence) {
+			bestFence = target;
+			best = i;
+		}
+	}
+	bool ready = bestFence != 0;
+	if (ready) {
+		p.pictureSlot = best;
+	}
+	const uint32_t pictureSlot = p.pictureSlot;
+	if (!ready) {
+		// Nothing has retired yet, which is only true at the start. One bounded wait; if even that
+		// finds nothing the picture stays the one already chosen rather than the frame being
+		// dropped, because a dropped frame here alternates the effect on and off -- a strobe --
+		// and a picture one generation older is the lesser fault.
+		const uint64_t deadline = GetTickCount64() + 500;
+		while (GetTickCount64() <= deadline) {
+			const uint64_t now = p.fence->GetCompletedValue();
+			for (uint32_t i = 0; i < kSlots; ++i) {
+				if (p.slotFence[i] != 0 && now >= p.slotFence[i]) {
+					p.pictureSlot = i;
+					ready = true;
+					break;
+				}
+			}
+			if (ready) break;
+			Sleep(0);
+		}
+		if (!ready) {
+			if (++p.timeouts <= 3) {
+				Logger::Get().Warn(fmt::format(
+					"DLSSNR AMD: no slot retired within 500 ms (fence {} / newest {}); frame "
+					"passed through ({} so far)",
+					completed, p.slotFence[pictureSlot], p.timeouts));
+			}
+			p.resetHistory = true;
+			return false;
+		}
+	}
+
+	// The compositing goes on its own list and allocator. SubmitEngineJob closed and submitted
+	// the one it had -- that is where the packet went -- and that submission is still in
+	// flight, so this frame's output has to be recorded somewhere else entirely: recording
+	// onto the closed list drops the calls, and reusing its allocator while the GPU still has
+	// it fails outright.
+	if (!p.outList) {
+		Logger::Get().Error("DLSSNR AMD: no output list");
+		p.failed = true;
+		return true;
+	}
+	if (p.outFence != 0 && p.fence->GetCompletedValue() < p.outFence) {
+		const uint64_t outWaitAt = Impl::Qpc();
+		const uint64_t deadline = GetTickCount64() + 500;
+		while (p.fence->GetCompletedValue() < p.outFence && GetTickCount64() < deadline) {
+			Sleep(0);
+		}
+		p.compositeAccum[0] += Impl::Qpc() - outWaitAt;
+	}
+	if (FAILED(p.outAllocator->Reset()) ||
+		FAILED(p.outList->Reset(p.outAllocator.get(), nullptr))) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR AMD: the output list could not be reset (fence {}/{})",
+			p.fence->GetCompletedValue(), p.outFence));
+		p.failed = true;
+		return true;
+	}
+	auto* const list = p.outList.get();
+	auto* const allocator = p.outAllocator.get();
+	(void)allocator;
+
+	// Point the member every helper records through at the output list, for the length of this
+	// stage.
+	//
+	// Bind, DispatchSized, BindResolve and RunTemporal all record onto the member `list`, while
+	// the barriers here take the local one -- and the member still named the engine's list, which
+	// SubmitEngineJob had already closed and submitted. Recording onto a closed list drops the
+	// calls without an error, so the temporal pass, the resolve and the output convert did
+	// nothing at all: the resolve's surface came back empty and the screen stayed black, while
+	// the input chain, recorded earlier when the list was still open, was perfectly fine. That
+	// asymmetry is what made this look like a fault in the resolve rather than in the plumbing.
+	struct EngineListScope {
+		winrt::com_ptr<ID3D12GraphicsCommandList>& member;
+		winrt::com_ptr<ID3D12GraphicsCommandList> saved;
+		EngineListScope(winrt::com_ptr<ID3D12GraphicsCommandList>& m,
+			const winrt::com_ptr<ID3D12GraphicsCommandList>& to) noexcept
+			: member(m), saved(m) {
+			member = to;
+		}
+		~EngineListScope() { member = saved; }
+		EngineListScope(const EngineListScope&) = delete;
+		EngineListScope& operator=(const EngineListScope&) = delete;
+	} engineListScope(p.list, p.outList);
+
+	ID3D12Resource* picture = p.net[pictureSlot].get();
 	if (p.scaled) {
 		// The residual for this frame, before anything composites it. With anti-flicker off
 		// this only subtracts; with it on, earlier frames are blended in here.
-		if (!p.RunTemporal(context)) {
-			p.failed = true;
-			return true;
+		// Only when the picture is a generation this pass has not seen. With four slots the
+		// newest retired one usually stands still for two or three frames while the engine
+		// finishes the next, and an accumulator that blends one frame into the next would then
+		// count the same generation once per frame instead of once -- the carried edit would
+		// grow a little on every repeat and settle only by accident. Skipping leaves the last
+		// residual in place, which is what the resolve reads.
+		if (p.pictureSlot != p.temporalSourceSlot) {
+			const uint64_t temporalAt = Impl::Qpc();
+			if (!p.RunTemporal(context)) {
+				Logger::Get().Error("DLSSNR AMD: the temporal pass stopped");
+				p.failed = true;
+				return true;
+			}
+			p.compositeAccum[1] += Impl::Qpc() - temporalAt;
+			p.temporalSourceSlot = p.pictureSlot;
 		}
-		Barrier(p.list.get(), p.resolved.get(), kStateShaderRead,
+		Barrier(list, p.resolved.get(), kStateShaderRead,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		p.BindResolve(8, p.full.get(), p.resolved.get(), p.baseline.get(),
+		// The base the edit is composited onto is THIS frame's picture, not the generation the
+		// residual came from.
+		//
+		// The asynchronous handshake means the residual is a frame or two old -- that is what the
+		// runtime means by "residual from an earlier frame" -- and what is old is the residual,
+		// not the image. Building the output from the retired generation's own full-resolution
+		// frame instead made the whole displayed picture that old: the content then advanced once
+		// per engine job, about every 51 ms here, inside a presentation three times faster, which
+		// reads as the picture stepping rather than moving.
+		p.BindResolve(8, p.full[p.slot].get(), p.resolved.get(), p.baseline[pictureSlot].get(),
 			p.historyResidual[p.historyIndex].get());
 		// NR Intensity scales the edit the resolve applies -- the same idea as NGX's
 		// residual intensity, and what a strength control on this effect should do. The
@@ -2961,38 +4748,170 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			float(p.editBoundMilli) * std::clamp(p.settings.intensity, 0.0f, 2.0f),
 			0.0f, 1000.0f));
 		const UINT dims[5]{ p.width, p.height, p.netWidth, p.netHeight, boundMilli };
+		const uint64_t resolveAt = Impl::Qpc();
 		p.DispatchSized(p.resolve.get(), 8, p.width, p.height, 10, dims, 5);
-		Barrier(p.list.get(), p.resolved.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		p.compositeAccum[2] += Impl::Qpc() - resolveAt;
+		Barrier(list, p.resolved.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kStateShaderRead);
 		picture = p.resolved.get();
 	}
 
 	if (p.outputIsFp16) {
-		Barrier(p.list.get(), picture, kStateShaderRead,
+		Barrier(list, picture, kStateShaderRead,
 			D3D12_RESOURCE_STATE_COPY_SOURCE);
-		Barrier(p.list.get(), p.sharedOut12.get(), kCommon,
+		Barrier(list, p.sharedOut12.get(), kCommon,
 			D3D12_RESOURCE_STATE_COPY_DEST);
-		p.list->CopyResource(p.sharedOut12.get(), picture);
-		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_COPY_DEST, kCommon);
+		list->CopyResource(p.sharedOut12.get(), picture);
+		Barrier(list, p.sharedOut12.get(), D3D12_RESOURCE_STATE_COPY_DEST, kCommon);
 	} else {
-		Barrier(p.list.get(), p.sharedOut12.get(), kCommon,
+		Barrier(list, p.sharedOut12.get(), kCommon,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		p.Bind(6, picture, DXGI_FORMAT_R16G16B16A16_FLOAT,
 			p.sharedOut12.get(), p.outputFormat);
-		p.list->SetComputeRoot32BitConstants(1, 1, &p.shoulderMilli, 0);
-		p.Dispatch(p.srgbInput ? p.convertOutSrgb.get() : p.convertOut.get(), 6);
-		Barrier(p.list.get(), p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		// Handed to the dispatch rather than recorded before it, for the reason spelled out on
+		// the reconstruction's own copy of this pass. It read the right value here only
+		// because this list happens to have a root signature by now.
+		const UINT outSettings[1]{ p.shoulderMilli };
+		p.DispatchSized(p.srgbInput ? p.convertOutSrgb.get() : p.convertOut.get(), 6,
+			p.width, p.height, 0, outSettings, 1);
+		Barrier(list, p.sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			kCommon);
 	}
-	if (FAILED(p.list->Close())) {
+	const HRESULT closed = p.outList->Close();
+	if (FAILED(closed)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR AMD: the output list would not close (0x{:08x})",
+			static_cast<uint32_t>(closed)));
 		p.failed = true;
 		return true;
 	}
-	ID3D12CommandList* lists[] = { p.list.get() };
-	p.queue->ExecuteCommandLists(1, lists);
+	ID3D12CommandList* lists[] = { p.outList.get() };
+	const uint64_t submitAt = Impl::Qpc();
+	p.SubmitTo(p.queue.get(), 1, lists);
+	p.outFence = ++p.fenceValue;
+	p.queue->Signal(p.fence.get(), p.outFence);
+	p.compositeAccum[3] += Impl::Qpc() - submitAt;
+
+	// Drained before the shared texture is read back on the other device. The copy below is
+	// D3D11 work against a surface this queue is producing: without this wait it reads a
+	// surface that has not been written yet, and the picture comes out black while every
+	// stage in the chain reports success. The bypass path in this same function has always
+	// waited here; the real one lost that wait when the output moved onto its own list.
+	if (p.fence->GetCompletedValue() < p.outFence) {
+		p.fence->SetEventOnCompletion(p.outFence, p.fenceEvent.get());
+		if (WaitForSingleObject(p.fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
+			Logger::Get().Error("DLSSNR AMD: the output did not retire before the readback");
+			p.failed = true;
+			return true;
+		}
+	}
+
+	// The other device is told where this queue has got to before it reads the shared surface.
+	// Our own fence only says the work is finished here; this is what makes it visible there.
+	// Its own fence, not the input's: signalling one object from both directions is what let
+	// this wait resolve against a value that meant nothing here.
+	if (p.context11x && p.outFence11 && p.outFence12) {
+		const uint64_t crossing = ++p.outFenceValue;
+		p.queue->Signal(p.outFence12.get(), crossing);
+		if (FAILED(p.context11x->Wait(p.outFence11.get(), crossing))) {
+			Logger::Get().Error("DLSSNR AMD: the other device refused the output crossing");
+			p.failed = true;
+			return true;
+		}
+	}
+
+	// PROFILE: every stage of the chain, measured once, after the submissions for this frame
+	// have all been made. The point is to see WHERE the value is lost rather than to guess:
+	// each line is one stage, and the first one that reads zero is the one that broke it.
+	if (!p.profiled && p.framesSeen >= 40) {
+		p.profiled = true;
+		// Each surface is measured from the state it is actually resting in: the two shared ones
+		// are put back to COMMON at the end of every frame, the engine's own are left
+		// shader-readable. Declaring the wrong one makes the transition an invalid barrier, and
+		// an invalid barrier is not a failed read -- it is a copy against undefined contents,
+		// which reads as zero and looks exactly like a chain that produced nothing.
+		const auto mean = [&](ID3D12Resource* res, DXGI_FORMAT fmt, D3D12_RESOURCE_STATES before) {
+			return res ? p.Measure(res, fmt, before) : -1.0f;
+		};
+		p.CrossTest();
+
+			Logger::Get().Info(fmt::format(
+			"DLSSNR AMD CONTROL: exposureTex (known 1.0) reads {:.4f} -- if this is 0 the "
+			"measure is what is broken, not the chain",
+			p.exposureTexture ? p.Measure(p.exposureTexture.get(),
+				DXGI_FORMAT_R32_FLOAT, kStateShaderRead) : -1.0f));
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD ADAPTERS: d11Luid={:08x}:{:08x} d12Luid={:08x}:{:08x} same={}",
+			static_cast<uint32_t>(p.luid11.HighPart), static_cast<uint32_t>(p.luid11.LowPart),
+			static_cast<uint32_t>(p.luid12.HighPart), static_cast<uint32_t>(p.luid12.LowPart),
+			std::memcmp(&p.luid11, &p.luid12, sizeof(LUID)) == 0));
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD HANDSHAKE: inSignal={} in12Completed={} outSignal={} out11Completed={} "
+			"d3d12Fence={} inputIsFp16={} inputFmt={}",
+			p.inFenceValue,
+			p.inFence12 ? p.inFence12->GetCompletedValue() : 0,
+			p.outFenceValue,
+			p.outFence11 ? p.outFence11->GetCompletedValue() : 0,
+			p.fence->GetCompletedValue(),
+			p.inputIsFp16, static_cast<uint32_t>(p.inputFormat)));
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD PROFILE @frame {}: in11 {:.4f} | in12 {:.4f} | full {:.4f} | net {:.4f} | "
+			"baseline {:.4f} | out11 {:.4f} | out12 {:.4f}",
+			p.framesSeen,
+			p.MeanOfOutput(p.sharedIn11.get()),
+			mean(p.sharedIn12.get(), p.inputFormat, kCommon),
+			mean(p.full[pictureSlot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kStateShaderRead),
+			mean(p.net[pictureSlot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kStateShaderRead),
+			mean(p.baseline[pictureSlot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+				kStateShaderRead),
+			p.MeanOfOutput(p.sharedOut11.get()),
+			mean(p.sharedOut12.get(), p.outputFormat, kCommon)));
+		// What the output stage was told to do, so a zero there can be told apart from a zero
+		// produced by it: the scale, the branch the convert takes, and the two extents. The
+		// resolve's own surface goes with them, because that is what the convert is handed.
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD OUTPUT @frame {}: pictureSlot {} scaled {} inputIsFp16 {} "
+			"inputFmt {} outputFmt {} capture {}x{} network {}x{} resolved {:.4f}",
+			p.framesSeen, pictureSlot, p.scaled, p.inputIsFp16,
+			static_cast<uint32_t>(p.inputFormat), static_cast<uint32_t>(p.outputFormat),
+			p.width, p.height, p.netWidth, p.netHeight,
+			mean(p.resolved.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kStateShaderRead)));
+	}
+
+	// ONE-OFF PROBE, on the D3D11 side only.
+	//
+	// The D3D12-side measure shares the main command list and allocator with the stages that
+	// are still being recorded, so its readback barrier and copy land in the middle of a
+	// pipeline whose state contract it does not honour -- the numbers it produced were not
+	// evidence. These three surfaces are all reachable from D3D11, which owns its own staging
+	// texture and map, so what it reports is the actual contents.
+	if (!p.probed && p.framesSeen >= 40) {
+		p.probed = true;
+		const float input = p.MeanOfOutput(p.sharedIn11.get());
+		const float output = p.MeanOfOutput(p.sharedOut11.get());
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD PROBE (D3D11 side): magpie-input {:.4f} | shared-output {:.4f}",
+			input, output));
+	}
+
+	// ONE-OFF: what each end of the chain actually contains, once, after the queue drains.
+	if (p.framesSeen == 40) {
+		p.fence->SetEventOnCompletion(p.outFence, p.fenceEvent.get());
+		WaitForSingleObject(p.fenceEvent.get(), 2000);
+		const float netMean = p.Measure(p.net[pictureSlot].get(),
+			DXGI_FORMAT_R16G16B16A16_FLOAT, kStateShaderRead);
+		const float fullMean = p.Measure(p.full[pictureSlot].get(),
+			DXGI_FORMAT_R16G16B16A16_FLOAT, kStateShaderRead);
+		const float outMean = p.Measure(p.sharedOut12.get(),
+			p.outputFormat, D3D12_RESOURCE_STATE_COMMON);
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD PROBE: engine-output(net) {:.4f} | original(full) {:.4f} | final(sharedOut) {:.4f}",
+			netMean, fullMean, outMean));
+	}
 
 	const uint64_t signal2 = ++p.fenceValue;
 	p.queue->Signal(p.fence.get(), signal2);
+	const uint64_t drainAt = Impl::Qpc();
 	if (p.fence->GetCompletedValue() < signal2) {
 		p.fence->SetEventOnCompletion(signal2, p.fenceEvent.get());
 		if (WaitForSingleObject(p.fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
@@ -3000,6 +4919,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			return true;
 		}
 	}
+	p.compositeAccum[4] += Impl::Qpc() - drainAt;
 	phaseAt[5] = Impl::Qpc();
 	// The frame's last signal: the guidance textures may be reused by the producer once this
 	// value is reached, so the interop is told it before the next frame can Update.
@@ -3008,31 +4928,6 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	}
 
 	p.context11->CopyResource(context.output, p.sharedOut11.get());
-
-	// TEMPORARY DIAGNOSTIC -- remove once the brightness wobble is pinned down.
-	//
-	// Twelve consecutive frames' means instead of one sample. A single reading cannot tell a
-	// steady picture from one that is breathing; a run of them can, and the three points
-	// separate the frame arriving from the engine's own output from what finally leaves, so
-	// whichever of the three is swinging is where to look. Readbacks stall the queue, which
-	// is why this is a short window and not a permanent per-frame reading.
-	if (p.probeSamples < 12 && p.framesSeen >= 10) {
-		const int n = p.probeSamples++;
-		uint64_t badIn = 0, badNet = 0, badOut = 0;
-		float deltaIn = -1.0f, deltaOut = -1.0f;
-		// Both ends are measured frame to frame. The input's change is what the game did;
-		// the picture's change is what flicker is when the scene is still.
-		const float inMean = p.Measure(p.sharedIn12.get(), p.inputFormat,
-			D3D12_RESOURCE_STATE_COMMON, &badIn, &deltaIn);
-		const float netMean = p.Measure(p.net.get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
-			kStateShaderRead, &badNet);
-		const float outMean = p.Measure(p.sharedOut12.get(), p.outputFormat,
-			D3D12_RESOURCE_STATE_COMMON, &badOut, &deltaOut);
-		Logger::Get().Info(fmt::format(
-			"DLSSNR AMD series {:2d}: in {:.4f}(bad {}) net {:.4f}(bad {}) "
-			"out {:.4f}(bad {}) | frame-to-frame: in {:.5f} out {:.5f}",
-			n, inMean, badIn, netMean, badNet, outMean, badOut, deltaIn, deltaOut));
-	}
 
 	// ---- where the frame went ----
 	// Averaged over a window and printed at the optical-flow provider's cadence, so the two
@@ -3068,8 +4963,22 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			std::max(0.0, (span - double(p.phaseAccum[6]) * msPerFrame)
 				/ double(p.phaseFrames)),
 			p.phaseAccum[6] * msPerFrame));
+		// What the composite stage is made of. Two of the five are blocking waits on the
+		// CPU, and the stage total cannot say which.
+		const double compTotal = double(p.compositeAccum[0] + p.compositeAccum[1] +
+			p.compositeAccum[2] + p.compositeAccum[3] + p.compositeAccum[4]) * msPerFrame;
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD composite over {} frames: out-wait {:.2f} + temporal {:.2f} + "
+			"resolve {:.2f} + submit {:.2f} + drain {:.2f} = {:.2f} ms/frame",
+			p.phaseFrames,
+			double(p.compositeAccum[0]) * msPerFrame, double(p.compositeAccum[1]) * msPerFrame,
+			double(p.compositeAccum[2]) * msPerFrame, double(p.compositeAccum[3]) * msPerFrame,
+			double(p.compositeAccum[4]) * msPerFrame, compTotal));
 		for (int i = 0; i < 7; ++i) {
 			p.phaseAccum[i] = 0;
+		}
+		for (int i = 0; i < 5; ++i) {
+			p.compositeAccum[i] = 0;
 		}
 		p.phaseFrames = 0;
 		p.phaseWindowStart = phaseAt[6];

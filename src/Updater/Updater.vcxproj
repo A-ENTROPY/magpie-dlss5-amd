@@ -40,6 +40,8 @@
   <ItemGroup>
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
+      <!-- 4459: fmt 12.1 的 base.h 在 Release 的 /W4 /WX 下会报“隐藏全局声明”。 -->
+      <DisableSpecificWarnings>4459;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <ClCompile Include="main.cpp" />
   </ItemGroup>

@@ -231,6 +231,18 @@ static int ReadIntegralEffectParameter(
 ) noexcept {
 	const auto it = effect.parameters.find(std::string(parameterName));
 	if (it == effect.parameters.end()) {
+		// What the effect actually carries, said once, because "the parameter is not there"
+		// and "the parameter is there with the wrong value" need different answers and the
+		// log otherwise cannot tell them apart.
+		if (effect.name.ends_with("XeSS_FrameGeneration")) {
+			std::string have;
+			for (const auto& [key, value] : effect.parameters) {
+				have += key + "=" + std::to_string(value) + " ";
+			}
+			Logger::Get().Warn(fmt::format(
+				"Effect parameters for '{}': asked '{}' (absent), carries [{}]",
+				effect.name, parameterName, have));
+		}
 		return fallback;
 	}
 
@@ -375,7 +387,7 @@ ScalingError Renderer::Initialize(HWND hwndAttach, OverlayOptions& overlayOption
 			ClassifyFrameGenerationEffect(effect.name);
 		if (kind != FrameGenerationEffectKind::None) {
 			_configuredFrameGenerationMultiplier = kind == FrameGenerationEffectKind::XeSSX2 ? 2u :
-				static_cast<uint32_t>(ReadIntegralEffectParameter(effect, "multiplier", 2, 4,
+				static_cast<uint32_t>(ReadIntegralEffectParameter(effect, "multiplier", 2, 6,
 					2));
 		}
 		if (kind != FrameGenerationEffectKind::XeSSX2 &&
@@ -388,7 +400,7 @@ ScalingError Renderer::Initialize(HWND hwndAttach, OverlayOptions& overlayOption
 		_xessFrameGenerationKind = kind;
 		xessFrameGenerationMultiplier = *xessVariant == XeSSFGVariant::X2 ? 2u :
 			static_cast<uint32_t>(ReadIntegralEffectParameter(
-				effect, "multiplier", 2, 4, 2));
+				effect, "multiplier", 2, 6, 2));
 		const int method = ReadIntegralEffectParameter(
 			effect, "opticalFlowMethod", 0,
 			2, 1);

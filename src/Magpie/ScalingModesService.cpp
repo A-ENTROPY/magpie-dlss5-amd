@@ -455,7 +455,7 @@ static V065NormalizationStats NormalizeV065ScalingModes(
 						stats.migratedXeSSMfgSettings);
 					normalizeChoice(L"amdOpticalFlowMode", 0, 1, 1,
 						stats.migratedMotionVectorChoices);
-					normalizeChoice(L"multiplier", 2, 4, 3,
+					normalizeChoice(L"multiplier", 2, 6, 3,
 						stats.migratedXeSSMfgSettings);
 					stats.removedXeSSMfgNvidiaParameters +=
 						static_cast<uint32_t>(effect.parameters.erase(

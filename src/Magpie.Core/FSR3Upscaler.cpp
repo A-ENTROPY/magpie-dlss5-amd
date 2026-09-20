@@ -99,9 +99,7 @@ static bool IsAddressInExecutableSection(
 	return false;
 }
 
-// FSR 4.1.1 contains a dedicated INT8 provider but hides it when IsSupported
-// rejects the real adapter. Patch only that provider's virtual support check in
-// this process. This avoids changing the system adapter identity or other apps.
+
 static bool ForceFsr4Int8ProviderSupport(HMODULE module) noexcept {
 	if (!module) return false;
 	uint8_t* base = reinterpret_cast<uint8_t*>(module);
@@ -347,10 +345,17 @@ bool FSR3Upscaler::Initialize(
 	const float zero[4]{};
 	const float one[4]{ impl->hdrProtocol.exposure, impl->hdrProtocol.exposure,
 		impl->hdrProtocol.exposure, impl->hdrProtocol.exposure };
+	// FSR 4 is told there are no reactive objects, which is the truth: nothing in this chain
+	// knows where they are. The field is the alpha of objects whose history has to be thrown
+	// away, so a constant here is a statement about every pixel at once -- and the constants
+	// that stood here, 0.8 and 1.0, said that every pixel was one of them. That switches off
+	// the temporal accumulation the algorithm is built on, and what is left is a spatial
+	// scaler; which is what "the picture looks pixelated" was. Disocclusion driven by the
+	// motion vectors is what decides where history is really unusable, and FSR 4 does that
+	// itself when it is not told otherwise.
+	const float reactiveFsr4None[4]{};
 	const float reactive02[4]{ 0.2f, 0.2f, 0.2f, 0.2f };
-	const float reactiveFsr4OpticalFlow[4]{ 0.8f, 0.8f, 0.8f, 0.8f };
 	const float reactive08[4]{ 0.8f, 0.8f, 0.8f, 0.8f };
-	const float reactiveFsr4ZeroMv[4]{ 1.0f, 1.0f, 1.0f, 1.0f };
 	auto addAux = [&](DXGI_FORMAT format, uint32_t width, uint32_t height,
 		winrt::com_ptr<ID3D12Resource>& texture, const float value[4]) -> bool {
 		if (!CreateAuxTexture(*impl, format, width, height, texture, cpu, gpu, value,
@@ -363,7 +368,7 @@ bool FSR3Upscaler::Initialize(
 	if (!addAux(DXGI_FORMAT_R32_FLOAT, inputDesc.Width, inputDesc.Height, impl->flatDepth12, zero) ||
 		!addAux(DXGI_FORMAT_R32_FLOAT, 1, 1, impl->exposure12, one) ||
 		!addAux(DXGI_FORMAT_R8_UNORM, inputDesc.Width, inputDesc.Height, impl->reactive12,
-			useFsr4 ? (enableOpticalFlow ? reactiveFsr4OpticalFlow : reactiveFsr4ZeroMv) :
+			useFsr4 ? reactiveFsr4None :
 				(enableOpticalFlow ? reactive02 : reactive08)) ||
 		!addAux(DXGI_FORMAT_R8_UNORM, inputDesc.Width, inputDesc.Height, impl->transparency12, zero)) {
 		return false;
@@ -433,18 +438,28 @@ bool FSR3Upscaler::Initialize(
 	rc = impl->query(nullptr, &versionQuery.header);
 	if (rc != FFX_API_RETURN_OK) return false;
 	uint64_t selectedVersionId = 0;
+	const char* selectedVersionName = nullptr;
 	const char* requestedVersion = useFsr4 ? "4.1.1" : "3.1.5";
 	std::string availableVersions;
 	for (uint64_t i = 0; i < versionCount; ++i) {
 		const char* name = versionNames[i] ? versionNames[i] : "unknown";
 		if (!availableVersions.empty()) availableVersions += ", ";
 		availableVersions += name;
-		if (strstr(name, requestedVersion)) selectedVersionId = versionIds[i];
+		if (strstr(name, requestedVersion)) {
+			selectedVersionId = versionIds[i];
+			selectedVersionName = name;
+		}
 	}
 	if (!selectedVersionId) {
 		Logger::Get().Error(fmt::format("{} provider not found; available: {}", upscalerName, availableVersions));
 		return false;
 	}
+	// Which provider is actually being asked for, and which ones were on offer. The version
+	// query returns every provider every loaded FFX DLL has, and one whose name is not what
+	// was asked for means the upscaler running is not the upscaler named -- the failure the
+	// FSR 4 port is most prone to and the one a log like this is the only way to see.
+	Logger::Get().Info(fmt::format("{}: selected provider \"{}\" of [{}]",
+		upscalerName, selectedVersionName, availableVersions));
 
 	impl->createDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
 	impl->createDesc.flags =
@@ -547,13 +562,29 @@ bool FSR3Upscaler::Draw(const NativeEffectDrawContext& drawContext) noexcept {
 	desc.transparencyAndComposition = ffxApiGetResourceDX12(
 		impl.transparency12.get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
 	desc.output = ffxApiGetResourceDX12(impl.sharedOutput12.get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-	desc.jitterOffset = { 0.0f, 0.0f };
+	// Where this frame's colour was sampled. The caller sets it; left at zero by every caller
+	// that hands over a frame sampled at the pixel centre, which is all of them but the
+	// reconstruction route.
+	desc.jitterOffset = { _jitterX, _jitterY };
 	desc.motionVectorScale = { 1.0f, 1.0f };
 	desc.renderSize = { impl.inputWidth, impl.inputHeight };
 	desc.upscaleSize = { impl.outputWidth, impl.outputHeight };
 	desc.enableSharpening = true;
 	desc.sharpness = 0.2f;
-	desc.frameTimeDelta = 16.6667f;
+	// How long this frame took, measured rather than assumed. The API wants milliseconds and
+	// the temporal accumulation is weighted by it.
+	{
+		const auto now = std::chrono::steady_clock::now();
+		if (_lastDispatch.time_since_epoch().count() != 0) {
+			const double elapsed = std::chrono::duration<double, std::milli>(
+				now - _lastDispatch).count();
+			// Clamped: a paused game or a hitch is not a frame time, and the API rejects
+			// anything below a millisecond.
+			_frameDeltaMs = static_cast<float>(std::clamp(elapsed, 1.0, 1000.0));
+		}
+		_lastDispatch = now;
+	}
+	desc.frameTimeDelta = _frameDeltaMs;
 	desc.preExposure = impl.hdrProtocol.preExposure;
 	desc.reset = impl.resetHistory;
 	desc.cameraNear = 1.0f;

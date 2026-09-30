@@ -9,7 +9,7 @@ Magpie Experimental 是面向 Windows 的窗口画面处理工具，也是 [Blin
 
 ## AMD RDNA3 适配版（Radeon RX 7900 XTX）
 
-本分支为 DLSSNR 效果增加了 **AMD 后端**，让 DLSS Neural Rendering 能在 AMD Radeon 显卡上运行，不再必须依赖 NVIDIA RTX。开发与实测都基于 **Radeon RX 7900 XTX（gfx1100，RDNA3）**，并已在《赛博朋克 2077》中确认生效。
+本分支为 DLSSNR 效果增加了 **AMD 后端**，让 DLSS Neural Rendering 能在 AMD Radeon 显卡上运行，不再必须依赖 NVIDIA RTX。开发与实测都基于 **Radeon RX 7900 XTX（gfx1100，RDNA3）**，并已在《赛博朋克 2077》中确认生效，最新的版本实现了1080p分辨率下大约33帧的可用水平。
 
 效果本身没有任何改动：仍然是 DLSSNR，仍然是同一个效果组、同一组参数。变的只是**由谁来执行**。在 NVIDIA 显卡上，它由 NVIDIA NGX 的 Feature 18 提供；在这里，只要 AMD runtime 就位，同一个效果名就改由一个 D3D12 + HIP 后端在 Radeon 上跑这个网络。
 
@@ -20,8 +20,9 @@ Magpie Experimental 是面向 Windows 的窗口画面处理工具，也是 [Blin
 **已知限制。**
 
 - **高渲染压力下效果会间歇性失效。** 引擎走 inline 模式，即同一帧内等待网络返回。当网络无法在引擎的 inline 等待窗口内完成时，该帧会被原样透传，效果就肉眼可见地掉一下。参考的 AMD 实现也有同样的表现。修掉它是本分支接下来的工作。
-- 在 7900 XTX 上，网络本身约 63–78 ms/帧（1080p），效果生效时帧率上限约 13 fps。
+- 在 7900 XTX 上，网络本身约 27-35 ms/帧（1080p），效果生效时帧率上限约 33 fps，但实际的硬件利用率应该还可以继续发掘。
 - 只实测过 RDNA3。runtime 里带有其他目标的 kernel，但本仓库未做任何验证。
+- 目前存在异常崩溃情况，在同时开启dlssnr与xefg四倍帧生成时可触发。
 
 **致谢。** AMD runtime 的驱动契约——偏移表、packet 布局、逐 pass 状态——是从 [OptiScaler](https://github.com/optiscaler) 的 PreSR-Multipass AMD 路径中读出的，那是该接口的权威描述。runtime 与权重来自 DLSS-NR-on-AMD 项目。本分支是独立的互操作尝试，与 NVIDIA、AMD 以及上述项目均无隶属关系。
 

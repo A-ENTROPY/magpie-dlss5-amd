@@ -112,9 +112,21 @@ ColorDescription GraphicsCaptureFrameSource::_GetSourceColorDescription() const 
 	return result;
 }
 
+// TEMPORARY DIAGNOSTIC for the XeSS-FG re-entry hang. Remove once it has an answer.
+// Same shape as the marker in Renderer.cpp: written and flushed immediately, so it survives a
+// freeze. The hang is somewhere in these two calls, and these say which.
+static void CaptureStep(const char* what) noexcept {
+	Logger::Get().Info(fmt::format("STEP {}", what));
+	Logger::Get().Flush();
+}
+
 bool GraphicsCaptureFrameSource::Start() noexcept {
+	CaptureStep("capture-start: entering");
 	_DisableRoundCornerInWin11();
-	return _StartCapture("initial start");
+	CaptureStep("capture-start: corners done");
+	const bool started = _StartCapture("initial start");
+	CaptureStep(started ? "capture-start: ok" : "capture-start: failed");
+	return started;
 }
 
 FrameSourceState GraphicsCaptureFrameSource::_Update() noexcept {

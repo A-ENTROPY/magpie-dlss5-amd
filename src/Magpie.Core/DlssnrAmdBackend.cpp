@@ -38,73 +38,161 @@ namespace {
 // rather than inferred, and they are valid for exactly one binary -- the one the hash
 // below names. A wrong offset does not fail, it jumps into nothing.
 //
-//   base + 0x12380   bool(void* ctx, const std::string* weights)   engine init
-//   base + 0xa0b0    void(Packet*)                                 record a job
-//   base + 0x4640    void(queue, n, lists)                         notify submitted
-//   base + 0x764d8   data                                          the ctx struct
+//   base + 0x1fe80   bool(void* ctx, const std::string* weights)   engine init
+//   base + 0x12640   void(Packet*)                                 record a job
+//   base + 0x9460    void(queue, n, lists)                         notify submitted
 // ---------------------------------------------------------------------------
-constexpr uintptr_t kRvaDevice = 0x96f68;
-constexpr uintptr_t kRvaQueue = 0x96f70;
-constexpr uintptr_t kRvaInitCtx = 0x96f78;
-constexpr uintptr_t kRvaHipDevice = 0x97c30;
-constexpr uintptr_t kRvaInlineMode = 0x977a0;
+// One build is supported, and the table stays a table anyway: the offsets are derived, not
+// read from source, so they need a place to live that is not a scatter of constants through
+// the file with no statement of which build they describe.
+//
+// It is danielblnc 0.5.0 and nothing else. Earlier builds are retired rather than kept
+// alongside: 0.5.0 is the first whose register-resident kernels are compiled for gfx1100 at
+// all (see kOffsets050 below), it measured 82 ms -> 27 ms of network time on this card, and
+// carrying the old columns would mean carrying the old kernel-substitution machinery with
+// them, which is tied to their exact addresses and is now redundant.
+//
+// IdentifyRuntime still tells builds apart by SHA-256 rather than trusting a filename,
+// because handing these offsets to a different layout does not fail -- it jumps into
+// nothing. A runtime that is not 0.5.0 is refused with a message naming what it found.
+struct RuntimeOffsets {
+    uintptr_t init, record, notify;
+    uintptr_t device, queue, initCtx, hipDevice;
+    uintptr_t inlineMode, interop, enabled, useFsrInputs, useDepth, tonemap;
+    uintptr_t initDone, history, wantHistory, perPassFlag;
+    uintptr_t depthInverted, depthExplicit;
+    uintptr_t localTone, localStructure, skinStructure, charMask, toneChannels;
+    uintptr_t jobCounter, statusFlag, syncCounter, trampoline, watchdog, pendingList;
+};
+
+// The runtime calls what `trampoline` points at to hand work over. Every installation the
+// reference supports points it at a no-op, because the submission is done by whoever drives
+// the queue -- here, that is this backend calling Notify. Left unfilled it is a null pointer
+// the runtime will call.
+// danielblnc 0.5.0. The build this backend exists for.
+//
+// "Up to 207% performance improvement over v0.4.3" on RX 7000, per its own release notes,
+// and that number is real here: measured 82.2-83.0 ms of network time at 1920x1080 on an
+// RX 7900 XTX before, 27.4-27.7 ms after. It is an RDNA3 change and only an RDNA3 change --
+// RX 9000 got 5% in the same release. 0.5.0's gfx1100 code object is 7,852,736 B against
+// 0.4.3's 1,270,096, and of the 98 `k_reg_*` kernels 0.4.3 shipped, 96 were 52-byte
+// `s_sethalt 5` stubs while 0.5.0's 111 have a median size of 84,548 B. The Fast path
+// reaches RDNA3 by expanding E4M3 to F16 with packed 16-bit integer ops and running the
+// matmuls on gfx11's F16 matrix units -- `k_reg_swin32<32,false>` carries 152
+// `v_wmma_f32_16x16x16_f16`, 567/464/176 `v_pk_{add,mul,fma}_f16` and 528/312/248
+// `v_pk_{add_u16,lshrrev_b16,min_u16}`, with no `cvt_pk_fp8` (gfx12-only) and no `s_trap`.
+//
+// Derived as follows, twice over, because a wrong offset here jumps into nothing rather
+// than failing. The three function entries are unique 32-byte prologue hits. The 27 data
+// fields are NOT a constant delta away: .data grew by exactly 0x40 bytes of virtual size
+// and the shift is a staircase (0x5000/0x5008/0x5018/0x5020/0x5028/0x5038/0x503c/0x5040),
+// which is what insertions look like. Two independent methods agree on all 27:
+// tools/derive_050_offsets.py aligns each paired function's .data reference list and samples
+// 358 old addresses, every field landing within one byte of a sample carrying a single
+// undisputed delta; and the project's own tools/pair_globals.py matches on the instruction
+// context around each reference, scoring 0.61-0.93 with a clear margin over the runner-up.
+// Weights are unchanged: dlssnr_on_amd_weights.bin is 6bf8dc93... as it was for 0.3.0.
+constexpr RuntimeOffsets kOffsets050{
+    0x29870, 0x15640, 0xa000,
+    0xb5c18, 0xb5c20, 0xb5c30, 0xb6ae8,
+    0xb65d0, 0xb6828, 0xb69c4, 0xb69c6, 0xb69c7, 0xb69c8,
+    0xb60c8, 0xb5d88, 0xb5d90, 0xb69c5,
+    0xb69b8, 0xb69bc,
+    0xb69d8, 0xb69dc, 0xb69e0, 0xb69e8, 0xb69ec,
+    0xb6914, 0xb60ca, 0xb6604, 0xb6b88, 0xb6634, 0xb6908,
+};
+
 // How many frames may be in flight through the engine at once.
 //
-// Two, and the reason is the runtime's own: with inline handshaking off it reports
+// Four, and the reason is the runtime's own: with inline handshaking off it reports
 // "mode async (residual from an earlier frame)" and returns before its work is done, so the
 // frame being recorded and the frame being read cannot be the same one. One surface means the
 // second frame overwrites the first while the engine is still reading it, and the picture
-// comes back black. Two is the least that lets the engine work while the picture is built.
-// Four, not two. The engine takes about three times a frame here, so with two slots the
-// composite can never find one that has already retired and every frame waits out an entire
-// engine job -- the frame time becomes the engine's, with its variance on top. Four covers
-// that ratio with room, which is what the reference's own slot count (1-5, default 3) is for.
+// comes back black.
+//
+// The engine takes about three times a frame here, so with two slots the composite can never
+// find one that has already retired and every frame waits out an entire engine job -- the
+// frame time becomes the engine's, with its variance on top. Four covers that ratio with room,
+// which is what the reference's own slot count (1-5, default 3) is for.
 constexpr uint32_t kSlots = 4;
-constexpr uintptr_t kRvaInterop = 0x97984;
-constexpr uintptr_t kRvaEnabled = 0x97b1c;
-constexpr uintptr_t kRvaUseFsrInputs = 0x97b1e;
-constexpr uintptr_t kRvaUseDepth = 0x97b1f;
-constexpr uintptr_t kRvaTonemap = 0x97b20;
-constexpr uintptr_t kRvaInitDone = 0x97298;
-constexpr uintptr_t kRvaHistory = 0x97090;
-constexpr uintptr_t kRvaWantHistory = 0x97098;
-constexpr uintptr_t kRvaPerPassFlag = 0x97b1d;
-constexpr uintptr_t kRvaDepthInverted = 0x97b10;
-constexpr uintptr_t kRvaDepthExplicit = 0x97b14;
-constexpr uintptr_t kRvaLocalTone = 0x97b30;
-constexpr uintptr_t kRvaLocalStructure = 0x97b34;
-constexpr uintptr_t kRvaSkinStructure = 0x97b38;
-constexpr uintptr_t kRvaCharMask = 0x97b40;
-constexpr uintptr_t kRvaToneChannels = 0x97b44;
-constexpr uintptr_t kRvaJobCounter = 0x97a6c;
-constexpr uintptr_t kRvaStatusFlag = 0x9729a;
-constexpr uintptr_t kRvaSyncCounter = 0x977d4;
 
-constexpr uintptr_t kRvaInit = 0x1fe80;
-constexpr uintptr_t kRvaRecord = 0x12640;
-constexpr uintptr_t kRvaNotify = 0x9460;
-// The runtime calls this to hand work over. Every installation the reference supports points
-// it at a no-op, because the submission is done by whoever drives the queue -- here, that is
-// this backend calling Notify. Left unfilled it is a null pointer the runtime will call.
-constexpr uintptr_t kRvaTrampoline = 0x97c70;
-// The runtime's spin allowance for one job. The reference scales it with the pixel count and
-// clamps it between these same bounds, which are its own.
-constexpr uintptr_t kRvaWatchdog = 0x97804;
-// The list the runtime recorded into, handed to Notify and cleared by it. The reference calls
-// this "the publication contract": a submission is published when this is consumed, which is
-// what there is to wait on when the runtime is not itself waiting on anything.
-constexpr uintptr_t kRvaPendingList = 0x97a60;
+// How long a teardown will wait for the engine to publish its last job and for this queue to
+// retire it. An engine job is twenty to thirty milliseconds, so this is two orders of magnitude
+// of headroom; it is a bound on a hang, not a budget for normal work.
+constexpr uint64_t kDrainDeadlineMs = 2000;
 
-// sha256 of the build these offsets belong to. Anything else is refused rather than
-// attempted: the offsets point into a different layout and the failure mode is a jump
-// into nothing, not an error.
-// 0.3.0 (the version.dll the reference package ships), whose layout the constants below
-// describe. This was 0.2.14 -- 3c9ca13f... -- and every offset was that build's; the two
-// layouts share no addresses at all.
-constexpr uint8_t kRuntimeSha256[32] = {
-	0x83, 0x21, 0xca, 0xe7, 0x28, 0xd2, 0x8c, 0xb7, 0x63, 0x2d, 0x0d, 0x58, 0xd3, 0xd9,
-	0x13, 0xe9, 0x11, 0x32, 0xbf, 0x76, 0x45, 0xc1, 0x26, 0x50, 0x56, 0x98, 0xfb, 0xe4,
-	0xcd, 0x5a, 0x01, 0x38
+
+// The engine's substrate, for the life of the process.
+//
+// The runtime is loaded once and never unloaded -- ~Impl explains why -- so its engine is
+// process state. Everything the engine was initialised *against* has to be process state too,
+// and it was not: Magpie builds a backend per scaling session and destroys it when scaling
+// stops, so the D3D12 device, the command queue and the HIP device index were all rebuilt for
+// the second session and the engine re-initialised on top of the first one.
+//
+// That is measured, not inferred. In one Magpie process, the session that ran `engine bring-up
+// 1` carried 36 seconds of frames without a fault, and the session that ran `engine bring-up 2`
+// -- same process, same runtime instance -- faulted the GPU within six seconds and took the
+// machine down with a kernel bugcheck. The two differ in nothing else.
+//
+// So the first session that needs these creates them and every later one adopts them. Only the
+// size-dependent resources stay per session, and they already have their own lifetime
+// (CreateSized / DestroySized).
+struct EngineHost {
+	winrt::com_ptr<ID3D12Device> device;
+	winrt::com_ptr<ID3D12CommandQueue> queue;
+	// Taken from the queue's vtable while it still belongs to the driver. Re-deriving it in a
+	// later session would read it with the runtime already loaded, which is the one moment it
+	// cannot be read -- so it is captured once, here, and passed on.
+	void* executeOriginal = nullptr;
+	// The module and the offset table it was identified as. The runtime is never unloaded, so a
+	// later session has no reason to load it again: that would take the loader lock to bump a
+	// refcount on a module this process already holds, and re-read and re-hash 38 MB to reach
+	// the answer already here.
+	HMODULE runtime = nullptr;
+	const RuntimeOffsets* rva = nullptr;
+	// The runtime's init has run against the objects above. There is no second time.
+	bool started = false;
+};
+
+// Function-local so the order of namespace-scope initialisation cannot matter.
+inline EngineHost& Engine() noexcept {
+	static EngineHost host;
+	return host;
+}
+
+
+// SHA-256 of the one build these offsets belong to. Anything else is refused rather than
+// attempted: the offsets point into a different layout and the failure mode is a jump into
+// nothing, not an error.
+//
+// It is the stock 0.5.0 image, the same bytes the installer puts in the game folder, which
+// is 38,703,616 bytes and ships gfx1100/1101/1102/1200/1201 -- unpatched, deliberately.
+//
+// A patched build was shipped once and it does not work. The reasoning behind it looked sound
+// and was wrong, so it is recorded here rather than left in a commit message:
+// tools/patch_runtime_050.py neutralised the CreateThread that starts the thread installing the
+// runtime's five detours (the game's ExecuteCommandLists, both CreateSwapChain overloads, both
+// Presents), on the theory that the runtime driving itself and this backend driving it could not
+// both hold the wheel. With the patch in place the runtime loads, stages, warms up and passes
+// its inline flag check -- and then prints "apply UAV format 10" and stops. `first capture
+// submitted on a direct queue` never appears, no network job is ever run, and Magpie reports
+// MP-035 within seconds.
+//
+// The detour is not the runtime driving itself. It is how the runtime *gets a frame*: it hooks
+// the game's command list to find where its capture belongs. The backend drives the network; the
+// runtime's detour supplies its input. They are not competing for one wheel, and removing the
+// detour removes the input.
+
+// danielblnc 0.5.0. This is the build that matters for gfx1100: 0.4.3 and everything before
+// it could only run the slow Reference path here, because the register-resident kernels it
+// selected were `s_trap` stubs on RDNA3 (see kOffsets050 above). 0.4.3's own notes say as
+// much -- "RX 7000 always runs Reference" -- so its table is retired rather than kept
+// alongside this one.
+constexpr uint8_t kRuntimeSha256_050[32] = {
+	0xcd, 0xdf, 0xb0, 0x9e, 0x01, 0x93, 0x47, 0x95, 0x7b, 0xf7, 0xb9, 0x6c,
+	0x95, 0xc0, 0xe9, 0x00, 0xe8, 0xd3, 0x06, 0x2d, 0xfa, 0xed, 0x69, 0x7a,
+	0x8a, 0x96, 0xb0, 0xa0, 0x39, 0xae, 0xc3, 0x1a,
 };
 
 constexpr const wchar_t* kRuntimeName = L"dlssnr_amd_pass1.dll";
@@ -676,7 +764,8 @@ std::filesystem::path ExeDirectory() noexcept {
 
 
 
-bool HashMatches(const std::filesystem::path& file) noexcept {
+// Fills `out` with the file's SHA-256, or returns false when it cannot be read.
+bool RuntimeDigest(const std::filesystem::path& file, uint8_t out[32]) noexcept {
 	// Two small RAII wrappers rather than wil::unique_bcrypt_*: the WIL in use here does
 	// not provide those, and the lifetimes are one line each anyway.
 	struct AlgGuard {
@@ -725,7 +814,36 @@ bool HashMatches(const std::filesystem::path& file) noexcept {
 	if (BCryptFinishHash(hash.handle, digest, sizeof(digest), 0) < 0) {
 		return false;
 	}
-	return std::memcmp(digest, kRuntimeSha256, sizeof(digest)) == 0;
+	std::memcpy(out, digest, sizeof(digest));
+	return true;
+}
+
+// Returns the offset table for whichever build `file` is, or null when it is neither. The two
+// are told apart here rather than at the call site because this is the only place the whole
+// file is read anyway.
+const RuntimeOffsets* IdentifyRuntime(const std::filesystem::path& file) noexcept {
+	uint8_t digest[32]{};
+	if (!RuntimeDigest(file, digest)) {
+		return nullptr;
+	}
+	if (std::memcmp(digest, kRuntimeSha256_050, sizeof(digest)) == 0) {
+		return &kOffsets050;
+	}
+	// Name what was found instead, because "it did not work" is not actionable and the
+	// usual cause is a runtime from a different release sitting in the folder.
+	std::string hex;
+	hex.reserve(64);
+	for (uint8_t b : digest) {
+		hex += "0123456789abcdef"[b >> 4];
+		hex += "0123456789abcdef"[b & 0xf];
+	}
+	Logger::Get().Error(
+		"DLSSNR AMD: dlssnr_amd_pass1.dll is not the 0.5.0 build this backend carries offsets "
+		"for (sha256 " + hex + "). It is refused rather than guessed at -- these offsets into a "
+		"different layout jump into nothing. Earlier releases are retired: 0.5.0 is the first "
+		"whose register-resident kernels are compiled for gfx1100 at all, and it is about three "
+		"times faster here than anything before it.");
+	return nullptr;
 }
 
 // The runtime is called through raw addresses into someone else's image, so a fault is
@@ -1372,8 +1490,16 @@ struct DlssnrAmdBackend::Impl {
 	InitFn init = nullptr;
 	RecordFn record = nullptr;
 	NotifyFn notify = nullptr;
+	// Which build of the runtime `runtime` is. Identified from its hash at load time and used
+	// for every address taken into its image, so there is no path that reads it before it is
+	// set; LoadRuntime refuses the load when it cannot be identified.
+	const RuntimeOffsets* rva = nullptr;
 	bool ready = false;
 	bool failed = false;
+	// The engine is brought up once per process, like the runtime module it lives in and
+	// unlike every other resource this backend owns. Set at the end of InitEngine and never
+	// cleared, because nothing here tears the engine down. See the note there.
+	bool engineUp = false;
 	// The engine loads kernels and builds its pipeline on the first job or two, so
 	// the first frames legitimately take far longer than the steady state. A single
 	// slow frame is a frame to skip, not a reason to disable the effect for good.
@@ -1451,6 +1577,10 @@ struct DlssnrAmdBackend::Impl {
 	}
 
 	~Impl() {
+		// The session's history storage is about to be released with the members below, and the
+		// runtime is still holding a pointer to it. Said here, where the storage goes, rather
+		// than left to the next session's first submission -- see ForgetHistory.
+		ForgetHistory();
 		// The runtime stays loaded for the life of the process: it starts worker threads
 		// holding references into its own image, and unloading it under them is not
 		// something this backend can make safe.
@@ -1513,6 +1643,9 @@ struct DlssnrAmdBackend::Impl {
 	// Hands the engine's edited frame to it and lets it write the output.
 	bool RunReconstruction(const NativeEffectDrawContext& context) noexcept;
 	void DestroySized() noexcept;
+	// Tells the runtime that the history it was carrying is gone. Called where the storage
+	// actually goes away -- see the definition.
+	void ForgetHistory() noexcept;
 	// What actually reached the display, read back once. The route's whole claim is that the
 	// picture is display-referred -- that the shoulder and the encode happen before the
 	// reconstruction rather than after it, which is what the darker version of this route got
@@ -1529,45 +1662,63 @@ bool DlssnrAmdBackend::Impl::LoadRuntime() noexcept {
 		return true;
 	}
 
-	const auto dir = ExeDirectory();
-	const auto runtimePath = dir / kRuntimeName;
-	const auto weightsPath = dir / kWeightsName;
+	EngineHost& host = Engine();
+	if (host.runtime) {
+		// An earlier session in this process already loaded and identified the module. The
+		// runtime is never unloaded, so there is nothing to load: this only has to pick up the
+		// handle and the offsets.
+		//
+		// This is reached from Initialize on every session, which matters because that is where
+		// a session would stop with nothing more in the log. A dump taken from one of those had
+		// the loader's own path in KERNELBASE on the stack, entering the runtime's image, on the
+		// thread that was already inside it -- so re-entering the loader here, for a module this
+		// process holds and will hold until it exits, is worth not doing.
+		runtime = host.runtime;
+		rva = host.rva;
+	} else {
+		const auto dir = ExeDirectory();
+		const auto runtimePath = dir / kRuntimeName;
+		const auto weightsPath = dir / kWeightsName;
 
-	std::error_code ec;
-	if (!std::filesystem::exists(runtimePath, ec) ||
-		!std::filesystem::exists(weightsPath, ec)) {
-		return false;
-	}
-	if (!HashMatches(runtimePath)) {
-		Logger::Get().Error(
-			"DLSSNR AMD: dlssnr_amd_pass1.dll is not the build these offsets belong to; "
-			"refusing rather than guessing at offsets into a different layout");
-		return false;
-	}
-
-	// The engine reads this from DllMain, so it must exist first. It is left empty: every
-	// key that could go in it overrides a default that is already correct, and the
-	// working installation ships it at zero bytes.
-	const auto iniPath = dir / kIniName;
-	if (!std::filesystem::exists(iniPath, ec)) {
-		wil::unique_hfile ini(CreateFileW(iniPath.c_str(), GENERIC_WRITE, 0, nullptr,
-			CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-		if (!ini) {
+		std::error_code ec;
+		if (!std::filesystem::exists(runtimePath, ec) ||
+			!std::filesystem::exists(weightsPath, ec)) {
 			return false;
 		}
+		rva = IdentifyRuntime(runtimePath);
+		if (!rva) {
+			Logger::Get().Error(
+				"DLSSNR AMD: dlssnr_amd_pass1.dll is neither of the builds this backend carries "
+				"offsets for; refusing rather than guessing at offsets into a different layout");
+			return false;
+		}
+
+		// The engine reads this from DllMain, so it must exist first. It is left empty: every
+		// key that could go in it overrides a default that is already correct, and the
+		// working installation ships it at zero bytes.
+		const auto iniPath = dir / kIniName;
+		if (!std::filesystem::exists(iniPath, ec)) {
+			wil::unique_hfile ini(CreateFileW(iniPath.c_str(), GENERIC_WRITE, 0, nullptr,
+				CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+			if (!ini) {
+				return false;
+			}
+		}
+
+		runtime = LoadLibraryExW(runtimePath.c_str(), nullptr,
+			LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+		if (!runtime) {
+			Logger::Get().Error(fmt::format("DLSSNR AMD: LoadLibrary failed (error {})",
+				GetLastError()));
+			return false;
+		}
+		host.runtime = runtime;
+		host.rva = rva;
 	}
 
-	runtime = LoadLibraryExW(runtimePath.c_str(), nullptr,
-		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-	if (!runtime) {
-		Logger::Get().Error(fmt::format("DLSSNR AMD: LoadLibrary failed (error {})",
-			GetLastError()));
-		return false;
-	}
-
-	init = reinterpret_cast<InitFn>(reinterpret_cast<uintptr_t>(runtime) + kRvaInit);
-	record = reinterpret_cast<RecordFn>(reinterpret_cast<uintptr_t>(runtime) + kRvaRecord);
-	notify = reinterpret_cast<NotifyFn>(reinterpret_cast<uintptr_t>(runtime) + kRvaNotify);
+	init = reinterpret_cast<InitFn>(reinterpret_cast<uintptr_t>(runtime) + rva->init);
+	record = reinterpret_cast<RecordFn>(reinterpret_cast<uintptr_t>(runtime) + rva->record);
+	notify = reinterpret_cast<NotifyFn>(reinterpret_cast<uintptr_t>(runtime) + rva->notify);
 	return true;
 }
 
@@ -2919,6 +3070,30 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 #endif
 }
 
+// Tells the runtime to stop referring to the history it was carrying.
+//
+// The runtime holds a pointer to the last history it was given, and that storage is this
+// backend's and is released with the session. Clearing it used to happen lazily, from the first
+// SubmitEngineJob after the fact -- which leaves the runtime describing freed memory for as long
+// as it takes the next session to submit anything, and whatever drives it in that window (its
+// own worker finishing a job, a present, a frame generator's proxy Present) is reading and
+// writing storage that has already been handed back.
+//
+// That is the shape of the 20:00:53 run: session two set up cleanly, ran about twenty-five jobs,
+// and then the runtime's own HIP kernel faulted -- `device sync 719 (unspecified launch
+// failure)`, and the runtime's log says so itself. A kernel fault is what a stale pointer looks
+// like when the storage behind it has been recycled.
+//
+// Called where the storage goes away, so there is no window to be in.
+void DlssnrAmdBackend::Impl::ForgetHistory() noexcept {
+	if (!runtime || !rva) {
+		return;
+	}
+	At<uint8_t>(runtime, rva->wantHistory) = 0;
+	At<void*>(runtime, rva->history) = nullptr;
+	temporalValid = false;
+}
+
 void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	// Before the surfaces: the upscaler holds the shared texture it was given, and it has to
 	// let go of one that is about to be replaced.
@@ -2959,6 +3134,8 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 	}
 	outFence = 0;
 	resolved = nullptr;
+	// Before the storage is handed back, not after the next session has already started using it.
+	ForgetHistory();
 	for (int i = 0; i < 2; ++i) {
 		historyResidual[i] = nullptr;
 		historyGuide[i] = nullptr;
@@ -3130,6 +3307,52 @@ bool DlssnrAmdBackend::Impl::RunTemporal(const NativeEffectDrawContext& context)
 }
 
 bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath) noexcept {
+	// Initialise the engine once for the life of the process.
+	//
+	// The other three steps of the bring-up are already idempotent -- LoadRuntime returns
+	// early when `runtime` is set, CreateHip when `hipSet`, CreatePipeline when `root` -- and
+	// this one was not, so turning the effect off and on again called the runtime's init a
+	// second time while the first engine was still live: its worker threads still running,
+	// its device, queue and history still registered, because Impl's destructor deliberately
+	// unloads nothing. The second call is what crashed: the log from such a run ends with
+	//
+	//     its capture never landed (captured word 0): the game did not execute the command
+	//     list our capture was recorded into
+	//     FAULT: exception 0xc0000005 at amdhip64_7.dll + 0x3f496f
+	//
+	// followed by a driver reset. That is the queue the engine had already rebuilt being
+	// rebuilt again underneath it.
+	//
+	// Reusing the live engine is the right answer rather than resetting and re-initialising:
+	// the weights are the same, the device is Magpie's process-wide one, and the note below
+	// records that the engine holds device references for the life of the process -- it is
+	// not something this backend can take down and stand back up. Nothing it needs changes
+	// between one session and the next except the frame-sized surfaces, and those belong to
+	// CreateSized, which does run again.
+	if (engineUp) {
+		return true;
+	}
+
+	// The engine is process state, so a later session adopts it instead of initialising it
+	// again, and this is the branch that matters: measured, a second init in one process ran
+	// `engine bring-up 2` on a live engine and faulted the GPU within six seconds, while the
+	// same process's `engine bring-up 1` carried 36 seconds of frames without a fault.
+	//
+	// Everything below -- the adapter check, the field writes, the init call itself -- is the
+	// first session's work and must not happen twice.
+	//
+	// What adopting costs: the engine keeps the staging it built at that first init, and the
+	// guide flags below are read at staging time. Changing one of those needs Magpie restarted
+	// rather than the effect switched off and on. That is a real limitation, and it is worth
+	// far more than the bugcheck it replaces.
+	if (Engine().started) {
+		Logger::Get().Info(
+			"DLSSNR AMD: the engine is already up in this process; adopting it rather than "
+			"initialising a second time");
+		engineUp = true;
+		return true;
+	}
+
 	// Not captured here. The entry saved when the queue was created is the driver's; the one
 	// standing now is the runtime's hook, because its DLL was loaded before this function ran.
 	// Reported so the two can be told apart, since every submission this backend makes goes
@@ -3165,12 +3388,12 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// measured downstream of that write reads zero, which is the black screen.
 	//
 	// Left alone, the slot keeps whatever the runtime put there when it loaded.
-	// At<NotifyFn>(runtime, kRvaTrampoline) = &AlreadySubmitted;
-	At<ID3D12Device*>(runtime, kRvaDevice) = device12.get();
+	// At<NotifyFn>(runtime, rva->trampoline) = &AlreadySubmitted;
+	At<ID3D12Device*>(runtime, rva->device) = device12.get();
 	device12.get()->AddRef();
-	At<ID3D12CommandQueue*>(runtime, kRvaQueue) = queue.get();
+	At<ID3D12CommandQueue*>(runtime, rva->queue) = queue.get();
 	queue.get()->AddRef();
-	At<int>(runtime, kRvaHipDevice) = hipDevice;
+	At<int>(runtime, rva->hipDevice) = hipDevice;
 	// Which of these writes is the one. Everything below is a plain store at an address from the
 	// layout table, so the group that kills it names the field, and the field names the
 	// mechanism.
@@ -3202,20 +3425,20 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// zero the runtime falls back to "inputs readback, output upload; cpu staging" and every
 	// D3D12 submission still produces nothing, so interop is exonerated and the zero-copy path
 	// is kept, being both faster and what every working installation runs.
-	At<uint8_t>(runtime, kRvaInterop) = 1;
+	At<uint8_t>(runtime, rva->interop) = 1;
 	// -1 is what the reference passes: the tonemap is the engine's own choice rather than one
 	// of the fixed curves, which is what every working installation runs.
-	At<int>(runtime, kRvaTonemap) = -1;
+	At<int>(runtime, rva->tonemap) = -1;
 	// Inline is the mode the runtime ships and the one every working installation runs, but it
 	// depends on the driver letting a store from the queue be seen by the GPU-side wait, and
 	// the engine says so itself when it cannot: "Inline mode will time out on this driver".
 	// Pinned to 1 it is a black frame on such a driver with no way out from the ini, because
 	// this write lands after the runtime has read it. Left switchable so the fallback the
 	// engine names is reachable:   [DlssNrOnAmd]   Inline=0
-	At<uint8_t>(runtime, kRvaInlineMode) =
+	At<uint8_t>(runtime, rva->inlineMode) =
 		GetPrivateProfileIntW(L"DlssNrOnAmd", L"Inline", 1,
 			(ExeDirectory() / kIniName).c_str()) != 0 ? 1 : 0;
-	At<uint8_t>(runtime, kRvaEnabled) = 1;
+	At<uint8_t>(runtime, rva->enabled) = 1;
 	// Deliberately *not* written here: Interop, which belongs to dlssnr_on_amd.ini the way
 	// Tonemap does. An earlier version of this function still pinned it to 1 while the
 	// comment beside it claimed otherwise, so `Interop=0` in the file did nothing.
@@ -3231,9 +3454,9 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// per-pass block alone, the staging then read the ini default of 1, and every job since
 	// has carried a depth guide this backend has no source for -- fed from a zero-filled
 	// texture, and paid for on every frame.
-	At<uint8_t>(runtime, kRvaUseDepth) = settings.amdUseDepth ? 1 : 0;
-	At<uint8_t>(runtime, kRvaUseFsrInputs) = settings.amdUseFsrInputs ? 1 : 0;
-	At<uint8_t>(runtime, kRvaPerPassFlag) = settings.amdTemporal ? 1 : 0;
+	At<uint8_t>(runtime, rva->useDepth) = settings.amdUseDepth ? 1 : 0;
+	At<uint8_t>(runtime, rva->useFsrInputs) = settings.amdUseFsrInputs ? 1 : 0;
+	At<uint8_t>(runtime, rva->perPassFlag) = settings.amdTemporal ? 1 : 0;
 
 	// Deliberately *not* written: the tonemap mode at +0x76e20.
 	//
@@ -3265,16 +3488,34 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// CreateReconstruction, and this function -- so running the test on both sides of the init
 	// call narrows the window to the call itself and to nothing else.
 
+	// How many times this process has brought an engine up.
+	//
+	// The guard above stops a second init within one Impl, but the runtime is loaded once for
+	// the life of the process and never unloaded, while a re-enabled effect gets a new Impl
+	// (_ReleaseNgxConsumers clears the backend list) and so a fresh `engineUp`. The comment
+	// above says the second call is what crashed; the guard cannot span the case it is about.
+	//
+	// Counting is all this does. It changes no behaviour, and it is here so that the next log
+	// answers whether a crash happened on the first bring-up or on a later one, rather than the
+	// question being argued from the code a second time.
+	static uint32_t bringUps = 0;
+	++bringUps;
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD: engine bring-up {} in this process; the runtime instance at {:x} is about "
+		"to have its init called", bringUps, reinterpret_cast<uintptr_t>(runtime)));
+
 	const std::string weights = weightsPath.string();
 	if (!CallInit(init,
-		reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(runtime) + kRvaInitCtx),
+		reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(runtime) + rva->initCtx),
 		&weights)) {
 		Logger::Get().Error("DLSSNR AMD: engine initialisation failed");
 		return false;
 	}
 
 
-	At<uint8_t>(runtime, kRvaInitDone) = 1;
+	At<uint8_t>(runtime, rva->initDone) = 1;
+	Engine().started = true;
+	engineUp = true;
 	return true;
 }
 
@@ -3399,7 +3640,7 @@ bool DlssnrAmdBackend::Impl::WaitForEngine(uint32_t wanted, uint64_t deadlineMs)
 	// without giving up the processor at all, which is the common case.
 	const uint64_t deadline = GetTickCount64() + deadlineMs;
 	uint32_t spins = 0;
-	while (At<UINT>(runtime, kRvaSyncCounter) < wanted) {
+	while (At<UINT>(runtime, rva->syncCounter) < wanted) {
 		if (GetTickCount64() > deadline) {
 			return false;
 		}
@@ -3426,7 +3667,7 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 	// Not set-and-forget: the working implementation rewrites the whole block per pass.
 	// 0x76e1d is the engine's `Temporal` key as well as the per-pass flag the reference
 	// asserts; the control drives it directly.
-	At<uint8_t>(p.runtime, kRvaPerPassFlag) = p.settings.amdTemporal ? 1 : 0;
+	At<uint8_t>(p.runtime, p.rva->perPassFlag) = p.settings.amdTemporal ? 1 : 0;
 
 	// History is only meaningful while consecutive frames agree. The engine's own job
 	// counter cannot be the trigger, for the reason the reference gives: recreating staging
@@ -3438,8 +3679,8 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 		p.resetHistory = false;
 		// The carried residual describes a picture that is no longer here.
 		p.temporalValid = false;
-		At<uint8_t>(p.runtime, kRvaWantHistory) = 0;
-		At<void*>(p.runtime, kRvaHistory) = nullptr;
+		At<uint8_t>(p.runtime, p.rva->wantHistory) = 0;
+		At<void*>(p.runtime, p.rva->history) = nullptr;
 	}
 
 	// The engine's spin allowance for this frame, scaled with the pixels it is being asked to
@@ -3448,11 +3689,11 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 	// the reference scales it for exactly that reason.
 	if (p.netWidth && p.netHeight) {
 		const uint64_t allowance = 262144ull + (uint64_t(p.netWidth) * p.netHeight + 1) / 2;
-		At<UINT>(p.runtime, kRvaWatchdog) = static_cast<UINT>(allowance < 262144ull ? 262144ull :
+		At<UINT>(p.runtime, p.rva->watchdog) = static_cast<UINT>(allowance < 262144ull ? 262144ull :
 			(allowance > 2097152ull ? 2097152ull : allowance));
 	}
-	At<UINT>(p.runtime, kRvaDepthInverted) = 0;
-	At<uint8_t>(p.runtime, kRvaDepthExplicit) = 1;
+	At<UINT>(p.runtime, p.rva->depthInverted) = 0;
+	At<uint8_t>(p.runtime, p.rva->depthExplicit) = 1;
 	// These are the runtime's own defaults, and an attempt to drive them from Magpie's
 	// parameters had to be backed out of. Magpie's UI defaults are the *inverse* of the
 	// runtime's for two of the three: its localToneStrength defaults to 1 where the runtime
@@ -3500,15 +3741,15 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 		: p.settings.style == 2 ? std::max(1u, static_cast<UINT>(p.settings.amdToneChannels))
 		: static_cast<UINT>(std::clamp(p.settings.amdToneChannels, 0, 2));
 
-	At<float>(p.runtime, kRvaLocalTone) =
+	At<float>(p.runtime, p.rva->localTone) =
 		std::clamp(p.settings.localToneStrength, 0.0f, 2.0f);
 	const float engineStructure =
 		std::clamp(p.settings.localStructureStrength * styleDetail, 0.0f, 2.0f);
 	const float engineSkin =
 		std::clamp(p.settings.skinStructureStrength * styleSkin, 0.0f, 2.0f);
-	At<float>(p.runtime, kRvaLocalStructure) = engineStructure;
-	At<float>(p.runtime, kRvaSkinStructure) = engineSkin;
-	At<UINT>(p.runtime, kRvaToneChannels) = styleChannels;
+	At<float>(p.runtime, p.rva->localStructure) = engineStructure;
+	At<float>(p.runtime, p.rva->skinStructure) = engineSkin;
+	At<UINT>(p.runtime, p.rva->toneChannels) = styleChannels;
 	// The values the engine actually receives, so a style that is supposed to change them
 	// can be seen doing so rather than inferred.
 	if (p.settings.style != p.loggedStyle || p.settings.intensity != p.loggedIntensity) {
@@ -3519,9 +3760,9 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 			"toneChannels={} intensity={:.2f}", p.settings.style, engineStructure,
 			engineSkin, styleChannels, p.settings.intensity));
 	}
-	At<UINT>(p.runtime, kRvaCharMask) = p.settings.useAutoMask ? 1u : 0u;
-	At<uint8_t>(p.runtime, kRvaUseDepth) = p.settings.amdUseDepth ? 1 : 0;
-	At<uint8_t>(p.runtime, kRvaUseFsrInputs) = p.settings.amdUseFsrInputs ? 1 : 0;
+	At<UINT>(p.runtime, p.rva->charMask) = p.settings.useAutoMask ? 1u : 0u;
+	At<uint8_t>(p.runtime, p.rva->useDepth) = p.settings.amdUseDepth ? 1 : 0;
+	At<uint8_t>(p.runtime, p.rva->useFsrInputs) = p.settings.amdUseFsrInputs ? 1 : 0;
 	// Deliberately absent: the wait allowance at +0x76c44.
 	//
 	// The working implementation writes `262144 + pixels/2` into that field every pass, and
@@ -3607,7 +3848,7 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 	// No transitions here. The engine is handed shader-readable surfaces, exactly as the
 	// reference hands it shader-readable surfaces, and it deals with hazards itself.
 
-	if (!CallRecord(p.record, &packet) || At<uint8_t>(p.runtime, kRvaStatusFlag) != 0) {
+	if (!CallRecord(p.record, &packet) || At<uint8_t>(p.runtime, p.rva->statusFlag) != 0) {
 		p.failed = true;
 		Logger::Get().Error("DLSSNR AMD: the engine refused the frame");
 		return false;
@@ -3631,7 +3872,7 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 	// ("mode async"), and blocking would put the engine's cost back on the render thread,
 	// which is the whole thing the asynchronous mode buys. The wait happens where the result
 	// is needed, on the slot that holds it.
-	p.slotJob[p.slot] = At<UINT>(p.runtime, kRvaJobCounter);
+	p.slotJob[p.slot] = At<UINT>(p.runtime, p.rva->jobCounter);
 	p.slotState[p.slot].Record(GetTickCount64());
 	// What the runtime actually published, said once a frame for the first few: which job it
 	// thinks it was given, how far it says it has got, and whether it still holds the list.
@@ -3639,9 +3880,9 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 		Logger::Get().Info(fmt::format(
 			"DLSSNR AMD counters frame {}: jobId={} jobDone={} pending={} (slot {} job {})",
 			p.framesSeen,
-			At<UINT>(p.runtime, kRvaJobCounter),
-			At<UINT>(p.runtime, kRvaSyncCounter),
-			reinterpret_cast<uintptr_t>(At<void*>(p.runtime, kRvaPendingList)),
+			At<UINT>(p.runtime, p.rva->jobCounter),
+			At<UINT>(p.runtime, p.rva->syncCounter),
+			reinterpret_cast<uintptr_t>(At<void*>(p.runtime, p.rva->pendingList)),
 			p.slot, p.slotJob[p.slot]));
 	}
 	++p.framesSeen;
@@ -3810,16 +4051,72 @@ bool DlssnrAmdBackend::Initialize(
 		return false;
 	}
 
-	p.device12.attach(CreateDeviceOnAdapter(p.device11));
-	if (!p.device12) {
-		Logger::Get().Error("DLSSNR AMD: no D3D12 device on the render adapter");
-		return false;
+	// The engine's device and queue come from the process, not from this session. The first
+	// session creates them; every session after that adopts them, because the runtime is never
+	// unloaded and its engine holds pointers into them. See EngineHost.
+	EngineHost& host = Engine();
+	if (host.device) {
+		const LUID engineLuid = host.device->GetAdapterLuid();
+		LUID here{};
+		bool hereKnown = false;
+		{
+			winrt::com_ptr<IDXGIDevice> dxgi;
+			winrt::com_ptr<IDXGIAdapter> adapter;
+			DXGI_ADAPTER_DESC d{};
+			if (SUCCEEDED(p.device11->QueryInterface(IID_PPV_ARGS(dxgi.put()))) &&
+				SUCCEEDED(dxgi->GetAdapter(adapter.put())) &&
+				SUCCEEDED(adapter->GetDesc(&d))) {
+				here = d.AdapterLuid;
+				hereKnown = true;
+			}
+		}
+		// This session's shared textures are made on its D3D11 device and read by the engine on
+		// the device it was initialised on. Different cards means memory the engine cannot
+		// reach, and the engine cannot be moved -- so the session does not start.
+		if (hereKnown && std::memcmp(&here, &engineLuid, sizeof(LUID)) != 0) {
+			Logger::Get().Error(fmt::format(
+				"DLSSNR AMD: this session renders on adapter {:08x}:{:08x} but the engine was "
+				"initialised on {:08x}:{:08x}; it cannot move between cards, so the effect will "
+				"not start until Magpie is restarted",
+				static_cast<uint32_t>(here.HighPart), static_cast<uint32_t>(here.LowPart),
+				static_cast<uint32_t>(engineLuid.HighPart),
+				static_cast<uint32_t>(engineLuid.LowPart)));
+			return false;
+		}
+		// A removed device fails every call that follows, so it is refused in one place rather
+		// than reported from inside a frame. The engine cannot be rebuilt on a replacement
+		// either -- that is the re-initialisation this whole mechanism exists to avoid -- so a
+		// restart of Magpie is the only way back.
+		const HRESULT removed = host.device->GetDeviceRemovedReason();
+		if (FAILED(removed)) {
+			Logger::Get().Error(fmt::format(
+				"DLSSNR AMD: the engine's device was removed (0x{:08x}); it cannot be rebuilt on "
+				"another one, so the effect will not start until Magpie is restarted",
+				static_cast<uint32_t>(removed)));
+			return false;
+		}
+		p.device12 = host.device;
+		p.queue = host.queue;
+		Logger::Get().Info(
+			"DLSSNR AMD: adopting the engine's device and queue from the first session in this "
+			"process; the engine is not re-initialised");
+	} else {
+		p.device12.attach(CreateDeviceOnAdapter(p.device11));
+		if (!p.device12) {
+			Logger::Get().Error("DLSSNR AMD: no D3D12 device on the render adapter");
+			return false;
+		}
+		D3D12_COMMAND_QUEUE_DESC qd{};
+		qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		if (FAILED(p.device12->CreateCommandQueue(&qd, IID_PPV_ARGS(p.queue.put())))) {
+			Logger::Get().Error("DLSSNR AMD: could not create the engine's command queue");
+			return false;
+		}
+		host.device = p.device12;
+		host.queue = p.queue;
 	}
 
-	D3D12_COMMAND_QUEUE_DESC qd{};
-	qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-	if (FAILED(p.device12->CreateCommandQueue(&qd, IID_PPV_ARGS(p.queue.put()))) ||
-		FAILED(p.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+	if (FAILED(p.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
 			IID_PPV_ARGS(p.allocator.put()))) ||
 		FAILED(p.device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
 			p.allocator.get(), nullptr, IID_PPV_ARGS(p.list.put()))) ||
@@ -3848,11 +4145,21 @@ bool DlssnrAmdBackend::Initialize(
 	// still belongs to the driver, is the only way to have an entry that actually executes --
 	// and the reason it matters is that the runtime's own entry stops executing anything at all
 	// once this backend has written its device, queue and enabled flags into the module.
-	p.executeOriginal = reinterpret_cast<DlssnrAmdBackend::Impl::ExecuteFn>(
-		(*reinterpret_cast<void***>(p.queue.get()))[10]);
-	Logger::Get().Info(fmt::format(
-		"DLSSNR AMD: the queue's own ExecuteCommandLists is {:x} before the runtime loads",
-		reinterpret_cast<uintptr_t>(p.executeOriginal)));
+	//
+	// Taken once for the process, like the queue it comes from. A later session cannot re-derive
+	// it: by then the runtime is loaded, which is precisely the state it has to be read before.
+	if (host.executeOriginal) {
+		p.executeOriginal = reinterpret_cast<DlssnrAmdBackend::Impl::ExecuteFn>(
+			host.executeOriginal);
+	} else {
+		p.executeOriginal = reinterpret_cast<DlssnrAmdBackend::Impl::ExecuteFn>(
+			(*reinterpret_cast<void***>(p.queue.get()))[10]);
+		host.executeOriginal = reinterpret_cast<void*>(p.executeOriginal);
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: the queue's own ExecuteCommandLists is {:x}, taken before the runtime "
+			"loads and kept for the process",
+			reinterpret_cast<uintptr_t>(p.executeOriginal)));
+	}
 	// Record which adapter each side is on, once. Everything shared between them assumes the
 	// two are the same piece of hardware.
 	{
@@ -3924,7 +4231,25 @@ bool DlssnrAmdBackend::Initialize(
 		return false;
 	}
 
-	if (!p.LoadRuntime() || !p.CreateHip() || !p.CreatePipeline()) {
+	if (!p.LoadRuntime()) {
+		return false;
+	}
+
+	// The kernel-substitution drop-in (dlssnr_ours.dll) is retired, and deliberately not
+	// loaded even when the file is present.
+	//
+	// It worked by patching dlssnr_amd_pass1.dll's own HIP import slots and running this
+	// project's kernels in place of the runtime's. Every address it patches is a 0.4.x
+	// address, so against the 0.5.0 runtime it would rewrite slots that no longer mean what
+	// it thinks they mean -- and it does that at load time, before anything can check.
+	//
+	// It also no longer has anything to buy. It existed to work around the runtime's
+	// register-resident kernels being `s_trap` stubs on gfx1100; 0.5.0 compiles them, and
+	// measured 82 ms -> 27 ms of network time on this card, which is most of what the
+	// substitution was written to recover and it arrives without a single address this
+	// backend has to maintain.
+
+	if (!p.CreateHip() || !p.CreatePipeline()) {
 		return false;
 	}
 	if (!p.CreateSized(inputDesc.Width, inputDesc.Height,
@@ -4946,7 +5271,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	}
 	p.phaseAccum[6] += phaseAt[6] - phaseAt[0];
 	p.prevFrameId = context.frameId;
-	p.prevFrameJob = At<UINT>(p.runtime, kRvaJobCounter);
+	p.prevFrameJob = At<UINT>(p.runtime, p.rva->jobCounter);
 	p.prevFrameTotalMs = static_cast<float>(
 		double(phaseAt[6] - phaseAt[0]) * Impl::MsPerTick());
 	if (++p.phaseFrames >= 120) {
@@ -5006,8 +5331,68 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	return true;
 }
 
+// Magpie calls this before it lets go of the surfaces and before another session may start,
+// and it has to be a real quiescence point. Two things make the stub that used to be here
+// unsafe, and both end in a removed device rather than in a lost frame.
+//
+// The engine runs the network on its own worker, so a fence on this queue says nothing about
+// whether a kernel is still writing into a shared surface. And `~Impl` explains why the runtime
+// is never unloaded: it starts threads holding references into its own image. So anything this
+// backend leaves running keeps running into the next session, on the same runtime instance,
+// while the surfaces it was reading and writing have already been released. The symptom is
+// DXGI_ERROR_DEVICE_REMOVED (0x887A0005) on the first frames of the *second* session -- start,
+// stop, start -- which is exactly the sequence that was reported as reproducible.
+//
+// What this cannot do is stop the runtime driving itself: its own setup thread installs the
+// detours that put its work on the game's queue, and that thread is not ours to join. Tools
+// patch_runtime_050.py neutralises the call that starts it, which is the other half.
 bool DlssnrAmdBackend::Drain() noexcept {
-	return true;
+	auto& p = *_impl;
+	if (!p.ready || !p.runtime || !p.rva) {
+		return true;
+	}
+
+	// The engine's half. The highest job any slot was given is the last one to wait for;
+	// syncCounter is the counter the worker advances when it publishes a result, and it is the
+	// same quantity WaitForEngine polls inside the frame loop.
+	uint32_t lastJob = 0;
+	for (uint32_t k = 0; k < kSlots; ++k) {
+		if (p.slotJob[k] > lastJob) {
+			lastJob = p.slotJob[k];
+		}
+	}
+	bool quiesced = true;
+	if (lastJob && At<UINT>(p.runtime, p.rva->syncCounter) < lastJob) {
+		if (!p.WaitForEngine(lastJob, kDrainDeadlineMs)) {
+			// A frame that arrives late is already lost, so this is not fatal on its own --
+			// but it does mean the wait below is the only thing standing between a running
+			// kernel and a released surface, and the caller should know it happened.
+			Logger::Get().Warn(fmt::format(
+				"DLSSNR AMD: the engine did not publish job {} within {} ms while draining",
+				lastJob, kDrainDeadlineMs));
+			quiesced = false;
+		}
+	}
+
+	// This queue's half. The signal is taken after everything already submitted, so waiting on
+	// it is waiting for all of it.
+	if (p.fence) {
+		const uint64_t signal = ++p.fenceValue;
+		p.queue->Signal(p.fence.get(), signal);
+		if (p.fence->GetCompletedValue() < signal) {
+			p.fence->SetEventOnCompletion(signal, p.fenceEvent.get());
+			if (WaitForSingleObject(p.fenceEvent.get(), static_cast<DWORD>(kDrainDeadlineMs)) != WAIT_OBJECT_0) {
+				Logger::Get().Warn("DLSSNR AMD: this queue did not retire its work while draining");
+				quiesced = false;
+			}
+		}
+	}
+
+	// Now that both sides are idle, hand the slots back. RetireSubmission is the only thing
+	// that turns a recorded slot into a reusable one, and leaving them recorded would make the
+	// next session wait on fences that belong to the one being torn down.
+	p.RetireSubmission("drain");
+	return quiesced;
 }
 
 }

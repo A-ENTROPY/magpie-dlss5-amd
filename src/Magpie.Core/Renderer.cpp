@@ -312,6 +312,17 @@ Renderer::~Renderer() noexcept {
 	if (_frameTraceStarted) FrameTrace::Stop();
 }
 
+// TEMPORARY DIAGNOSTIC for the XeSS-FG re-entry hang. Remove once it has an answer.
+//
+// The window that hangs is 36 ms wide -- between "Frame Guidance AMD OF initialized" and
+// _DisableRoundCornerInWin11 -- and the last log line of the crashed run was cut off mid-write,
+// because spdlog buffers and _Log does not flush. A marker that is flushed the moment it is
+// written survives the freeze, so the next run names the call instead of ending in a half line.
+static void StepMarker(const char* what) noexcept {
+	Logger::Get().Info(fmt::format("STEP {}", what));
+	Logger::Get().Flush();
+}
+
 static DXGI_ADAPTER_DESC1 LogAdapter(IDXGIAdapter4* adapter) noexcept {
 	DXGI_ADAPTER_DESC1 desc;
 	if (FAILED(adapter->GetDesc1(&desc))) {
@@ -3195,6 +3206,66 @@ HANDLE Renderer::_InitBackend() noexcept {
 	}
 
 	if (guidanceRequirements.Any()) {
+		// Refuse the one combination measured to hang this machine's GPU.
+		//
+		// With XeSS frame generation asking AMD's optical flow for motion, the SECOND scaling
+		// session in one Magpie process hangs the GPU during the capture restart that follows
+		// the effect build. Measured in one process, two sessions, nothing else different:
+		//
+		//     17:20:15  session 1: AMD OF created at 16.848 and initialized at 16.879, then
+		//               _DisableRoundCornerInWin11, WGC interrupted, WGC restarted at 19.479.
+		//               35 seconds of frames, clean.
+		//     17:21:13  session 2: AMD OF created at 13.813, initialized at 13.845 -- the same
+		//               32 ms as session 1 -- and then nothing: no _DisableRoundCornerInWin11,
+		//               no WGC line, no frame. The log's last line is that one, cut off mid
+		//               write. The GPU is hung; Windows reports DXGI_ERROR_DEVICE_HUNG; the
+		//               watchdog fires and the machine bugchecks 0x119
+		//               VIDEO_SCHEDULER_INTERNAL_ERROR.
+		//
+		// The flow provider itself is exonerated, and this guard is placed before it only
+		// because that is early enough to stop the session: its Create() returns in the same
+		// 32 ms it takes in the session that works, and FidelityFX's optical flow component
+		// keeps no process-global mutable state (checked in its own source). What does not
+		// survive the session boundary is the capture path, not the effect.
+		//
+		// Both halves of the pair are needed and both were measured: the first session of a
+		// process is fine with frame generation, and later sessions are fine without it (three
+		// sessions, two off/on switches, no fault, at 17:03-17:05). So it is the pair that is
+		// refused, not the feature.
+		//
+		// What this does is decline to start a session that would reach that path: scaling stops
+		// with an error, Magpie stays up, and restarting Magpie clears it. Nothing in the
+		// avoided path is this project's own rendering code, and nothing else has been measured
+		// to work here.
+		//
+		// Set once a session has actually run the pair, so a session that failed earlier for an
+		// unrelated reason does not consume the allowance. Effect building happens on the
+		// render thread and one session at a time, so a plain static is enough here.
+		static bool xessAmdFlowHasRun = false;
+		bool xessAsksForAmdFlow = false;
+		for (size_t i = 0; i < _runtimeEffectOptions.size(); ++i) {
+			if (IsXeSSFrameGenerationEffect(_runtimeEffectOptions[i].name) &&
+				_xessMotionRequest.method == OpticalFlowMethod::Amd) {
+				xessAsksForAmdFlow = true;
+				break;
+			}
+		}
+		// The refusal is a stopgap for a mechanism that is not understood yet, so it can be
+		// lifted from the file the rest of this project's knobs live in. Absent or 0, it is on.
+		//   [DlssNrOnAmd]   AllowXeSSFGReentry=1
+		const bool allowReentry = GetPrivateProfileIntW(L"DlssNrOnAmd", L"AllowXeSSFGReentry", 0,
+			(Win32Helper::GetExePath().parent_path() / L"dlssnr_on_amd.ini").c_str()) != 0;
+		if (xessAsksForAmdFlow && xessAmdFlowHasRun && !allowReentry) {
+			Logger::Get().Error(
+				"XeSS frame generation with AMD optical flow has already run a scaling session "
+				"in this process, and starting a second one hangs the GPU on this machine. "
+				"Scaling is refused rather than attempted; restart Magpie to use it again.");
+			_backendInitError = ScalingError::OpticalFlowProviderUnavailable;
+			_backendInitContext =
+				"XeSS frame generation + AMD optical flow, second session in this process";
+			return NULL;
+		}
+
 		guidanceRequirements.ForEachMotion([&]([[maybe_unused]] MotionVectorRequest request) {
 #ifdef MP_ENABLE_NVIDIA_OPTICAL_FLOW
 			if (request.method == OpticalFlowMethod::Nvidia)
@@ -3237,6 +3308,12 @@ HANDLE Renderer::_InitBackend() noexcept {
 			}
 			return NULL;
 		}
+		// Reached only when the provider initialized, so this is the allowance being spent by a
+		// session that actually used it rather than by one that failed on the way.
+		if (xessAsksForAmdFlow) {
+			xessAmdFlowHasRun = true;
+		}
+		StepMarker("optical-flow-initialized");
 	}
 
 	HRESULT hr = d3dDevice->CreateFence(
@@ -3251,19 +3328,23 @@ HANDLE Renderer::_InitBackend() noexcept {
 		_backendInitSystemError = static_cast<uint32_t>(hr);
 		return NULL;
 	}
+	StepMarker("frontend-fence-created");
 
 	if (!_fenceEvent.try_create(wil::EventOptions::None, nullptr)) {
 		Logger::Get().Win32Error("CreateEvent 失败");
 		return NULL;
 	}
+	StepMarker("frontend-fence-event-created");
 
 	HANDLE sharedHandle = _CreateSharedTexture(outputTexture);
 	if (!sharedHandle) {
 		Logger::Get().Error("_CreateSharedTexture 失败");
 		return NULL;
 	}
+	StepMarker("shared-texture-created");
 
 	// 最后启动捕获以尽可能推迟显示黄色边框 (Win10) 或禁用圆角 (Win11)
+	StepMarker("capture-start-entering");
 	if (!_frameSource->Start()) {
 		Logger::Get().Error("启动捕获失败");
 		_backendInitError = ScalingError::CaptureFailed;

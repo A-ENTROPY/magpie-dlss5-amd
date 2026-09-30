@@ -9,7 +9,7 @@ The application captures a target window, processes its images through a user-co
 
 ## AMD RDNA3 Adaptation (Radeon RX 7900 XTX)
 
-This branch adds an **AMD backend for the DLSSNR effect**, so DLSS Neural Rendering runs on an AMD Radeon GPU instead of requiring an NVIDIA RTX card. It is developed and tested against a **Radeon RX 7900 XTX (gfx1100, RDNA3)**, and confirmed working in Cyberpunk 2077.
+This branch adds an **AMD backend for the DLSSNR effect**, so DLSS Neural Rendering runs on an AMD Radeon GPU instead of requiring an NVIDIA RTX card. It is developed and tested against a **Radeon RX 7900 XTX (gfx1100, RDNA3)**, and confirmed working in Cyberpunk 2077,and the latest version achieves a usable level of approximately 33 frames per second at 1080p resolution.
 
 Nothing about the effect changes: it is still DLSSNR, still the same effect group, still the same controls. What changes is who serves it. On NVIDIA hardware the effect is served by NVIDIA's NGX feature 18. Here, when the AMD runtime is present, the same effect name is served by a D3D12-and-HIP backend that runs the network on the Radeon.
 
@@ -20,8 +20,10 @@ Nothing about the effect changes: it is still DLSSNR, still the same effect grou
 **Known limitations.**
 
 - The effect is applied **intermittently under heavy rendering load**. The engine runs in inline mode, meaning a frame waits for the network on the same submission. When the network cannot finish inside the engine's inline wait window, that frame is passed through unprocessed and the effect visibly drops out. This matches what the reference AMD implementation does. Fixing it is the next piece of work on this branch.
-- The network itself costs roughly 63–78 ms per frame at 1080p on a 7900 XTX, which caps the frame rate around 13 fps while the effect is active.
+- On the 7900 XTX, the network itself takes roughly 27–35 ms per frame at 1080p. When the effect is active, the frame rate cap sits around 33 fps, though hardware utilization still has room for further optimization.
 - Only RDNA3 has been exercised. The runtime ships kernels for other targets, but nothing else has been tested here.
+- Spontaneous crashes currently exist and can be triggered when enabling both dlssnr and xefg 4x frame generation simultaneously.
+
 
 **Acknowledgements.** The driving contract for the AMD runtime — the offsets, the packet layout and the per-pass state — was read out of [OptiScaler](https://github.com/optiscaler)'s PreSR-Multipass AMD path, which is the authoritative description of that interface. The runtime and weights come from the DLSS-NR-on-AMD project. This branch is an independent interoperability effort and is not affiliated with NVIDIA, AMD or either of those projects.
 

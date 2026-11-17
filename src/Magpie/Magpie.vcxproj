@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Must be known before Microsoft.Cpp.Default.props resolves the toolset. The conan packages (zip, fmt) in the local cache are 14.44 objects; Magpie objects from any
+         other cl revision fail to link with C1047. Pin the toolset they were built with. -->
   <Import Project="..\..\packages\Microsoft.Windows.CppWinRT.3.0.260520.1\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('..\..\packages\Microsoft.Windows.CppWinRT.3.0.260520.1\build\native\Microsoft.Windows.CppWinRT.props')" />
   <Import Project="..\..\packages\Microsoft.UI.Xaml.2.8.7\build\native\Microsoft.UI.Xaml.props" Condition="Exists('..\..\packages\Microsoft.UI.Xaml.2.8.7\build\native\Microsoft.UI.Xaml.props')" />
   <PropertyGroup Label="Globals">
@@ -41,6 +43,9 @@
     <ConfigurationType>Application</ConfigurationType>
     <PlatformToolset Condition="$(VS17)">v143</PlatformToolset>
     <PlatformToolset Condition="!$(VS17)">v145</PlatformToolset>
+    <!-- The conan packages (zip, fmt) in the local cache are 14.44 objects; Magpie objects from any
+         other cl revision fail to link with C1047. Pin the toolset they were built with. -->
+
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
@@ -442,6 +447,20 @@
       <!-- 4459: fmt 12.1 的 base.h 里有个局部名 formattable 与 fmt 自己的全局名同名，Release 的 -->
       <!-- /W4 /WX 会把它当错误。这个头只在这里以非 PCH 方式编译一次，其它 .cpp 走 /Yu 不会重复报。 -->
       <DisableSpecificWarnings>4459;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <!-- This one file must not be compiled alongside the files that include it.
+           MSVC documents that /MP gives no ordering between a /Yc producer and its /Yu
+           consumers, and here the producer is expensive: pch.h expands to 1.5 GB of C++/WinRT
+           and XAML, so writing it takes long enough that a parallel reader reliably loses the
+           race and the build fails with "cannot open precompiled header file ... Permission
+           denied".
+
+           That one failed compile is what makes every build a full rebuild. A failed compile
+           does not record its outputs in CL.write.1.tlog, so the next build has no evidence
+           pch.pch was produced, treats it as stale, rebuilds it, and all 77 translation units
+           that include it follow: fifteen minutes to change a single .cpp.
+
+           Turning /MP off for this file alone keeps the other 78 compiling in parallel. -->
+      <MultiProcessorCompilation>false</MultiProcessorCompilation>
     </ClCompile>
     <ClCompile Include="App.cpp">
       <DependentUpon>App.xaml</DependentUpon>
@@ -755,7 +774,7 @@
     <Copy SourceFiles="$(DLSSSdkDir)\LICENSE.txt" DestinationFiles="$(OutDir)\NVIDIA-DLSS-LICENSE.txt" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\docs\licenses\NVIDIA-NVAPI.txt" DestinationFiles="$(OutDir)\NVIDIA-NVAPI-LICENSE.txt" SkipUnchangedFiles="true" />
   </Target>
-  <Target Name="CopyDLSSNRRuntime" AfterTargets="Build" Condition="$(EnableDLSSNR) And '$(Platform)' == 'x64'">
+  <Target Name="CopyDLSSNRRuntime" AfterTargets="Build" Condition="$(EnableDLSSNR) And '$(Platform)' == 'x64' And '$(DLSSNRRuntimeDir)' != ''">
     <Copy SourceFiles="$(DLSSNRRuntimeDir)\nvngx_dlssnr.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
   </Target>
   <Target Name="CopyFSR2ZeroMVRuntime" AfterTargets="Build" Condition="$(EnableFSR2ZeroMV) And '$(Platform)' == 'x64'">

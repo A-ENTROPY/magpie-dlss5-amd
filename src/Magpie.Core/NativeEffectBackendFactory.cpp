@@ -107,8 +107,7 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 		// endpoints. FP16 here confirms that decision, rather than classifying capture.
 		D3D11_TEXTURE2D_DESC endpoint{};
 		input->GetDesc(&endpoint);
-		const DLSSNRSettings settings = ParseDLSSNRSettings(option,
-			hdrEnabled && endpoint.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+		const bool nrHdr = hdrEnabled && endpoint.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 		// The NGX path this effect was written for exists only on NVIDIA hardware. When
 		// the AMD runtime is present the same effect name is served by a backend that
@@ -117,32 +116,27 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 		// device matching the render card, a runtime of the wrong build -- the NGX path
 		// runs exactly as before, so nothing changes on a machine that never had it.
 		if (DlssnrAmdBackend::IsAvailable()) {
-			// Upstream's anti-flicker setting, read the same way its own backend reads it. The
-			// AMD path has no optical flow, so anything non-zero lands on the static route.
-			const int antiFlicker = DLSSNRAntiFlickerMode(
-				[&](std::string_view name, float fallback) {
+			// Multi Pass is read inside the chain rather than here, so the count in the log below
+			// and the count the chain builds both come from the same parse.
+			//
+			// One layer and three are the same code with a different count. Each layer builds its
+			// own DlssnrAmdBackend, which adopts the process-wide engine on the second and later
+			// initialisations rather than trying to start a second one; each keeps its own
+			// surfaces, so the chain cost is the network run once per layer.
+			//
+			// The chain is built here rather than inside the backend so that a count of 1 follows
+			// exactly the path a count of 3 does -- a regression on the single layer would
+			// otherwise be invisible until someone asked for three.
+			auto amdChain = std::make_unique<DLSSNRMultiPass>();
+			if (amdChain->Initialize(resources, ngxCore, input, output, option, nrHdr)) {
+				const int layers = DLSSNRPassCount([&](std::string_view name, float fallback) {
 					const auto it = option.parameters.find(std::string(name));
 					return it == option.parameters.end() ? fallback : it->second;
 				});
-			// Multi Pass is the one control the AMD path does not serve. The reference chains two or
-			// three instances of the runtime, which means loading and initialising pass2 and pass3
-			// beside this one; this backend runs a single pass. Said out loud rather than left
-			// silent, because the control is visible in the interface and a 2 that quietly runs one
-			// pass is worse than one that says what it did.
-			{
-				const auto it = option.parameters.find("multiPass");
-				const int requested = it == option.parameters.end()
-					? 1 : static_cast<int>(std::lround(it->second));
-				if (requested > 1) {
-					Logger::Get().Warn(fmt::format(
-						"DLSSNR AMD: Multi Pass is set to {}; this backend runs one pass and "
-						"ignores the rest", requested));
-				}
-			}
-			auto amd = std::make_unique<DlssnrAmdBackend>();
-			if (amd->Initialize(resources, input, output, settings, antiFlicker)) {
-				Logger::Get().Info("DLSSNR: running on the AMD backend");
-				return { true, std::move(amd) };
+				Logger::Get().Info(fmt::format(
+					"DLSSNR: running on the AMD backend ({} layer{})",
+					layers, layers == 1 ? "" : "s"));
+				return { true, std::move(amdChain) };
 			}
 			Logger::Get().Warn("DLSSNR: AMD runtime present but unusable; trying NGX");
 		}
@@ -151,8 +145,7 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 		// than the single-pass filter this used to construct.
 		auto backend = std::make_unique<DLSSNRMultiPass>();
 		Logger::DiagnosticCapture diagnostic;
-		if (!backend->Initialize(resources, ngxCore, input, output, option,
-			hdrEnabled && endpoint.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+		if (!backend->Initialize(resources, ngxCore, input, output, option, nrHdr)) {
 			if (NgxRuntimeGuard::IsFaulted()) {
 				return { true, nullptr, ScalingError::NgxRestartRequired };
 			}

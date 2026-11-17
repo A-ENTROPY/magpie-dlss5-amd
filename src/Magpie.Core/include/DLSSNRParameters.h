@@ -48,6 +48,15 @@ Option DLSSNRPassOption(const Option& option, int pass) {
 			if (it == option.parameters.end()) result.parameters.erase(std::string(name));
 			else result.parameters[std::string(name)] = it->second;
 		}
+		// Tone does not stack. A second pass re-applies the same low-frequency edit, and it
+		// compounds. Measured by the reference host on a TR2013 frame against NVIDIA's own
+		// output, block-mean luminance ran 1.052 -> 1.102 -> 1.136 across three passes with the
+		// tone control carried on each, against 1.052 -> 1.055 -> 1.056 when only the first
+		// pass carries it. That drift is the red skin a multi-pass picture shows.
+		//
+		// Set rather than erased: erasing falls back to the parameter's default, and that
+		// default is 1 -- the value that makes a single pass visible at all.
+		result.parameters["localToneStrength"] = 0.0f;
 	}
 	return result;
 }

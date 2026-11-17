@@ -1,5 +1,6 @@
 #pragma once
 #include "DLSSNRFilter.h"
+#include "DlssnrAmdBackend.h"
 #include "DLSSNRTemporal.h"
 #include "DLSSNRParameters.h"
 #include "DeviceResources.h"
@@ -11,6 +12,17 @@ namespace Magpie {
 // command queue, interop fences and temporal history.
 class DLSSNRMultiPass final : public NativeEffectBackend {
 public:
+	// Which implementation a layer runs. The AMD port of the same network is preferred when its
+	// files are present; otherwise the NGX filter, which is what a machine without them has
+	// always run. Both answer NativeEffectBackend, so the chain above them does not care.
+	//
+	// Asked per construction rather than cached: IsAvailable() is a directory probe, and the
+	// chain is rebuilt whenever the layer count or the output size changes, not per frame.
+	static std::unique_ptr<NativeEffectBackend> MakeLayer(bool amd) {
+		if (amd) return std::make_unique<DlssnrAmdBackend>();
+		return std::make_unique<DLSSNRFilter>();
+	}
+
 	bool Initialize(DeviceResources& resources, NgxD3D12Core& core,
 		ID3D11Texture2D* input, ID3D11Texture2D* output,
 		const EffectOption& option, bool hdr) noexcept {
@@ -47,13 +59,36 @@ public:
 			Logger::Get().Error("Create DLSSNR anti-flicker raw output failed");
 			return false;
 		}
+		const bool useAmd = DlssnrAmdBackend::IsAvailable();
+		if (useAmd && count > 1) {
+			// One process-wide engine, several layers adopting it. That is the arrangement this
+			// backend was built for -- the second instance logs that it is adopting rather than
+			// starting a second engine -- but it has not been run with a chain before, so the
+			// line says which shape the session took rather than leaving it to be inferred.
+			Logger::Get().Info(fmt::format(
+				"DLSSNR Multi Pass: {} layers on the AMD runtime, sharing one engine", count));
+		}
 		for (int i = 0; i < count; ++i) {
-			auto filter = std::make_unique<DLSSNRFilter>();
-			if (!filter->Initialize(resources, core,
-				i == 0 ? input : _intermediates[i - 1].get(),
-				i == count - 1 ? (antiFlicker ? _rawOutput.get() : output) : _intermediates[i].get(),
-				ParseDLSSNRSettings(DLSSNRPassOption(option, i + 1), hdr))) {
-				Logger::Get().Error(fmt::format("DLSSNR Multi Pass initialization failed at pass {}/{}", i + 1, count));
+			auto filter = MakeLayer(useAmd);
+			ID3D11Texture2D* passInput = i == 0 ? input : _intermediates[i - 1].get();
+			ID3D11Texture2D* passOutput = i == count - 1
+				? (antiFlicker ? _rawOutput.get() : output) : _intermediates[i].get();
+			const DLSSNRSettings passSettings =
+				ParseDLSSNRSettings(DLSSNRPassOption(option, i + 1), hdr);
+			// Two implementations, two entry points: the AMD backend is handed settings and the
+			// anti-flicker request and builds no NGX core, the filter is handed the core and
+			// serves the anti-flicker through the chain's own temporal pass instead.
+			bool ok = false;
+			if (useAmd) {
+				ok = static_cast<DlssnrAmdBackend*>(filter.get())
+					->Initialize(resources, passInput, passOutput, passSettings, antiFlicker);
+			} else {
+				ok = static_cast<DLSSNRFilter*>(filter.get())
+					->Initialize(resources, core, passInput, passOutput, passSettings);
+			}
+			if (!ok) {
+				Logger::Get().Error(fmt::format(
+					"DLSSNR Multi Pass initialization failed at pass {}/{}", i + 1, count));
 				return false;
 			}
 			filter->SetHdrBoundary(_hdrBoundary);
@@ -171,7 +206,7 @@ private:
 	std::vector<winrt::com_ptr<ID3D11Texture2D>> _intermediates;
 	winrt::com_ptr<ID3D11Texture2D> _rawOutput;
 	std::unique_ptr<DLSSNRTemporal> _temporal;
-	std::vector<std::unique_ptr<DLSSNRFilter>> _filters;
+	std::vector<std::unique_ptr<NativeEffectBackend>> _filters;
 };
 
 }

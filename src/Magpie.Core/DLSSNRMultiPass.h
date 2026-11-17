@@ -80,8 +80,11 @@ public:
 			// serves the anti-flicker through the chain's own temporal pass instead.
 			bool ok = false;
 			if (useAmd) {
+				// Each layer owns one entry of the engine table. The index is the pass number
+				// minus one, so a rebuilt chain lands on the same entries it used before rather
+				// than exhausting them.
 				ok = static_cast<DlssnrAmdBackend*>(filter.get())
-					->Initialize(resources, passInput, passOutput, passSettings, antiFlicker);
+					->Initialize(resources, passInput, passOutput, passSettings, antiFlicker, i);
 			} else {
 				ok = static_cast<DLSSNRFilter*>(filter.get())
 					->Initialize(resources, core, passInput, passOutput, passSettings);

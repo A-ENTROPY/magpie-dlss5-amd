@@ -139,6 +139,9 @@ constexpr uint64_t kDrainDeadlineMs = 2000;
 // So the first session that needs these creates them and every later one adopts them. Only the
 // size-dependent resources stay per session, and they already have their own lifetime
 // (CreateSized / DestroySized).
+// The part of the engine that really is process-wide: the D3D12 objects and the saved
+// ExecuteCommandLists. One device, one queue, one hook to step around -- a second layer shares
+// all three with the first, and there is nothing to keep apart.
 struct EngineHost {
 	winrt::com_ptr<ID3D12Device> device;
 	winrt::com_ptr<ID3D12CommandQueue> queue;
@@ -146,17 +149,34 @@ struct EngineHost {
 	// later session would read it with the runtime already loaded, which is the one moment it
 	// cannot be read -- so it is captured once, here, and passed on.
 	void* executeOriginal = nullptr;
-	// The module and the offset table it was identified as. The runtime is never unloaded, so a
-	// later session has no reason to load it again: that would take the loader lock to bump a
-	// refcount on a module this process already holds, and re-read and re-hash 38 MB to reach
-	// the answer already here.
+};
+
+// What one *layer* owns. This used to live in EngineHost, one per process, and that was correct
+// while the effect ran a single pass: adopting the live engine is what keeps a second init from
+// faulting the GPU. A multi-layer chain breaks that assumption, because the runtime's state --
+// its job counter, its status byte, its history -- belongs to a session, not to the process.
+//
+// The Vulkan shim already builds one session per attached state block, and the Mochizuki runtime
+// it drives allocates a fresh Session per Create with no process-wide instance; what stopped two
+// layers working was this struct handing both of them the same block. Measured symptom: the
+// engine skipped every other frame, because the two layers interleaved submissions against one
+// job counter.
+//
+// Kept as fixed storage rather than a map because a chain is at most three layers and the entry
+// has to outlive the session that made it -- the runtime is never unloaded, and re-hashing a
+// 38 MB image to rediscover offsets already known is work with no answer behind it.
+struct LayerHost {
+	// The state block this layer was attached with, and what identifies the entry. Null when the
+	// slot has never been used.
+	void* state = nullptr;
+	// The module and the offset table it was identified as.
 	HMODULE runtime = nullptr;
 	const RuntimeOffsets* rva = nullptr;
-	// The runtime's init has run against the objects above. There is no second time.
+	// The runtime's init has run against this block. There is no second time for this layer.
 	bool started = false;
-	// Which DLSSNRW1 container init read. When it differs from what the next session asks
-	// for, the engine is not re-initialised -- it is not re-initialisable, the second call
-	// faults the GPU -- and that session must not be told it has the model it chose.
+	// Which DLSSNRW1 container init read. When it differs from what this layer's next session
+	// asks for, the engine is not re-initialised -- a second init faults the GPU -- and that
+	// session must not be told it has the model it chose.
 	std::string weightsInUse;
 	// Whether `runtime` is our shim or the vendored image.
 	//
@@ -169,7 +189,19 @@ struct EngineHost {
 	// seconds, and only a Magpie restart recovered. Recorded explicitly so the two are
 	// distinguishable.
 	bool runtimeIsOurs = false;
+	// The Vulkan shim is set up once per block and answers every later call from that state, so
+	// it needs no per-layer distinction beyond the block itself.
+	bool vulkan = false;
 };
+
+constexpr int kMaxEngineLayers = 3;
+
+// Which layer of the chain a slot belongs to. The index is what the backend asks for, so layer 2
+// is always slot 1 and rebuilding a layer reuses its slot instead of leaking another entry.
+inline LayerHost& Layer(int index) noexcept {
+	static LayerHost layers[kMaxEngineLayers];
+	return layers[std::clamp(index, 0, kMaxEngineLayers - 1)];
+}
 
 // Function-local so the order of namespace-scope initialisation cannot matter.
 inline EngineHost& Engine() noexcept {
@@ -1832,6 +1864,13 @@ struct DlssnrAmdBackend::Impl {
 	HMODULE hip = nullptr;
 	HipSetFn hipSet = nullptr;
 	int hipDevice = -1;
+	// Which entry of the shared engine table this session owns. Assigned by the chain before
+	// Initialize, zero for a single layer, and never changed afterwards -- every call that has to
+	// reach the runtime's own state goes through this, because that state is per session and two
+	// layers sharing one block is what made a two-layer run interleave on a single job counter.
+	int engineLayer = 0;
+	// The entry itself, resolved once. Null until Initialize picks a runtime.
+	LayerHost* host = nullptr;
 	InitFn init = nullptr;
 	RecordFn record = nullptr;
 	NotifyFn notify = nullptr;
@@ -2129,6 +2168,8 @@ bool DlssnrAmdBackend::Impl::TryLoadOurs(bool smallModel) noexcept {
 					auto initFn = reinterpret_cast<InitFn>(GetProcAddress(vkMod, "NrInit"));
 					auto recordFn = reinterpret_cast<RecordFn>(GetProcAddress(vkMod, "NrRecord"));
 					auto notifyFn = reinterpret_cast<NotifyFn>(GetProcAddress(vkMod, "NrNotify"));
+					auto setLayer = reinterpret_cast<void (*)(int)>(
+						GetProcAddress(vkMod, "NrSetLayer"));
 					if (!attach || !initFn || !recordFn || !notifyFn) {
 						Logger::Get().Error(
 							"DLSSNR AMD: glsl_vk_shim.dll does not export "
@@ -2137,15 +2178,22 @@ bool DlssnrAmdBackend::Impl::TryLoadOurs(bool smallModel) noexcept {
 						void* state = VirtualAlloc(nullptr, 0x100000,
 							MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 						if (state) {
+							// Which slot this block is, before Attach registers it. A shim
+							// without the export falls back to counting, which is what a
+							// single layer wants anyway.
+							if (setLayer) setLayer(engineLayer);
 							attach(state);
 							rva = &kOffsets050;
 							runtime = reinterpret_cast<HMODULE>(state);
 							init = initFn;
 							record = recordFn;
 							notify = notifyFn;
-							Engine().runtime = runtime;
-							Engine().rva = rva;
-							Engine().runtimeIsOurs = true;
+							host = &Layer(engineLayer);
+							host->state = state;
+							host->runtime = runtime;
+							host->rva = rva;
+							host->runtimeIsOurs = true;
+							host->vulkan = true;
 							oursRuntime = true;
 							vulkanRuntime = true;
 							Logger::Get().Info(
@@ -2233,9 +2281,11 @@ bool DlssnrAmdBackend::Impl::TryLoadOurs(bool smallModel) noexcept {
 	init = initFn;
 	record = recordFn;
 	notify = notifyFn;
-	Engine().runtime = runtime;
-	Engine().rva = rva;
-	Engine().runtimeIsOurs = true;
+	host = &Layer(engineLayer);
+	host->state = state;
+	host->runtime = runtime;
+	host->rva = rva;
+	host->runtimeIsOurs = true;
 	oursRuntime = true;
 	Logger::Get().Info("DLSSNR AMD: using our own network runtime (dlssnr_ours_small.dll)");
 	return true;
@@ -2249,8 +2299,11 @@ bool DlssnrAmdBackend::Impl::LoadRuntime(bool smallModel) noexcept {
 		return true;
 	}
 
-	EngineHost& host = Engine();
-	if (host.runtime) {
+	// This layer's entry, not the process's. Two layers of one chain each load and identify their
+	// own runtime session, so every field below is about this layer alone.
+	LayerHost& mine = Layer(engineLayer);
+	this->host = &mine;
+	if (mine.runtime) {
 		// An earlier session in this process already loaded and identified the module. The
 		// runtime is never unloaded, so there is nothing to load: this only has to pick up the
 		// handle and the offsets.
@@ -2290,7 +2343,7 @@ bool DlssnrAmdBackend::Impl::LoadRuntime(bool smallModel) noexcept {
 		// inferred: both runtimes set `rva`, so a null-rva test answers false for the shim too
 		// and this check never fired. That is what let the vendored runtime adopt the shim's
 		// state block -- see EngineHost::runtimeIsOurs.
-		const bool haveOurs = host.runtimeIsOurs;
+		const bool haveOurs = mine.runtimeIsOurs;
 		if (wantOurs != haveOurs) {
 			// The runtime in use cannot be swapped for the other kind, but WHY it cannot
 			// depends on whether the engine has been brought up against it.
@@ -2299,7 +2352,7 @@ bool DlssnrAmdBackend::Impl::LoadRuntime(bool smallModel) noexcept {
 			// the modules are loaded, nothing has been initialised against them, and the
 			// session can simply load the one it wants. Re-loading the vendored image is safe
 			// (LoadLibrary only bumps a refcount); the shim allocates a fresh state block.
-			// Resetting Engine()'s runtime/rva here is what makes that possible -- without it
+			// Resetting this layer's runtime/rva here is what makes that possible -- without it
 			// the new runtime was paired with the old state block, which is the run where the
 			// vendored image indexed the shim's 1 MB allocation with offsets meant for a 38 MB
 			// image and the session died in seconds.
@@ -2307,7 +2360,7 @@ bool DlssnrAmdBackend::Impl::LoadRuntime(bool smallModel) noexcept {
 			// After a bring-up, neither runtime can be swapped at all: the engine holds
 			// references into whichever one it was initialised against, and a second init
 			// faults the GPU. That case genuinely needs a restart, and says so.
-			if (host.started) {
+			if (mine.started) {
 				Logger::Get().Error(fmt::format(
 					"DLSSNR AMD: this process has already brought the engine up against the "
 					"{}; switching to the {} needs Magpie restarted, because the engine holds "
@@ -2323,14 +2376,14 @@ bool DlssnrAmdBackend::Impl::LoadRuntime(bool smallModel) noexcept {
 				"the load can be replaced)",
 				haveOurs ? "our own network runtime" : "vendored runtime",
 				wantOurs ? "our own network runtime" : "vendored runtime"));
-			host.runtime = nullptr;
-			host.rva = nullptr;
-			host.runtimeIsOurs = false;
+			mine.runtime = nullptr;
+			mine.rva = nullptr;
+			mine.runtimeIsOurs = false;
 			// The load for the requested runtime happens at the bottom, which is also what the
 			// never-loaded case does.
 		} else {
-			runtime = host.runtime;
-			rva = host.rva;
+			runtime = mine.runtime;
+			rva = mine.rva;
 		}
 	}
 	if (!runtime) {
@@ -2368,13 +2421,13 @@ bool DlssnrAmdBackend::Impl::LoadRuntime(bool smallModel) noexcept {
 				GetLastError()));
 			return false;
 		}
-		host.runtime = runtime;
-		host.rva = rva;
+		mine.runtime = runtime;
+		mine.rva = rva;
 		// Explicit, not inherited. This field outlives the session, so leaving it at whatever
 		// a previous shim session set made the next vendored session look like "ours" and the
 		// switch check below rejected it -- the effect then fell through to NGX and the model
 		// could only be brought back by restarting Magpie.
-		host.runtimeIsOurs = false;
+		mine.runtimeIsOurs = false;
 	}
 
 	init = reinterpret_cast<InitFn>(reinterpret_cast<uintptr_t>(runtime) + rva->init);
@@ -4388,13 +4441,16 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// guide flags below are read at staging time. Changing one of those needs Magpie restarted
 	// rather than the effect switched off and on. That is a real limitation, and it is worth
 	// far more than the bugcheck it replaces.
-	if (Engine().started) {
-		// One engine per process, and the model it was given at init is what it will run
-		// until Magpie itself is restarted. Adopting is the right answer for everything
-		// except the container; for that one, say so clearly and continue with the engine
-		// that is already up rather than refusing the whole effect.
-		if (!Engine().weightsInUse.empty() &&
-			Engine().weightsInUse != weightsPath.string()) {
+	// Per layer, not per process. A second layer of the same chain has its own state block and
+	// therefore its own engine, so it initialises rather than adopting; the branch below is for
+	// the same layer being rebuilt, which must not call init twice.
+	if (host && host->started) {
+		// The model this layer was given at init is what it will run until Magpie restarts.
+		// Adopting is the right answer for everything except the container; for that one, say
+		// so clearly and continue with the engine that is already up rather than refusing the
+		// whole effect.
+		if (!host->weightsInUse.empty() &&
+			host->weightsInUse != weightsPath.string()) {
 			// A user-visible warning, not a failure. The engine is process state and a second
 			// init faults the GPU, so the switch cannot take effect here -- but the effect can
 			// still run with the model it already has, which is strictly better than the NGX
@@ -4405,7 +4461,7 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 				"the engine with {} but this session asked for {}; the engine cannot be "
 				"re-initialised (a second init faults the GPU), so it keeps running the model "
 				"it was given. Close and restart Magpie to switch models",
-				Engine().weightsInUse, weightsPath.string()));
+				host->weightsInUse, weightsPath.string()));
 			engineUp = true;
 			return true;
 		}
@@ -4577,8 +4633,8 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 
 
 	At<uint8_t>(runtime, rva->initDone) = 1;
-	Engine().started = true;
-	Engine().weightsInUse = weightsPath.string();
+	Layer(engineLayer).started = true;
+	Layer(engineLayer).weightsInUse = weightsPath.string();
 	engineUp = true;
 	return true;
 }
@@ -5042,9 +5098,13 @@ bool DlssnrAmdBackend::Initialize(
 	ID3D11Texture2D* input,
 	ID3D11Texture2D* output,
 	const DLSSNRSettings& settings,
-	int antiFlickerMode
+	int antiFlickerMode,
+	int layer
 ) noexcept {
 	auto& p = *_impl;
+	// Which engine entry this session owns. Set before LoadRuntime, because that is what picks
+	// the entry: the state block, the module and the init flag all belong to one layer.
+	p.engineLayer = std::clamp(layer, 0, kMaxEngineLayers - 1);
 	// Set before anything is allocated: whether the residual path is in use decides which
 	// surfaces exist. Modes 2 to 4 are optical-flow routes and there is no optical flow here,
 	// so every non-zero request is served as mode 1 -- static accumulation, the route
@@ -5335,9 +5395,9 @@ bool DlssnrAmdBackend::Initialize(
 	// The engine's device and queue come from the process, not from this session. The first
 	// session creates them; every session after that adopts them, because the runtime is never
 	// unloaded and its engine holds pointers into them. See EngineHost.
-	EngineHost& host = Engine();
-	if (host.device) {
-		const LUID engineLuid = host.device->GetAdapterLuid();
+	EngineHost& engine = Engine();
+	if (engine.device) {
+		const LUID engineLuid = engine.device->GetAdapterLuid();
 		LUID here{};
 		bool hereKnown = false;
 		{
@@ -5368,7 +5428,7 @@ bool DlssnrAmdBackend::Initialize(
 		// than reported from inside a frame. The engine cannot be rebuilt on a replacement
 		// either -- that is the re-initialisation this whole mechanism exists to avoid -- so a
 		// restart of Magpie is the only way back.
-		const HRESULT removed = host.device->GetDeviceRemovedReason();
+		const HRESULT removed = engine.device->GetDeviceRemovedReason();
 		if (FAILED(removed)) {
 			Logger::Get().Error(fmt::format(
 				"DLSSNR AMD: the engine's device was removed (0x{:08x}); it cannot be rebuilt on "
@@ -5376,8 +5436,8 @@ bool DlssnrAmdBackend::Initialize(
 				static_cast<uint32_t>(removed)));
 			return false;
 		}
-		p.device12 = host.device;
-		p.queue = host.queue;
+		p.device12 = engine.device;
+		p.queue = engine.queue;
 		Logger::Get().Info(
 			"DLSSNR AMD: adopting the engine's device and queue from the first session in this "
 			"process; the engine is not re-initialised");
@@ -5393,8 +5453,8 @@ bool DlssnrAmdBackend::Initialize(
 			Logger::Get().Error("DLSSNR AMD: could not create the engine's command queue");
 			return false;
 		}
-		host.device = p.device12;
-		host.queue = p.queue;
+		engine.device = p.device12;
+		engine.queue = p.queue;
 	}
 
 	if (FAILED(p.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -5429,13 +5489,13 @@ bool DlssnrAmdBackend::Initialize(
 	//
 	// Taken once for the process, like the queue it comes from. A later session cannot re-derive
 	// it: by then the runtime is loaded, which is precisely the state it has to be read before.
-	if (host.executeOriginal) {
+	if (engine.executeOriginal) {
 		p.executeOriginal = reinterpret_cast<DlssnrAmdBackend::Impl::ExecuteFn>(
-			host.executeOriginal);
+			engine.executeOriginal);
 	} else {
 		p.executeOriginal = reinterpret_cast<DlssnrAmdBackend::Impl::ExecuteFn>(
 			(*reinterpret_cast<void***>(p.queue.get()))[10]);
-		host.executeOriginal = reinterpret_cast<void*>(p.executeOriginal);
+		engine.executeOriginal = reinterpret_cast<void*>(p.executeOriginal);
 		Logger::Get().Info(fmt::format(
 			"DLSSNR AMD: the queue's own ExecuteCommandLists is {:x}, taken before the runtime "
 			"loads and kept for the process",

@@ -37,6 +37,9 @@ public:
 	// us, which is why the first motion attempt saw empty views for both.
 	FrameGuidanceRequirements GetFrameGuidanceRequirements() const noexcept override;
 
+	// `layer` selects which entry of the process-wide engine table this session owns. Each
+	// layer of a chain passes its own index and gets its own runtime state block; a single
+	// layer passes 0, which is the arrangement this backend shipped with. At most three.
 	bool Initialize(
 		DeviceResources& resources,
 		ID3D11Texture2D* input,
@@ -44,7 +47,8 @@ public:
 		const DLSSNRSettings& settings,
 		// The effect's anti-flicker request. Modes above 1 reproject history with optical
 		// flow, which this backend has no source for, so they are served as mode 1.
-		int antiFlickerMode
+		int antiFlickerMode,
+		int layer = 0
 	) noexcept;
 
 	bool Resize(

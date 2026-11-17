@@ -72,9 +72,17 @@ public:
 		ID3D11Texture2D* output
 	) noexcept = 0;
 
-	// Whether the last Draw produced a valid result. A chain of backends uses this to reject
-	// a whole frame rather than composite a broken layer on top of good ones. Default true:
-	// a backend with no notion of failure is healthy by construction.
+	// Whether this backend can still produce a result, for a chain that has to decide whether
+	// to composite the frame at all. Both implementations latch: false means a failure that
+	// does not clear, not a frame that was merely dropped.
+	//
+	// Every site that sets it is unrecoverable by construction -- a removed device, a command
+	// list that will not reset, an engine that refuses to record, a fence that timed out. The
+	// surfaces are left holding whatever they held, so retrying would composite a stale or
+	// torn frame rather than recover one. A recoverable miss returns false from Draw alone and
+	// leaves this true.
+	//
+	// Default true: a backend with no notion of failure is healthy by construction.
 	virtual bool IsHealthy() const noexcept { return true; }
 
 	virtual bool Draw(const NativeEffectDrawContext& context) noexcept = 0;

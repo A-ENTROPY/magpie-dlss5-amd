@@ -1,4 +1,4 @@
-#include "pch.h"
+﻿#include "pch.h"
 #include "DlssnrAmdBackend.h"
 
 // The reconstruction route drives the FSR3 upscaler this project already carries. Its
@@ -8,6 +8,7 @@
 #include "FSR3Upscaler.h"
 #endif
 #include "FrameGuidanceD3D12Interop.h"
+#include "DLSSNRTemporal.h"
 #include "DeviceResources.h"
 #include "DirectXHelper.h"
 #include "Logger.h"
@@ -153,6 +154,21 @@ struct EngineHost {
 	const RuntimeOffsets* rva = nullptr;
 	// The runtime's init has run against the objects above. There is no second time.
 	bool started = false;
+	// Which DLSSNRW1 container init read. When it differs from what the next session asks
+	// for, the engine is not re-initialised -- it is not re-initialisable, the second call
+	// faults the GPU -- and that session must not be told it has the model it chose.
+	std::string weightsInUse;
+	// Whether `runtime` is our shim or the vendored image.
+	//
+	// It cannot be derived from rva being null: the shim sets rva to &kOffsets050 as well (the
+	// offsets are the contract it shares with the backend), so `rva == nullptr` was false for
+	// BOTH runtimes and the switch check below never fired. The observable failure: load the
+	// large model first (vendored), then switch back to the small one, and the vendored
+	// runtime adopted the shim's allocated state block while indexing it with the vendored
+	// offsets -- every field read from a megabyte past the block, the session died within
+	// seconds, and only a Magpie restart recovered. Recorded explicitly so the two are
+	// distinguishable.
+	bool runtimeIsOurs = false;
 };
 
 // Function-local so the order of namespace-scope initialisation cannot matter.
@@ -166,23 +182,30 @@ inline EngineHost& Engine() noexcept {
 // attempted: the offsets point into a different layout and the failure mode is a jump into
 // nothing, not an error.
 //
-// It is the stock 0.5.0 image, the same bytes the installer puts in the game folder, which
-// is 38,703,616 bytes and ships gfx1100/1101/1102/1200/1201 -- unpatched, deliberately.
+// It is the stock 0.5.0 image, the same bytes the installer puts in the game folder, 38,703,616
+// bytes, shipping gfx1100/1101/1102/1200/1201 -- with one change, made by
+// tools/patch_runtime_050_swapchain.py: the two 5-byte calls from the swapchain detours into the
+// runtime's own registration routine are NOP'd, so those detours still create the swapchain
+// through the saved original but no longer take the mutex that the present detour also takes.
 //
-// A patched build was shipped once and it does not work. The reasoning behind it looked sound
-// and was wrong, so it is recorded here rather than left in a commit message:
-// tools/patch_runtime_050.py neutralised the CreateThread that starts the thread installing the
-// runtime's five detours (the game's ExecuteCommandLists, both CreateSwapChain overloads, both
-// Presents), on the theory that the runtime driving itself and this backend driving it could not
-// both hold the wheel. With the patch in place the runtime loads, stages, warms up and passes
-// its inline flag check -- and then prints "apply UAV format 10" and stops. `first capture
-// submitted on a direct queue` never appears, no network job is ever run, and Magpie reports
-// MP-035 within seconds.
+// That mutex is the point. Both the swapchain registration (0xa6e0) and the present path
+// (0xa880) take the lock at 0xb1000, on different threads; a scan of the whole image finds
+// exactly two callers of 0xa6e0 and they are those two swapchain detours; and the registry the
+// registration maintains is read by a lookup that already handles a miss. Removing the
+// contention costs an empty registry and nothing else -- see the tool for the full derivation.
 //
-// The detour is not the runtime driving itself. It is how the runtime *gets a frame*: it hooks
-// the game's command list to find where its capture belongs. The backend drives the network; the
-// runtime's detour supplies its input. They are not competing for one wheel, and removing the
-// detour removes the input.
+// Everything else about the image is untouched: the saved-original trampolines, the
+// ExecuteCommandLists detour that gets the frames, both Present detours, and the setup thread.
+//
+// A patched build was shipped once before and did not work. That one was different and is worth
+// keeping on the record, because the reasoning behind it looked sound:
+// tools/patch_runtime_050.py neutralised the CreateThread that starts the thread installing all
+// five detours, on the theory that the runtime driving itself and this backend driving it could
+// not both hold the wheel. With the whole thread gone the runtime loads, stages, warms up and
+// passes its inline flag check -- and then prints "apply UAV format 10" and stops:
+// `first capture submitted on a direct queue` never appears, no network job is ever run, and
+// Magpie reports MP-035 within seconds. The detour is not the runtime driving itself; it is how
+// the runtime gets a frame, and this patch leaves that one alone.
 
 // danielblnc 0.5.0. This is the build that matters for gfx1100: 0.4.3 and everything before
 // it could only run the slow Reference path here, because the register-resident kernels it
@@ -190,14 +213,29 @@ inline EngineHost& Engine() noexcept {
 // much -- "RX 7000 always runs Reference" -- so its table is retired rather than kept
 // alongside this one.
 constexpr uint8_t kRuntimeSha256_050[32] = {
-	0xcd, 0xdf, 0xb0, 0x9e, 0x01, 0x93, 0x47, 0x95, 0x7b, 0xf7, 0xb9, 0x6c,
-	0x95, 0xc0, 0xe9, 0x00, 0xe8, 0xd3, 0x06, 0x2d, 0xfa, 0xed, 0x69, 0x7a,
-	0x8a, 0x96, 0xb0, 0xa0, 0x39, 0xae, 0xc3, 0x1a,
+	0x09, 0x83, 0xb4, 0xce, 0x86, 0x09, 0x72, 0xfd, 0x87, 0x94, 0xbe, 0x55,
+	0x3f, 0x38, 0x80, 0x65, 0x92, 0x52, 0xad, 0x64, 0x57, 0xdf, 0x27, 0x76,
+	0x1a, 0xe6, 0x12, 0x6c, 0x07, 0x95, 0x9a, 0xfc,
 };
 
 constexpr const wchar_t* kRuntimeName = L"dlssnr_amd_pass1.dll";
 constexpr const wchar_t* kWeightsName = L"dlssnr_on_amd_weights.bin";
+constexpr const wchar_t* kWeightsNameSmall = L"dlssnr_on_amd_weights_small.bin";
 constexpr const wchar_t* kIniName = L"dlssnr_on_amd.ini";
+
+// Which of the two DLSSNRW1 containers the engine is handed. Both are read by name from the
+// same record table, so the choice is the whole of the switch; whether the runtime knows the
+// smaller schedule is the engine's own answer, not this backend's.
+inline const wchar_t* WeightsNameFor(const DLSSNRSettings& settings) noexcept {
+	return settings.amdSmallModel ? kWeightsNameSmall : kWeightsName;
+}
+
+// Availability cannot consult a setting: it is asked before the effect's parameters are
+// known. A machine with either container is a machine this backend can serve.
+inline bool WeightsPresent(const std::filesystem::path& dir, std::error_code& ec) noexcept {
+	return std::filesystem::exists(dir / kWeightsName, ec) ||
+		std::filesystem::exists(dir / kWeightsNameSmall, ec);
+}
 
 // Every state field in the packet is this value. The reference writes it for the colour,
 // the motion, the depth and the exposure alike, including at points where the resource is
@@ -286,6 +324,70 @@ void main(uint3 id : SV_DispatchThreadID)
 	v.rgb = SrgbToLinear(v.rgb);
 #endif
 	dst[id.xy] = v;
+}
+)";
+
+// Puts back the high frequencies the reduced-scale route throws away.
+//
+// At fifty percent the network sees a frame with a quarter of the samples, and the upscaler
+// has to invent everything above that -- which it cannot. The full-resolution frame is still
+// here, and its high frequencies are exactly the missing information, so they are measured and
+// added back on top of the reconstructed picture.
+//
+// Measured in the domain the output is already in, not in the frame's own: the upscaler's
+// result is display-referred, and a difference taken in linear and added to an encoded image
+// is not a difference of the same quantity. So each tap goes through the same shoulder and
+// encode the output stage applies before any subtraction happens.
+//
+// The low pass is a small gaussian rather than a box, so what is left carries a narrower band
+// and the addition does not ring at the scale of the kernel.
+constexpr char kDetailRestoreShader[] = R"(
+Texture2D<float4> base : register(t0);
+Texture2D<float4> src : register(t1);
+RWTexture2D<float4> dst : register(u0);
+cbuffer Settings : register(b0) { uint shoulderMilli; uint strengthMilli; };
+
+#ifdef SRGB_IN
+float3 DisplayShoulder(float3 v) {
+	const float k = max(shoulderMilli, 10u) / 1000.0;
+	const float s = k / (1.0 - k);
+	v = max(v, 0);
+	float3 t = (v - k) / max(v, 1e-6);
+	float3 g = t / (t + (1.0 - t) / s);
+	return lerp(v, k + (1.0 - k) * g, saturate(t * 1000.0));
+}
+
+float3 Lift(float3 v) {
+	v = DisplayShoulder(v);
+	return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+#else
+float3 Lift(float3 v) { return v; }
+#endif
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+	uint w, h;
+	dst.GetDimensions(w, h);
+	if (id.x >= w || id.y >= h) return;
+	const int2 last = int2(int(w) - 1, int(h) - 1);
+	const int2 p = int2(id.xy);
+
+	float3 low = 0;
+	[unroll] for (int y = -1; y <= 1; ++y)
+	[unroll] for (int x = -1; x <= 1; ++x) {
+		const int wx = x == 0 ? 2 : 1;
+		const int wy = y == 0 ? 2 : 1;
+		low += Lift(src.Load(int3(clamp(p + int2(x, y), int2(0, 0), last), 0)).rgb) *
+			(float)(wx * wy);
+	}
+	low *= 1.0 / 16.0;
+	const float3 high = Lift(src.Load(int3(p, 0)).rgb) - low;
+	const float3 b = base.Load(int3(p, 0)).rgb;
+	// Not saturated: an eight-bit target clamps on write by itself, and clamping here would
+	// also crush the highlights of a float one.
+	dst[p] = float4(b + high * (strengthMilli / 1000.0), 1.0);
 }
 )";
 
@@ -425,6 +527,13 @@ constexpr char kResolveShader[] = R"(
 Texture2D<float4> src : register(t0);
 Texture2D<float4> baseline : register(t1);
 Texture2D<float4> residual : register(t2);
+// What the edit is added to. Normally the same resource as `src`; the reconstruction route
+// passes the network's own output here while keeping `src` at the pre-edit picture, so the
+// acceptance gate still compares like with like. Without this split the route had to choose
+// between a gate that rejects the largest edits (src = network output) and an output built
+// from a low-resolution residual field, which is what made the upscaler's input look like the
+// residual route's.
+Texture2D<float4> target : register(t3);
 RWTexture2D<float4> dst : register(u0);
 cbuffer Extent : register(b0) { uint w; uint h; uint lowW; uint lowH; uint boundMilli; };
 
@@ -480,15 +589,19 @@ void main(uint3 p : SV_DispatchThreadID)
 {
 	if (p.x >= w || p.y >= h) return;
 	float4 c = src.Load(int3(p.xy, 0));
+	// What the edit is added onto: the network's own output, which for the composite route is
+	// the same resource as `src`. `c` above stays the pre-edit picture and is what the gate
+	// compares against baseline.
+	const float4 base4 = target.Load(int3(p.xy, 0));
 	float3 edit;
-	float3 result = c.rgb;
+	float3 result = base4.rgb;
 	// The bound is a safety net for extremes, not the mechanism; the acceptance above is
 	// what decides whether an edit is applied at all.
 	if (SampleEdit(int2(p.xy), edit)) {
-		const float3 limit = (boundMilli / 1000.0) * max(abs(c.rgb), 1e-4);
-		result = c.rgb + clamp(edit, -limit, limit);
+		const float3 limit = (boundMilli / 1000.0) * max(abs(base4.rgb), 1e-4);
+		result = base4.rgb + clamp(edit, -limit, limit);
 	}
-	if (!all(isfinite(result))) result = c.rgb;
+	if (!all(isfinite(result))) result = base4.rgb;
 	dst[p.xy] = float4(clamp(result, 0, 65504), c.a);
 }
 )";
@@ -536,6 +649,15 @@ Texture2D<float4> historyGuide : register(t3);
 Texture2D<float2> motionField : register(t4);
 RWTexture2D<float4> nextResidual : register(u0);
 RWTexture2D<float4> nextGuide : register(u1);
+// How much of the reprojected history this pixel's blend actually believed, written out for the
+// upscaler's reactive mask. FSR's convention is the opposite -- reactive 1 means "the history
+// here is unusable, take this frame" -- so what goes in is 1 - trust.
+//
+// This is the same evidence the blend above already weighs: the history is reprojected by the
+// motion field and every tap is checked against the guide it was measured against. A pixel whose
+// reprojection landed on something that no longer matches is exactly a pixel where the upscaler
+// should not be accumulating either, and one that matched is one where it should.
+RWTexture2D<float> nextTrust : register(u2);
 cbuffer Settings : register(b0) {
 	// weightMilli, not a float. The constant buffer slot is filled from a uint32 holding
 	// thousandths, so declaring it float here reinterpreted the bit pattern instead of
@@ -549,6 +671,10 @@ cbuffer Settings : register(b0) {
 	// means the same thing on both paths.
 	float residualMultiplier; float residualSaturation; float residualLightness;
 	float shadowStructure; float reflectionGlow;
+	// Must stay LAST: it lands at index 12 of the 13-element constant array the C++ side fills
+	// (w, h, weightMilli, historyValid, useMotion, motionScaleX/Y, 5 residual floats, clampHistory).
+	// Placing it earlier shifted every later read by one slot and the shader fetched garbage.
+	uint clampHistory;
 };
 
 float3 Guide(float3 c) { return c / (1 + abs(c)); }
@@ -620,7 +746,14 @@ float3 ApplyResidualControls(float3 original, float3 residual) {
 			float3(0.2126, 0.7152, 0.0722));
 		float directional = deltaY < 0.0 ? shadowStructure :
 			(deltaY > 0.0 ? reflectionGlow : 1.0);
-		float3 candidate = saturate(original + residual * directional);
+		// Bound the amplification by the edit's own magnitude. `edge` reaches 1 at an edit of
+		// 0.10 (a strong edge) and 0 at 0.02 (fine texture), so the multiplier is full for
+		// detail and fades to unity for edges. Without this bound a 2x multiplier on a 0.15
+		// edge edit produced a 0.15 overshoot, which is the hard-edge sharpening that appears
+		// only when the temporal accumulation is on (this pass runs inside it).
+		float edge = saturate((MaxAbs(residual) - 0.02f) / 0.04f);
+		float bounded = lerp(directional, 1.0f, edge);
+		float3 candidate = saturate(original + residual * bounded);
 		[branch]
 		if (abs(residualSaturation - 1.0) >= 1e-6 ||
 			abs(residualLightness - 1.0) >= 1e-6) {
@@ -650,13 +783,14 @@ void main(uint3 id : SV_DispatchThreadID)
 	bool finiteInput = all(isfinite(raw.rgb)) && all(isfinite(base.rgb));
 	float3 guide = finiteInput ? Guide(base.rgb) : 0;
 	nextGuide[p] = float4(guide, finiteInput ? 1 : 0);
-	if (!finiteInput) { nextResidual[p] = 0; return; }
+	if (!finiteInput) { nextResidual[p] = 0; nextTrust[p] = 1; return; }
 
 	// The engine's edit, after the controls. Everything downstream -- the history blend and
 	// the resolve -- sees the controlled residual, so one slider position means the same
 	// thing all the way through.
 	float3 current = ApplyResidualControls(base.rgb, raw.rgb - base.rgb) - base.rgb;
 	float3 result = current;
+	float believed = 0;
 
 	if (historyValid != 0 && weightMilli > 0) {
 		// The range this frame's own neighbourhood spans; a carried edit may only persist as
@@ -682,21 +816,48 @@ void main(uint3 id : SV_DispatchThreadID)
 			// the guide it was measured against before it counts: a tap whose neighbourhood
 			// has moved on must not leak into the blend. Upstream's own history gather.
 			float2 mv = motionField.Load(int3(p, 0));
-			float2 prev = float2(p) + (all(isfinite(mv)) ? mv : 0) *
+			if (!all(isfinite(mv))) mv = 0;
+			// The flow must agree with itself across the footprint. A 3x3 gather of a field
+			// that changes by more than a couple of pixels between neighbouring taps is not a
+			// reliable mapping of one surface -- it straddles a motion boundary or sits where
+			// the estimator had nothing to match (flat shadow, low texture). Averaging such
+			// taps pulls an edit from somewhere else onto this pixel, which shows up as the
+			// shadow flickering that persists even with the accumulation running. This is the
+			// B.3/F rule the design doc names and the reconstruction route was missing.
+			//
+			// Only the DISAGREEMENT between taps is evidence against the mapping. This used to
+			// start the running maximum at |mv| itself, so the test read
+			// `max(|mv|, |neighbour - mv|) <= 2` -- which fails wherever the surface simply
+			// moves faster than two source pixels per frame, i.e. all real motion. The gather
+			// was skipped and every such pixel fell back to its own frame's edit, so the
+			// accumulation was off exactly where the flicker lives. The magnitude of the flow
+			// says nothing about whether the estimate is coherent; the spread does.
+			float2 mvSpread = 0;
+			[unroll] for (int y = -1; y <= 1; ++y)
+			[unroll] for (int x = -1; x <= 1; ++x) {
+				int2 n = clamp(p + int2(x, y), int2(0, 0), last);
+				float2 mn = motionField.Load(int3(n, 0));
+				if (!all(isfinite(mn))) continue;
+				mvSpread = max(mvSpread, abs(mn - mv));
+			}
+			const bool flowConsistent = max(mvSpread.x, mvSpread.y) <= 2.0;
+			float2 prev = float2(p) + mv *
 				float2(motionScaleXMilli, motionScaleYMilli) / 1000.0;
 			int2 baseP = int2(floor(prev));
 			float2 f = frac(prev);
-			[unroll] for (int y = 0; y < 2; ++y)
-			[unroll] for (int x = 0; x < 2; ++x) {
-				int2 n = clamp(baseP + int2(x, y), int2(0, 0), last);
-				float4 hg = historyGuide.Load(int3(n, 0));
-				float4 hr = historyResidual.Load(int3(n, 0));
-				if (!all(isfinite(hg.rgb)) || !all(isfinite(hr.rgb)) ||
-					hg.a < .999 || hr.a < .999) continue;
-				float wgt = (x ? f.x : 1 - f.x) * (y ? f.y : 1 - f.y);
-				float accept = 1 - smoothstep(.025, .10, MaxAbs(guide - hg.rgb));
-				old += wgt * accept * hr.rgb;
-				trust += wgt * accept;
+			if (flowConsistent) {
+				[unroll] for (int y = 0; y < 2; ++y)
+				[unroll] for (int x = 0; x < 2; ++x) {
+					int2 n = clamp(baseP + int2(x, y), int2(0, 0), last);
+					float4 hg = historyGuide.Load(int3(n, 0));
+					float4 hr = historyResidual.Load(int3(n, 0));
+					if (!all(isfinite(hg.rgb)) || !all(isfinite(hr.rgb)) ||
+						hg.a < .999 || hr.a < .999) continue;
+					float wgt = (x ? f.x : 1 - f.x) * (y ? f.y : 1 - f.y);
+					float accept = 1 - smoothstep(.025, .10, MaxAbs(guide - hg.rgb));
+					old += wgt * accept * hr.rgb;
+					trust += wgt * accept;
+				}
 			}
 			haveHistory = trust >= .25;
 			if (haveHistory) {
@@ -729,32 +890,138 @@ void main(uint3 id : SV_DispatchThreadID)
 		}
 
 		if (haveHistory) {
-			float3 margin = .02 + trust * abs(old);
-			float3 safe = clamp(old, lo - margin, hi + margin);
+			// How far the carried edit is allowed to sit outside this frame's range -- and,
+			// more importantly, what it is measured against.
+			//
+			// Measuring against the CURRENT frame's 3x3 (`lo`/`hi`) does not stabilise anything
+			// on the case that matters. A shadow's edit is a few thousandths that jitter, while
+			// the carried one is a steady few hundredths; `lo`/`hi` span only the jitter, so
+			// `clamp(old, lo-m, hi+m)` collapses to `current+margin`, `result = lerp(current,
+			// current+margin, w)` still moves with `current`, and the history's amplitude is
+			// gone. Blending a constant offset into a jittering value leaves the jitter exactly
+			// where it was, at reduced scale -- which is what "the accumulation runs but the
+			// flicker is still there" looks like from inside.
+			//
+			// The clamp's job is to stop the carried edit drifting onto a different surface, not
+			// to hold it under one frame's amplitude. So the bound is symmetric around `old`,
+			// sized by how much this frame's own edit disagrees with it: a carried edit that
+			// this frame's residual supports barely moves, and one the frame contradicts is
+			// pulled toward the frame. `stillness` widens the tolerance where nothing moves,
+			// because there the disagreement is measurement noise rather than evidence -- the
+			// `alargar` / `parado` pair the reference stabiliser uses.
+			const float3 span = hi - lo;
+			float motionPixels = 0;
+			if (useMotion != 0) {
+				float2 mvHere = motionField.Load(int3(p, 0));
+				// An unreadable vector is not evidence of stillness: fall on the moving side, which
+				// keeps the tighter tolerance and cannot build a halo out of a bad mapping.
+				motionPixels = all(isfinite(mvHere))
+					? length(mvHere * float2(motionScaleXMilli, motionScaleYMilli) / 1000.0)
+					: 1e3;
+			}
+			const float stillRange = 4.0;
+			const float stillness = useMotion != 0
+				? saturate(1.0 - motionPixels / stillRange)
+				: 1.0; // no flow to consult: the static route's own assumption is that nothing moved
+			// Disagreement between the carried edit and this frame's own, plus the frame's own
+			// neighbourhood spread as the scale below which a difference is not evidence.
+			const float3 tolerance = abs(old - current) + span * lerp(.5, 1.0, stillness);
+			// The carried edit survives in full while it is consistent with this frame; beyond
+			// that it is pulled toward the current frame, never past it.
+			float3 safe = clamp(old, min(old, current) - tolerance, max(old, current) + tolerance);
+			// Bound the result by this frame's range as a last resort, so a carried edit that
+			// drifted somewhere the picture no longer supports cannot publish regardless.
+			safe = clamp(safe, lo - tolerance, hi + tolerance);
+			// A/B: clampHistory=0 carries the edit unclamped, which isolates whether this
+			// clamp is the source of the moving-edge over-sharpen.
+			if (clampHistory == 0) safe = old;
 			result = lerp(current, safe, weightMilli / 1000.0 * trust);
+			believed = trust;
 		}
 	}
 
 	nextResidual[p] = float4(clamp(result, -65504, 65504), 1);
+	nextTrust[p] = 1 - believed;
 }
 )";
 
 
-// The optical-flow resample. The vectors themselves are left unchanged; the packet's scale
-// fields convert their pixel scale, which is the convention the reference uses for exactly
-// this hand-off. The guide Magpie produces is in source pixels, current-to-previous.
+// The optical-flow resample, and the dilation the temporal pass needs to read it.
+//
+// What this used to be: one source texel per destination texel, point sampled. At the 720 tier
+// the network surface is a quarter of the capture's area, so three of every four vectors were
+// thrown away -- and the ones that survived were chosen by sub-pixel rounding. On a smooth
+// field that is harmless. On a silhouette it is not: a thin occluder has its own vector on one
+// side of the edge and the background's on the other, and which one the sample returns changes
+// from frame to frame as the edge drifts. The reprojection then lands somewhere different each
+// frame and the accumulation flickers.
+//
+// The fix is dilation, which is what every production temporal upscaler does here: AMD's GDC
+// 2023 temporal-upscaling deck states it as "the vector of the closest pixel in a 3x3
+// neighbourhood is used", NVIDIA's programming guide says a standard-resolution motion buffer
+// "does not need to be dilated, DLSS dilates them internally", and the TAA survey literature
+// describes the same 4-tap window. The rule is that an edge pixel belongs to the foreground
+// object, so it must be reprojected with that object's vector.
+//
+// Depth is what decides who is in front. Without it the only tools are averaging and voting,
+// and averaging across an edge is worse than either side -- it invents a third vector that
+// belongs to neither surface, which is the failure mode this pass had.
+//
+// The vectors themselves are left in source pixels; the packet's scale fields convert their
+// pixel scale, which is the reference's own convention for this hand-off.
 constexpr char kMotionShader[] = R"(
 Texture2D<float2> src : register(t0);
+Texture2D<float> depth : register(t1);
 RWTexture2D<float2> dst : register(u0);
 cbuffer Extent : register(b0) { uint w; uint h; uint sourceW; uint sourceH; };
+
+// Conservative: only a clear depth difference counts as an edge. Anything smaller is the same
+// surface with its own tiny depth gradient, and dilating across it would move a smooth region's
+// vector for no reason.
+static const float kDepthEdge = 0.02;
+
 [numthreads(8, 8, 1)]
 void main(uint3 p : SV_DispatchThreadID)
 {
 	if (p.x >= w || p.y >= h) return;
 	if (sourceW == 0 || sourceH == 0) return;
-	uint2 q = min(uint2((float2(p.xy) + 0.5) * float2(sourceW, sourceH) / float2(w, h)),
-		uint2(sourceW - 1, sourceH - 1));
-	dst[p.xy] = src.Load(int3(q, 0));
+
+	// The source footprint this destination texel covers, and the centre of it. Point sampling
+	// the centre keeps the destination grid aligned with the source it came from; the dilation
+	// below is what decides which of the covered vectors to take.
+	const float sx = float(sourceW) / float(w);
+	const float sy = float(sourceH) / float(h);
+	const int2 last = int2(int(sourceW) - 1, int(sourceH) - 1);
+	const int2 centre = clamp(int2((float2(p.xy) + 0.5) * float2(sx, sy)), int2(0, 0), last);
+
+	// 3x3 at source resolution, in the source's own pixels: dilation is about which surface a
+	// vector belongs to, and that question is only meaningful where each texel is one surface.
+	const float centreDepth = depth.Load(int3(centre, 0));
+	float nearestDepth = centreDepth;
+	float2 nearestMotion = src.Load(int3(centre, 0));
+	bool depthValid = isfinite(centreDepth);
+
+	[unroll] for (int y = -1; y <= 1; ++y)
+	[unroll] for (int x = -1; x <= 1; ++x) {
+		const int2 q = clamp(centre + int2(x, y), int2(0, 0), last);
+		const float d = depth.Load(int3(q, 0));
+		if (!isfinite(d)) continue;
+		// Reverse-Z is what this backend gets from the guide: smaller means nearer. The guide's
+		// own convention is read here rather than assumed -- if it were reversed, the far
+		// surface would win every edge and the picture would smear, which is a visible failure
+		// and not a silent one.
+		if (depthValid && d >= nearestDepth) continue;
+		const float2 m = src.Load(int3(q, 0));
+		if (!all(isfinite(m))) continue;
+		nearestDepth = d;
+		nearestMotion = m;
+		depthValid = true;
+	}
+
+	// A neighbourhood with no usable depth anywhere keeps the centre's vector rather than a
+	// fabricated one: no depth means no evidence, and the centre is the only sample that is
+	// certainly on this texel's surface.
+	dst[p.xy] = depthValid ? nearestMotion : src.Load(int3(centre, 0));
 }
 )";
 
@@ -1047,7 +1314,8 @@ bool CreateEngineTexture(
 	uint32_t width,
 	uint32_t height,
 	DXGI_FORMAT format,
-	winrt::com_ptr<ID3D12Resource>& out
+	winrt::com_ptr<ID3D12Resource>& out,
+	bool share = false
 ) noexcept {
 	D3D12_HEAP_PROPERTIES heap{};
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1063,7 +1331,13 @@ bool CreateEngineTexture(
 	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
 		D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
-	return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+	// **Shared when our own runtime is in the slot**, so it can open the resource: a D3D12
+	// surface another API maps has to come from a shared heap, and `hipImportExternalMemory`
+	// otherwise accepts the handle and hands back a buffer that reads as zeroes - which looks
+	// exactly like an empty frame and is not. The vendored runtime opens the resource itself, so
+	// its path keeps the original heap and stays byte-for-byte the build it shipped as.
+	const D3D12_HEAP_FLAGS heapFlags = share ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE;
+	return SUCCEEDED(device->CreateCommittedResource(&heap, heapFlags,
 		&desc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
 		IID_PPV_ARGS(out.put())));
 }
@@ -1200,6 +1474,16 @@ struct DlssnrAmdBackend::Impl {
 	// kept apart because sampled detail and averaged detail fail differently and the figures
 	// decide which one this route wants.
 	bool pointSample = true;
+	// Which way round the upscaler is told about this frame's sub-pixel phase. The downsample
+	// pushes its sample by +jitter; the upscaler subtracts what it is handed. Whether those two
+	// agree is a convention neither side documents, so it is a switch rather than a conclusion:
+	// a wrong sign leaves a fixed 2x-jitter offset that never averages out, and a fixed offset
+	// is most visible exactly when nothing else is moving.
+	float jitterSign = 1.0f;
+	// Whether the upscaler is given this backend's trust map as its reactive mask, or the old
+	// constant. Off is the A/B: if the picture resolves more static detail with the constant,
+	// the map is firing where the history was in fact good.
+	bool reactiveMaskEnabled = true;
 
 	struct EventGuard {
 		HANDLE handle = nullptr;
@@ -1238,8 +1522,14 @@ struct DlssnrAmdBackend::Impl {
 	// generation the resolve is reading rather than against a fixed neighbour.
 	uint32_t pictureSlot = 0;
 	// The generation the temporal history was last advanced for. Sentinel, so the first frame
-	// always runs it.
+	// always runs it. The composite route keys this on pictureSlot (which surface the newest
+	// retired frame landed in); the reconstruction route keys it on the frame id, because it
+	// never assigns pictureSlot. Two variables rather than one: the two routes publish different
+	// quantities and sharing a single slot made the reconstruction route's condition degenerate
+	// to a permanent false after the first frame, which stopped the accumulation and left every
+	// later frame reconstructed from nothing -- the flicker.
 	uint32_t temporalSourceSlot = 0xFFFFFFFFu;
+	uint64_t temporalSourceFrame = ~0ull;
 	uint32_t slotJob[kSlots]{};
 	// The fence value this queue reaches when the frame in that slot is finished on the GPU.
 	//
@@ -1348,6 +1638,10 @@ struct DlssnrAmdBackend::Impl {
 	winrt::com_ptr<ID3D12PipelineState> convertInSrgb;
 	winrt::com_ptr<ID3D12PipelineState> convertOut;
 	winrt::com_ptr<ID3D12PipelineState> convertOutSrgb;
+	// Two variants for the same reason the output convert has two: whether the frame's own
+	// values are display-referred decides what the high frequencies are subtracted in.
+	winrt::com_ptr<ID3D12PipelineState> detailRestore;
+	winrt::com_ptr<ID3D12PipelineState> detailRestoreSrgb;
 
 	// Whether Magpie's frame is handed to the engine as linear values rather than as the
 	// sRGB-encoded ones it arrives in. Read from the ini so it can be A/B'd without a build.
@@ -1365,6 +1659,12 @@ struct DlssnrAmdBackend::Impl {
 	// highlight structure at the cost of dimming the top of the range; the reason it is a
 	// setting rather than a constant is on the conversion shader.
 	uint32_t shoulderMilli = 850;
+	// How much of the full-resolution frame's high frequencies is added back over the
+	// reconstructed picture, in thousandths. Zero turns the pass off and gives the old
+	// output exactly. At a reduced input scale this is the only source of the detail the
+	// downscale discarded, which is why it defaults on rather than off.
+	uint32_t detailStrengthMilli = 500;
+	bool detailLogged = false;
 
 	// Only so the engine-value line is printed when something changes rather than per frame.
 	int loggedStyle = -1;
@@ -1398,6 +1698,10 @@ struct DlssnrAmdBackend::Impl {
 #endif
 	winrt::com_ptr<ID3D11Texture2D> netShared11;
 	winrt::com_ptr<ID3D12Resource> netShared12;
+	// The trust map, shared for the same reason netShared is: the upscaler runs on a D3D12
+	// device of its own, and a resource made on this one is invisible to it until it is shared.
+	// Same GPU throughout -- a D3D12 device is a context, not a piece of hardware.
+	winrt::com_ptr<ID3D11Texture2D> trustShared11;
 	// Where the encode lands before it crosses. A texture this device owns outright, so the
 	// encoding pass writes somewhere no other device has an interest in; the crossing is a
 	// plain copy afterwards, which is the shape this backend has always used and the only one
@@ -1435,7 +1739,17 @@ struct DlssnrAmdBackend::Impl {
 	// writes the other. Alpha in both carries validity, not opacity.
 	winrt::com_ptr<ID3D12Resource> historyResidual[2];
 	winrt::com_ptr<ID3D12Resource> historyGuide[2];
+	// How much history the temporal pass believed, per pixel, for the upscaler's reactive mask.
+	// One of these, not two: the pass writes the trust for the frame it is producing, and the
+	// upscaler consumes it in the same frame -- there is no history of it to keep.
+	winrt::com_ptr<ID3D12Resource> historyTrust;
 	uint32_t historyIndex = 0;
+	// Where the reconstruction route puts the picture after the temporal pass has had its say.
+	// Before this existed the route handed the engine's own output straight to the upscaler,
+	// which is why the flicker the composite route was built to remove came back the moment
+	// reconstruction was switched on. Made on the first frame that needs it, at the network's
+	// extent; never shared, because only this side reads it.
+	winrt::com_ptr<ID3D12Resource> smoothedNet;
 
 	// The blend weight comes from the capture interval, so the accumulation is a duration in
 	// real time rather than a frame count -- upstream derives it the same way,
@@ -1445,6 +1759,17 @@ struct DlssnrAmdBackend::Impl {
 	uint64_t lastRevision = 0;
 	uint64_t lastTimestamp = 0;
 	bool temporalValid = false;
+	// The time constant of the blend, in milliseconds. Upstream's own figure is 80 ms, chosen
+	// when the engine ran at a rate where a 20-30 ms interval already produced a weight near
+	// 0.75. This build runs the reconstruction route at 45-65 ms per frame, where the same
+	// constant yields 0.45-0.56 and the carried residual is the minority of the blend -- which
+	// is why the shadow flicker survived the accumulation. Read from the ini so the trade can
+	// be moved rather than rebuilt: a longer constant smooths more but carries a change further,
+	// which is the trailing-ghost trade on moving content.
+	uint32_t temporalTauMs = 80;
+	// A/B knob for the moving-edge over-sharpen. 1 disables the neighbourhood-range clamp on the
+	// carried residual (safe = old, unclamped), so the effect of the clamp can be isolated.
+	bool clampHistory = true;
 
 	// The effect's own parameters, kept so the per-pass block can drive the engine from
 	// them. Magpie rebuilds the effect when they change, so this is how new values arrive.
@@ -1454,6 +1779,17 @@ struct DlssnrAmdBackend::Impl {
 	// which is exactly what ran before any of this existed. One is static accumulation, two
 	// and above reproject the history with optical flow.
 	int antiFlickerMode = 0;
+
+	// The anti-flicker filter that the shipped effect carries, reused here rather than
+	// reimplemented. It is the same class the NGX path runs and it is the one whose output a
+	// user compared against this backend's own accumulation and preferred; writing a second
+	// one from the same description would only be a different set of mistakes.
+	//
+	// It is a D3D11 pass over the finished picture -- input, base and the engine's raw answer
+	// in, a stabilised picture out -- so it chains after the reconstruction has written the
+	// output copy rather than inside the D3D12 side. Its history is a residual history: it
+	// never feeds an accumulated image back into the network.
+	std::unique_ptr<DLSSNRTemporal> postTemporal;
 
 	// Optical flow, supplied by Magpie's provider and opened into this device through the
 	// same interop the NGX path uses. The engine is a temporal network: with no motion it
@@ -1481,6 +1817,15 @@ struct DlssnrAmdBackend::Impl {
 	// the engine works on `full` directly -- the path that shipped before this existed.
 	uint32_t netWidth = 0, netHeight = 0;
 	float modelScale = 1.0f;
+	// Where `modelScale` comes from, kept apart so `CreateSized` can decide once it knows which
+	// path the session took. `requestedScale` is the percentage slider or the ini fallback;
+	// `tierRebuildsRuntime` says a tier was asked for, in which case the runtime rebuilt its
+	// network at that extent and nothing here is scaled at all.
+	float requestedScale = 1.0f;
+	bool tierRebuildsRuntime = false;
+	// The tier as the user named it, in pixels of height, or 0 for none. Reported in the
+	// startup line so a run states which extent its network was built for.
+	int tierPixels = 0;
 	bool scaled = false;
 
 	HMODULE runtime = nullptr;
@@ -1500,6 +1845,16 @@ struct DlssnrAmdBackend::Impl {
 	// unlike every other resource this backend owns. Set at the end of InitEngine and never
 	// cleared, because nothing here tears the engine down. See the note there.
 	bool engineUp = false;
+	// True when the runtime in `runtime` is ours (host/ours_small.cpp) rather than the vendored
+	// image. `runtime` is then a zeroed block standing in for a data section, not a module.
+	bool oursRuntime = false;
+	// True when the runtime in `runtime` is the Vulkan path (glsl_vk_shim.dll over Mochizuki).
+	// It is kept apart from oursRuntime because the two runtimes have different ceilings and the
+	// ceiling is applied before anything is allocated: Mochizuki's Small network runs at any
+	// extent up to 16384x16384 the runtime admits, while the pak's Small schedule exists only at
+	// 1920x1152. Clamping the Vulkan path to the pak's budget would throw away the whole reason
+	// for having it.
+	bool vulkanRuntime = false;
 	// The engine loads kernels and builds its pipeline on the first job or two, so
 	// the first frames legitimately take far longer than the steady state. A single
 	// slow frame is a frame to skip, not a reason to disable the effect for good.
@@ -1601,7 +1956,13 @@ struct DlssnrAmdBackend::Impl {
 		return h;
 	}
 
-	bool LoadRuntime() noexcept;
+	// LoadRuntime takes the model choice. The two runtimes are not interchangeable: our shim
+	// runs only the small schedule, and the vendored image is the one that runs the large one.
+	bool LoadRuntime(bool smallModel) noexcept;
+	// Loads host/ours_small.cpp when it is beside the exe AND the session asked for the small
+	// model. False means the vendored runtime is the one to use, which is the path every
+	// existing installation takes.
+	bool TryLoadOurs(bool smallModel) noexcept;
 	bool CreateHip() noexcept;
 	bool CreatePipeline() noexcept;
 	bool CreateSized(uint32_t w, uint32_t h, DXGI_FORMAT inFmt, DXGI_FORMAT outFmt) noexcept;
@@ -1609,14 +1970,34 @@ struct DlssnrAmdBackend::Impl {
 	bool CreateExposure() noexcept;
 	void Bind(uint32_t tableSlot, ID3D12Resource* srv, DXGI_FORMAT srvFormat,
 		ID3D12Resource* uav, DXGI_FORMAT uavFormat) noexcept;
+	// A resource the shader only reads, and reads on its own. The pair Bind writes is not
+	// usable for it: that helper always occupies two consecutive descriptors, so a shader with
+	// two textures and one unordered target cannot be served by it.
+	void BindSource(uint32_t tableSlot, ID3D12Resource* srv, DXGI_FORMAT srvFormat) noexcept;
+	// `targetTexture` is what the edit is added onto; pass the same resource as `srv` unless
+	// the caller needs the gate to compare against something other than the output base.
 	void BindResolve(uint32_t tableSlot, ID3D12Resource* srv, ID3D12Resource* uav,
-		ID3D12Resource* baselineTexture, ID3D12Resource* edited) noexcept;
+		ID3D12Resource* baselineTexture, ID3D12Resource* edited,
+		ID3D12Resource* targetTexture = nullptr) noexcept;
+	// The reconstructed picture and the full-resolution frame it is missing detail from. The
+	// second one starts the table that follows, which is why this pass is dispatched with
+	// `residualTableSlot` at tableSlot + 2 rather than left at zero.
+	void BindDetail(uint32_t tableSlot, ID3D12Resource* base, DXGI_FORMAT baseFormat,
+		ID3D12Resource* dst, DXGI_FORMAT dstFormat, ID3D12Resource* source,
+		DXGI_FORMAT sourceFormat) noexcept;
 	void BindTemporal(uint32_t tableSlot, ID3D12Resource* edited, ID3D12Resource* nextResidual,
-		ID3D12Resource* nextGuide, ID3D12Resource* baselineTexture,
+		ID3D12Resource* nextGuide, ID3D12Resource* nextTrust, ID3D12Resource* baselineTexture,
 		ID3D12Resource* historyResidualTexture,
 		ID3D12Resource* historyGuideTexture, ID3D12Resource* motionTexture) noexcept;
 	void CreateSrv(ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE where) noexcept;
-	bool RunTemporal(const NativeEffectDrawContext& context) noexcept;
+	// `sourceSlot` is the surface the picture to be edited is in, and it is the caller's to
+	// name rather than this pass's to infer. The two routes publish different quantities: the
+	// composite route knows the newest retired frame's slot (pictureSlot), while the
+	// reconstruction route is handed the frame it is about to encode in `slot`. Reading
+	// pictureSlot here unconditionally made the reconstruction route reproject against slot 0
+	// every frame -- a surface holding some other generation, or nothing -- which is the
+	// trailing ghost that stayed after the accumulation itself started working.
+	bool RunTemporal(const NativeEffectDrawContext& context, uint32_t sourceSlot) noexcept;
 	void Dispatch(ID3D12PipelineState* pso, uint32_t tableSlot) noexcept;
 	// `residualTableSlot` is where the second descriptor table starts, or 0 for a pass that
 	// has no second table. It is a slot rather than a flag because the passes lay their
@@ -1657,8 +2038,214 @@ struct DlssnrAmdBackend::Impl {
 		float* meanAbsDelta = nullptr) noexcept;
 };
 
-bool DlssnrAmdBackend::Impl::LoadRuntime() noexcept {
+// Our own network runtime, when host/ours_small.cpp is beside the exe.
+//
+// It exports Init, Record and Notify by name instead of leaving them at fixed offsets in an
+// image compiled from other sources, so those three are resolved here. Its data section does
+// not exist either: the backend stores device, queue and flags through kOffsets050's offsets,
+// and those land in a zeroed block this function allocates and hands to the DLL. The offsets
+// are the same table on both sides, which is the whole of the contract.
+//
+// False leaves the vendored runtime as the one to load, which is what every existing
+// installation does - the DLL is not shipped by default.
+//
+// The runtime follows the model, and that is the whole of the hot-switch fix. Our shim runs only
+// the small schedule; the vendored image is what runs the large one. LoadRuntime is reached from
+// Initialize, where the model setting is already known, so the choice is passed in rather than
+// guessed from which DLL happens to be beside the exe. Before this parameter existed TryLoadOurs
+// loaded the shim whenever the DLL was present, which meant selecting the LARGE model handed the
+// engine the shim's fake state block plus the vendored offsets: the engine read device, queue and
+// every flag from addresses a megabyte away from the real image. The session then ran, published
+// frames, and the picture was neither model's output -- which is what a person looks at and
+// calls "the old model, but wrong".
+bool DlssnrAmdBackend::Impl::TryLoadOurs(bool smallModel) noexcept {
+	const auto dir = ExeDirectory();
+	// Two shims, two runtimes, and the small model has one of its own.
+	//
+	// The Vulkan path goes first because it is the one that runs the Small network at capture
+	// size on this card. It is selected by what is on disk rather than by a key, exactly like the
+	// shim below it, and it refuses to load unless its own runtime and model file are both
+	// present -- so an installation that has never seen it behaves as if it did not exist.
+	//
+	// Both the small and the large model can be served by either runtime, and the difference is
+	// not quality but which network the file contains:
+	//
+	//   glsl_vk_shim.dll        Mochizuki's Vulkan runtime. Small = 31 blocks at any extent up to
+	//                           16384x16384; Original = 310.8. Measured 64.35 ms at 3840x2160
+	//                           through NRLive on this card. First session compiles 109 pipelines
+	//                           (~50 s) and caches the result.
+	//   dlssnr_ours_small.dll   the HIP shim over AMDNR's pak. Small there means the pak's own
+	//                           31-block schedule, which only exists at 1920x1152.
+	//
+	// The Vulkan path is the small-model route the user asked for: same integration as NRLive,
+	// without NRLive's framework (whose keyboard latency came from its own overlay and input
+	// hooking, not from the network).
+	//
+	// VulkanSmall\Enabled=0 in the ini, or vk_disabled.txt beside the exe, turns it off and
+	// leaves the pak shim as the small-model runtime -- which is what every existing profile was
+	// measured against.
+	{
+		auto vkExists = [&dir](const wchar_t* name) {
+			std::error_code e;
+			return std::filesystem::exists(dir / name, e);
+		};
+		const bool vkDisabled = vkExists(L"vk_disabled.txt");
+		wchar_t vkOn[8] = {};
+		GetPrivateProfileStringW(L"VulkanSmall", L"Enabled", L"1", vkOn, 8,
+			(dir / kIniName).c_str());
+		// settings.wantVulkanShim is the panel's choice, and it is what makes the two small-model
+		// options distinct. Both run the 31-block network, so `smallModel` alone cannot tell them
+		// apart -- without this, picking "Small on the pak" would still land on the Vulkan path,
+		// and the option would look like it did nothing.
+		const bool vkWanted = (vkOn[0] != L'0') && !vkDisabled && settings.wantVulkanShim != 0;
+		const auto vkShim = dir / L"glsl_vk_shim.dll";
+		if (vkWanted && !smallModel) {
+			Logger::Get().Info(
+				"DLSSNR AMD: the large model was selected; the Vulkan path serves the small model "
+				"only, so the pak shim is used (its large model is the pak's 68-block schedule at "
+				"NetworkHeight)");
+		} else if (vkWanted) {
+			if (!vkExists(L"glsl_vk_shim.dll")) {
+				Logger::Get().Info("DLSSNR AMD: glsl_vk_shim.dll is not present; the smallest "
+					"model will run on the pak shim at 1920x1152");
+			} else if (!vkExists(L"opennr\\MochizukiNrRuntime.dll") ||
+				!vkExists(L"opennr\\dlssnr-amd\\dlssnr-small.bin")) {
+				Logger::Get().Error(fmt::format(
+					"DLSSNR AMD: glsl_vk_shim.dll is present but {} is missing; the Vulkan path "
+					"needs opennr\\MochizukiNrRuntime.dll and opennr\\dlssnr-amd\\dlssnr-small.bin "
+					"beside it. Falling back to the pak shim.",
+					vkExists(L"opennr\\MochizukiNrRuntime.dll")
+						? "dlssnr-small.bin"
+						: "MochizukiNrRuntime.dll"));
+			} else {
+				HMODULE vkMod = LoadLibraryExW(vkShim.c_str(), nullptr,
+					LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+				if (!vkMod) {
+					Logger::Get().Error(fmt::format(
+						"DLSSNR AMD: glsl_vk_shim.dll would not load (error {})", GetLastError()));
+				} else {
+					auto attach = reinterpret_cast<void (*)(void*)>(
+						GetProcAddress(vkMod, "NrAttach"));
+					auto initFn = reinterpret_cast<InitFn>(GetProcAddress(vkMod, "NrInit"));
+					auto recordFn = reinterpret_cast<RecordFn>(GetProcAddress(vkMod, "NrRecord"));
+					auto notifyFn = reinterpret_cast<NotifyFn>(GetProcAddress(vkMod, "NrNotify"));
+					if (!attach || !initFn || !recordFn || !notifyFn) {
+						Logger::Get().Error(
+							"DLSSNR AMD: glsl_vk_shim.dll does not export "
+							"NrAttach/NrInit/NrRecord/NrNotify");
+					} else {
+						void* state = VirtualAlloc(nullptr, 0x100000,
+							MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+						if (state) {
+							attach(state);
+							rva = &kOffsets050;
+							runtime = reinterpret_cast<HMODULE>(state);
+							init = initFn;
+							record = recordFn;
+							notify = notifyFn;
+							Engine().runtime = runtime;
+							Engine().rva = rva;
+							Engine().runtimeIsOurs = true;
+							oursRuntime = true;
+							vulkanRuntime = true;
+							Logger::Get().Info(
+								"DLSSNR AMD: small model on the Vulkan path "
+								"(glsl_vk_shim.dll -> opennr\\MochizukiNrRuntime.dll); the first "
+								"session compiles the network and takes about a minute");
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	const auto path = dir / L"dlssnr_ours_small.dll";
+	std::error_code ec;
+	// Both models run through the shim, and the cost is known and accepted.
+	//
+	// The shim is a thin forwarder to LmxxfNrRuntime, and the pak behind it does not honour
+	// DLSS5_MULTI_PASS: its startup line reports skip=42,43,46 whether that key says 0.5 or 1,
+	// measured both ways. So "large model" here means the pak's 68-block schedule, not the
+	// lmxxf build's all-71. What it does honour is the network tier, and that is the trade
+	// being taken: 68 blocks at 1280x768 runs near 20 ms where the vendored runtime's 71
+	// blocks at 1920x1152 runs 42-45 ms. The vendored image has no tier key at all -- the
+	// string does not occur in it -- so the "real 71 blocks" path cannot be made fast this way.
+	//
+	// The earlier guard that sent the large model to the vendored runtime was written for a
+	// shim that ran only the small schedule. This one forwards both, so the guard would now
+	// cost the tier for no gain in blocks.
+	//
+	// Said after the choice below rather than here: both large-model options arrive with
+	// smallModel=false, and this line used to print for the vendored one too -- a run that then
+	// announced it was standing aside two lines later. Whoever read the log saw two statements
+	// that contradicted each other and could not tell which one had taken effect.
+	if (!std::filesystem::exists(path, ec)) {
+		return false;
+	}
+	// A marker file, not an environment variable: the game is started by hand, so whoever starts
+	// it decides the environment, and an A/B against the shipped runtime that silently ran this
+	// one instead is exactly the confusion this prevents. Deleting or creating this file is the
+	// whole switch.
+	if (std::filesystem::exists(dir / L"ours_disabled.txt", ec)) {
+		Logger::Get().Info("DLSSNR AMD: ours_disabled.txt present, using the shipped runtime");
+		return false;
+	}
+	// The panel's "Large 71-block - vendored runtime" option asks for the image this shim stands
+	// in front of. Both large options select the same network by amdSmallModel, so the choice
+	// number is what distinguishes them: 2 is the pak shim's own 68-block schedule, 3 is the
+	// vendored image. Standing aside for 3 is what makes those two comparable.
+	if (settings.networkChoice == 3) {
+		Logger::Get().Info("DLSSNR AMD: the 71-block vendored runtime was selected; the pak shim "
+			"is standing aside (choose the 68-block option to use it instead)");
+		return false;
+	}
+	if (!smallModel) {
+		Logger::Get().Info("DLSSNR AMD: the 68-block pak schedule was selected; this runtime "
+			"honours the network tier, so Network Size applies (the runtime's own block list "
+			"reports skip=42,43,46 either way -- see its startup line)");
+	}
+	HMODULE mod = LoadLibraryExW(path.c_str(), nullptr,
+		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+	if (!mod) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR AMD: dlssnr_ours_small.dll would not load (error {})", GetLastError()));
+		return false;
+	}
+	auto attach = reinterpret_cast<void (*)(void*)>(GetProcAddress(mod, "NrAttach"));
+	auto initFn = reinterpret_cast<InitFn>(GetProcAddress(mod, "NrInit"));
+	auto recordFn = reinterpret_cast<RecordFn>(GetProcAddress(mod, "NrRecord"));
+	auto notifyFn = reinterpret_cast<NotifyFn>(GetProcAddress(mod, "NrNotify"));
+	if (!attach || !initFn || !recordFn || !notifyFn) {
+		Logger::Get().Error(
+			"DLSSNR AMD: dlssnr_ours_small.dll does not export NrAttach/NrInit/NrRecord/NrNotify");
+		return false;
+	}
+	// 0x100000 covers the whole of kOffsets050's span (the last field is 0xb6b88); the block is
+	// never freed, exactly like the image it stands in for.
+	void* state = VirtualAlloc(nullptr, 0x100000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	if (!state) {
+		return false;
+	}
+	attach(state);
+	rva = &kOffsets050;
+	runtime = reinterpret_cast<HMODULE>(state);
+	init = initFn;
+	record = recordFn;
+	notify = notifyFn;
+	Engine().runtime = runtime;
+	Engine().rva = rva;
+	Engine().runtimeIsOurs = true;
+	oursRuntime = true;
+	Logger::Get().Info("DLSSNR AMD: using our own network runtime (dlssnr_ours_small.dll)");
+	return true;
+}
+
+bool DlssnrAmdBackend::Impl::LoadRuntime(bool smallModel) noexcept {
 	if (runtime) {
+		return true;
+	}
+	if (TryLoadOurs(smallModel)) {
 		return true;
 	}
 
@@ -1673,16 +2260,85 @@ bool DlssnrAmdBackend::Impl::LoadRuntime() noexcept {
 		// the loader's own path in KERNELBASE on the stack, entering the runtime's image, on the
 		// thread that was already inside it -- so re-entering the loader here, for a module this
 		// process holds and will hold until it exits, is worth not doing.
-		runtime = host.runtime;
-		rva = host.rva;
-	} else {
+		//
+		// What this branch used to miss is that "the process already has a runtime" is not the
+		// same statement as "the process already has the runtime this session asked for". The
+		// two runtimes are selected by a file's existence (dlssnr_ours_small.dll beside the exe),
+		// and that file can be added or removed between sessions -- which is exactly what
+		// switching between the models means. Adopting unconditionally therefore silently ran
+		// the runtime from the first session forever: turning the ours DLL off and on again
+		// kept running ours, and turning it on after the vendored image had been loaded kept
+		// running the vendored image. Refusing with a message is the honest outcome, because the
+		// one thing that cannot be done here is load the other one: the module in use has
+		// threads inside it, and unloading it under them is the bugcheck ~Impl exists to avoid.
+		// TryLoadOurs returns false for two different reasons -- the file is absent, or it is
+		// present but would not load -- and the second is reported there. What matters here is
+		// the first: whether this session wants ours at all.
+		// Whether this session should be running our shim. That is two conditions, not one:
+		// the DLL has to be present AND the session has to have asked for the small model,
+		// because the shim only runs the small schedule. Testing the file alone answered true
+		// for the large model too, so every large-model session after the first looked like a
+		// request to swap runtimes and was rejected -- the effect fell back to NGX and only a
+		// Magpie restart brought it back. That is the whole of the "large model works once"
+		// report.
+		std::error_code probeEc;
+		const bool wantOurs =
+			smallModel &&
+			std::filesystem::exists(ExeDirectory() / L"dlssnr_ours_small.dll", probeEc) &&
+			!std::filesystem::exists(ExeDirectory() / L"ours_disabled.txt", probeEc);
+		// Whether the runtime already loaded is ours. Recorded when it was loaded rather than
+		// inferred: both runtimes set `rva`, so a null-rva test answers false for the shim too
+		// and this check never fired. That is what let the vendored runtime adopt the shim's
+		// state block -- see EngineHost::runtimeIsOurs.
+		const bool haveOurs = host.runtimeIsOurs;
+		if (wantOurs != haveOurs) {
+			// The runtime in use cannot be swapped for the other kind, but WHY it cannot
+			// depends on whether the engine has been brought up against it.
+			//
+			// Before any bring-up, the difference is only which pointers this backend holds:
+			// the modules are loaded, nothing has been initialised against them, and the
+			// session can simply load the one it wants. Re-loading the vendored image is safe
+			// (LoadLibrary only bumps a refcount); the shim allocates a fresh state block.
+			// Resetting Engine()'s runtime/rva here is what makes that possible -- without it
+			// the new runtime was paired with the old state block, which is the run where the
+			// vendored image indexed the shim's 1 MB allocation with offsets meant for a 38 MB
+			// image and the session died in seconds.
+			//
+			// After a bring-up, neither runtime can be swapped at all: the engine holds
+			// references into whichever one it was initialised against, and a second init
+			// faults the GPU. That case genuinely needs a restart, and says so.
+			if (host.started) {
+				Logger::Get().Error(fmt::format(
+					"DLSSNR AMD: this process has already brought the engine up against the "
+					"{}; switching to the {} needs Magpie restarted, because the engine holds "
+					"references into the runtime it was initialised with and a second init "
+					"faults the GPU",
+					haveOurs ? "our own network runtime (dlssnr_ours_small.dll)"
+							 : "vendored runtime (dlssnr_amd_pass1.dll)",
+					wantOurs ? "ours" : "vendored one"));
+				return false;
+			}
+			Logger::Get().Info(fmt::format(
+				"DLSSNR AMD: switching from the {} to the {} (no engine brought up yet, so "
+				"the load can be replaced)",
+				haveOurs ? "our own network runtime" : "vendored runtime",
+				wantOurs ? "our own network runtime" : "vendored runtime"));
+			host.runtime = nullptr;
+			host.rva = nullptr;
+			host.runtimeIsOurs = false;
+			// The load for the requested runtime happens at the bottom, which is also what the
+			// never-loaded case does.
+		} else {
+			runtime = host.runtime;
+			rva = host.rva;
+		}
+	}
+	if (!runtime) {
 		const auto dir = ExeDirectory();
 		const auto runtimePath = dir / kRuntimeName;
-		const auto weightsPath = dir / kWeightsName;
 
 		std::error_code ec;
-		if (!std::filesystem::exists(runtimePath, ec) ||
-			!std::filesystem::exists(weightsPath, ec)) {
+		if (!std::filesystem::exists(runtimePath, ec) || !WeightsPresent(dir, ec)) {
 			return false;
 		}
 		rva = IdentifyRuntime(runtimePath);
@@ -1714,6 +2370,11 @@ bool DlssnrAmdBackend::Impl::LoadRuntime() noexcept {
 		}
 		host.runtime = runtime;
 		host.rva = rva;
+		// Explicit, not inherited. This field outlives the session, so leaving it at whatever
+		// a previous shim session set made the next vendored session look like "ours" and the
+		// switch check below rejected it -- the effect then fell through to NGX and the model
+		// could only be brought back by restarting Magpie.
+		host.runtimeIsOurs = false;
 	}
 
 	init = reinterpret_cast<InitFn>(reinterpret_cast<uintptr_t>(runtime) + rva->init);
@@ -2459,12 +3120,13 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 	// of two SRVs from t1, and twenty-four 32-bit constants. No static sampler. The
 	// conversion shaders above use the same layout, which is why there is only one.
 	// Two UAVs, not one: the temporal pass writes the residual and the guide it will be
-	// measured against next frame. A shader that binds a register the root signature does
+	// measured against next frame. Three, not two: it also writes the trust map the upscaler
+	// consumes as its reactive mask. A shader that binds a register the root signature does
 	// not cover makes CreateComputePipelineState fail, and that failure used to be silent --
 	// see the note in the compile lambda.
 	D3D12_DESCRIPTOR_RANGE ranges[2]{};
 	ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
-	ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 1 };
+	ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 1 };
 
 	D3D12_ROOT_PARAMETER params[3]{};
 	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -2546,6 +3208,10 @@ bool DlssnrAmdBackend::Impl::CreatePipeline() noexcept {
 			nullptr, convertOut) &&
 		compile(kConvertOutShader, sizeof(kConvertOutShader) - 1, "convert out linear",
 			srgbMacros, convertOutSrgb) &&
+		compile(kDetailRestoreShader, sizeof(kDetailRestoreShader) - 1, "detail restore",
+			nullptr, detailRestore) &&
+		compile(kDetailRestoreShader, sizeof(kDetailRestoreShader) - 1,
+			"detail restore linear", srgbMacros, detailRestoreSrgb) &&
 		compile(kDownsampleShader, sizeof(kDownsampleShader) - 1, "downsample",
 			nullptr, downsample) &&
 		compile(kResolveShader, sizeof(kResolveShader) - 1, "resolve",
@@ -2662,10 +3328,78 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 	// exposure hunting, which stopped when the host began supplying an exposure. Left in
 	// place it silently raised every request below half, which is what the user saw: 25%
 	// asked for, 50% applied, and a frame rate to match.
+	// What the surface is scaled to, and a tier does not exempt it from a ceiling.
+	//
+	// The tier rebuilds the runtime's network -- that is what makes it worth having -- but the
+	// surface handed to that network is a separate thing. Feeding the capture's own 3840x2160
+	// into a runtime whose largest network is 1920x1152 is not "letting the tier do the work":
+	// the shim refuses the frame outright, the backend has already committed to reading the
+	// surface back, and the session dies before it draws one. That is exactly what happened
+	// with a tier selected and no ceiling applied.
+	//
+	// So the surface is fitted into the runtime's budget first, and the runtime then rebuilds
+	// its network inside that. Below the budget nothing is scaled and the two paths agree.
+	if (tierRebuildsRuntime) {
+		// The tier is an absolute height, and it has to be honoured for anything below the card's
+		// own ceiling -- otherwise "720" means "1080", which is what it meant here: the budget
+		// below fits the surface into the largest extent the pak accepts, and that is 1920x1080
+		// whatever the tier says. The pak rebuilds its network from its own key so the surface
+		// size did not matter there; the Vulkan path has no such key, so the surface IS the
+		// network's extent and this is the only place the tier can act.
+		//
+		// Above the ceiling the old fit still applies, so a 1440 tier on a 1080 card stays at
+		// 1080 rather than asking for a surface the pak cannot run.
+		const uint32_t tierWantedH = uint32_t(std::max(0, tierPixels));
+		// The ceiling depends on who is running. The pak accepts nothing above 1920x1152, so a
+		// 1440 or 2160 tier there clamps to 1080. The Vulkan runtime admits far larger extents,
+		// so those two are real options for it -- and on this card 2160 costs about 62 ms a
+		// frame, which is why they are opt-in rather than what Auto picks.
+		const uint32_t ceilingH = vulkanRuntime ? std::max(32u, h)
+			: std::max(32u, std::min(h, 1080u));
+		const uint32_t capH = ceilingH;
+		const uint32_t targetH = (tierWantedH > 0) ? std::min(tierWantedH, ceilingH) : capH;
+		const float scaleByH = float(targetH) / float(std::max(h, 1u));
+		const uint32_t ceilingW = vulkanRuntime ? std::max(32u, w)
+			: std::max(32u, std::min(w, 1920u));
+		const float budgetW = float(ceilingW) / float(std::max(w, 1u));
+		modelScale = std::min(budgetW, scaleByH);
+	} else if (vulkanRuntime) {
+		// Auto on the Vulkan path. Its ceiling is the runtime's admission limit (16384), not the
+		// pak's 1920x1080, so "nothing was asked for" would hand the network the capture size --
+		// and at 3840x2160 that is 62.6 ms a frame, which presents as a frozen picture and is
+		// what made Auto look like a black screen. Auto therefore means the same extent the pak
+		// would pick, and the 2160 option exists for anyone who wants the capture size and
+		// accepts the cost.
+		const float budgetW = float(std::max(32u, std::min(w, 1920u))) / float(std::max(w, 1u));
+		const float budgetH = float(std::max(32u, std::min(h, 1080u))) / float(std::max(h, 1u));
+		modelScale = std::min(budgetW, budgetH);
+	} else {
+		modelScale = requestedScale;
+	}
+	// The Vulkan path's ceiling is the runtime's own admission limit, and it is much larger. Its
+	// Small network is 31 blocks regardless of extent, and it ran 3840x2160 in 64.35 ms through
+	// NRLive on this card -- so feeding it the capture size is the point, not an overshoot. The
+	// budget above belongs to the pak, whose Small schedule has no kernels outside 1920x1152 and
+	// refuses the frame rather than running a different one.
+	const uint32_t ceilLimitW = vulkanRuntime ? 16384u : 1920u;
+	const uint32_t ceilLimitH = vulkanRuntime ? 16384u : 1080u;
+
 	const uint32_t scaledW = uint32_t(float(w) * modelScale + 0.5f);
 	const uint32_t scaledH = uint32_t(float(h) * modelScale + 0.5f);
-	netWidth = std::clamp(scaledW, 32u, w);
-	netHeight = std::clamp(scaledH, 32u, h);
+	// The same ceiling, applied after the scale so no path can slip past it. The runtime states
+	// its own limit -- "Model B runs only at the 1920x1152 network (this size is not ported)" --
+	// and what an oversize surface produces is not a worse edit but a refused frame that leaves
+	// the display showing whatever was already in the buffer.
+	//
+	// This used to apply to the small model only, on the reading that the large model "has its
+	// own tiers". It does have tiers, and they are all inside the same 1920x1152 budget: the
+	// 1440 and native sizes the runtime names are RDNA 4 paths this card never takes. Applying
+	// the cap to both is what the runtime actually accepts, and the tier selection is unaffected
+	// because it is a separate argument the runtime resolves itself.
+	const uint32_t ceilW = std::max(32u, std::min(w, ceilLimitW));
+	const uint32_t ceilH = std::max(32u, std::min(h, ceilLimitH));
+	netWidth = std::clamp(scaledW, 32u, ceilW);
+	netHeight = std::clamp(scaledH, 32u, ceilH);
 
 	downscaling = netWidth != w || netHeight != h;
 	// The resolve path runs whenever the network is smaller than the capture, and also when
@@ -2688,7 +3422,7 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 	// hands over exactly one such pointer as `Packet::colour`.
 	for (uint32_t i = 0; i < kSlots; ++i) {
 		if (!CreateEngineTexture(device12.get(), netWidth, netHeight,
-				DXGI_FORMAT_R16G16B16A16_FLOAT, net[i])) {
+				DXGI_FORMAT_R16G16B16A16_FLOAT, net[i], oursRuntime)) {
 			return false;
 		}
 	}
@@ -2718,6 +3452,14 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 		}
 		historyIndex = 0;
 		temporalValid = false;
+		// Shared rather than an engine texture: the temporal pass writes it here, and the
+		// upscaler -- which is on its own D3D12 device -- reads it. `allowUav` is what lets
+		// this side create the UAV the pass needs on a texture the other side created.
+		if (!CreateSharedTexture(device11, device12.get(), netWidth, netHeight,
+				DXGI_FORMAT_R8_UNORM, true, trustShared11, historyTrust)) {
+			Logger::Get().Error("DLSSNR AMD: the reconstruction could not share its trust map");
+			return false;
+		}
 	}
 	// The engine's input contract names motion and depth. This backend has no source for
 	// either, and zero-filled buffers are what the reference feeds when a game offers
@@ -2741,6 +3483,7 @@ bool DlssnrAmdBackend::Impl::CreateSized(
 bool DlssnrAmdBackend::Impl::CreateReconstruction(
 	DeviceResources& resources, ID3D11Texture2D* output
 ) noexcept {
+	(void)resources;   // the reconstruction path builds its own textures; kept for the signature
 	reconstruction.reset();
 	netShared11 = nullptr;
 	netShared12 = nullptr;
@@ -2816,15 +3559,57 @@ bool DlssnrAmdBackend::Impl::CreateReconstruction(
 			return false;
 		}
 	}
-	// Version 3.1.5, deliberately: FSR 4.1.1 is the FSR4\FSR4_SR effect's own business, and
-	// that effect already asks for it. This route is the reconstruction the DLSSNR network
-	// feeds, not a super-resolution mode of its own.
+	// Which upscaler reconstructs. FSR 3.1.5 by default, FSR 4.1.1 on request.
+	//
+	// FSR4 is a KPN temporal upscaler: it accumulates sub-pixel phase across frames through a
+	// recursive state that motion vectors reproject. It therefore needs jitter on the render-
+	// resolution inputs and warns against a jitter sequence containing (0,0) -- without it the
+	// kernel predictor degenerates to a plain spatial scaler. This route does set a jitter
+	// (SetJitter, below), so it gives FSR4 something real to accumulate; what it cannot give it
+	// is the game's own per-pixel motion, because the frame arrives already resolved and the
+	// motion here is estimated by AMD's optical flow. That mismatch is the reason to compare the
+	// two side by side rather than assume the newer one wins:
+	//
+	//   [DlssNrOnAmd]   UseFsr4=1
+	//
+	// It is an ini key rather than an effect parameter so both can be measured from one build.
+	// FSR 4.1.1 by default: it is the one the reconstruction route is tuned for, and the
+	// older 3.1.5 stays available through the same key for anyone who wants the trade.
+	const bool useFsr4 = GetPrivateProfileIntW(L"DlssNrOnAmd", L"UseFsr4", 1,
+		(ExeDirectory() / kIniName).c_str()) != 0;
 	auto upscaler = std::make_unique<FSR3Upscaler>();
 	if (!upscaler->Initialize(resources, netShared11.get(), output,
-			settings.motionRequest)) {
-		Logger::Get().Error("DLSSNR AMD: the FSR3 upscaler refused to initialise");
-		return false;
+			settings.motionRequest, useFsr4,
+			reactiveMaskEnabled ? trustShared11.get() : nullptr)) {
+		// A legal resolution setting can ask for more upscaling than this backend accepts --
+		// the control goes down to 25%, which is a 4x scale at a 4K capture, and the upscaler
+		// stops at 3x. Refusing here takes the whole effect down: the renderer moves on to the
+		// other backends, finds none of them either, and reports only that the backend failed,
+		// which says nothing about a resolution slider.
+		//
+		// The resolve route has no such limit, so the picture still comes out -- it just does
+		// not get the upscaler's reconstruction. A worse picture beats no effect at all, and
+		// the reason is said here rather than inferred from a generic failure further up.
+		Logger::Get().Warn(
+			"DLSSNR AMD: the FSR upscaler refused this scale (it stops at 3x, and the "
+			"resolution setting asked for more); falling back to the resolve route");
+		reconstruction = nullptr;
+		return true;
 	}
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD: reconstruction switches -- reactive mask {}, jitter sign {}",
+		reactiveMaskEnabled ? "the trust map" : "a constant (A/B)",
+		jitterSign < 0 ? "-1 (A/B)" : "+1"));
+	// Sharpening runs after the upscale, on pixels the upscaler interpolated, which is where a
+	// source-pixel grid can be talked back into visibility. Zero is the A/B for that.
+	{
+		const int sharpnessPercent = static_cast<int>(GetPrivateProfileIntW(L"DlssNrOnAmd",
+			L"Sharpness", 20, (ExeDirectory() / kIniName).c_str()));
+		upscaler->SetSharpness(std::clamp(sharpnessPercent, 0, 100) / 100.0f);
+	}
+	Logger::Get().Info(fmt::format(
+		"DLSSNR AMD: reconstruction upscaler is {}, requested by {}",
+		useFsr4 ? "FSR 4.1.1" : "FSR 3.1.5", useFsr4 ? "UseFsr4" : "default"));
 	// The protocol the renderer would have set if this upscaler were a link in the chain.
 	// What it is handed carries the shoulder and the sRGB encode, applied before it rather
 	// than after, so it is told it is reading display-referred colour: hdrColorInput stays
@@ -2884,17 +3669,103 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 		FAILED(list->Reset(allocator.get(), nullptr))) {
 		return fail("resetting the allocator");
 	}
+	// The surface encode reads. Normally the engine's own output; when the temporal pass runs it
+	// is the smoothed copy instead, made on demand because only this route has a use for it.
+	ID3D12Resource* srcPicture = nullptr;
 	// The engine's frame through the same shoulder and encode the output stage applies -- run
 	// here, at the network's resolution, so the upscaler reconstructs from display-referred
 	// colour.
 	// Recorded in as many steps as the settings file asks for. Stopping between them is the
 	// only way this was narrowed down: every step is a call the working path also makes, and
 	// only one of them takes the device with it.
+	// The residual, carried between frames, before the upscaler gets the picture.
+	//
+	// The composite route runs the temporal pass in step 3 and the reconstruction route used to
+	// return before reaching it -- so with reconstruction on, the network's per-frame edit went
+	// straight to FSR3 with nothing smoothing it, and the network's own frame-to-frame variation
+	// showed up as flicker. FSR3's own history does not cover this: it accumulates the upscaled
+	// picture, whose input is already the jittering edit.
+	//
+	// Two dispatches, in the order the composite route uses them: the temporal pass turns this
+	// frame's edit and the carried history into the residual to apply, and the resolve applies it
+	// to this frame's picture. The result lands back in `net[slot]`, which is what encode below
+	// reads, so the upscaler sees the smoothed picture rather than the raw one.
+	//
+	// Only for a generation this pass has not seen, for the reason spelled out on the composite
+	// route: the same retired picture can stand for two or three presented frames, and counting
+	// it once per presentation would let the carried edit grow on every repeat.
+	//
+	// The generation is the frame id here, not `pictureSlot`. pictureSlot is the composite
+	// route's notion of which of the four surfaces the newest retired frame is in, and only that
+	// route ever assigns it -- it is 0 for the life of a reconstruction session. Keying the
+	// temporal pass on it meant the condition read "0 != 0xFFFFFFFF" once, ran the pass once on
+	// the first frame, then "0 != 0" forever: the accumulation stopped after a single frame and
+	// every subsequent frame was reconstructed from nothing. That is the flicker. The frame id
+	// advances once per submitted frame on every route, which is what "a generation this pass has
+	// not seen" actually means.
+	if (antiFlickerMode != 0 && context.frameId != temporalSourceFrame) {
+		const uint64_t temporalAt = Impl::Qpc();
+		if (!RunTemporal(context, slot)) {
+			return fail("the temporal pass");
+		}
+		compositeAccum[1] += Impl::Qpc() - temporalAt;
+		temporalSourceFrame = context.frameId;
+
+		// Applying it needs a surface to composite into: `net[slot]` is read by the temporal
+		// pass as its `edited` input, so it cannot be the target of the same dispatch. The
+		// full-resolution `resolved` surface is the wrong size, so a texture at the network's
+		// extent is made for this -- shared with nothing, since only this route reads it.
+		if (!smoothedNet) {
+			D3D12_RESOURCE_DESC td{};
+			td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			td.Width = netWidth;
+			td.Height = netHeight;
+			td.DepthOrArraySize = 1;
+			td.MipLevels = 1;
+			td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			td.SampleDesc.Count = 1;
+			td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			D3D12_HEAP_PROPERTIES hp{};
+			hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+			if (FAILED(device12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+					D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+					IID_PPV_ARGS(smoothedNet.put())))) {
+				return fail("allocating the smoothed network surface");
+			}
+		}
+		Barrier(list.get(), smoothedNet.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		// Two different bases, and the split is the whole of this fix:
+		//
+		//   src = baseline  -- the acceptance gate compares src against baseline to decide
+		//                     whether the carried edit is trustworthy, and that comparison is
+		//                     only meaningful between the pre-edit picture and what the network
+		//                     was given. Passing the network's own output here made the
+		//                     difference be the edit itself, so the gate rejected the largest
+		//                     edits -- which are exactly the shadows the accumulation exists
+		//                     for.
+		//
+		//   target = net    -- what the smoothed residual is added onto. Passing `baseline`
+		//                     here produced base + residual, i.e. the edit rebuilt from a
+		//                     1080p residual field, and the upscaler then had nothing above
+		//                     that resolution to reconstruct from: the picture collapsed to
+		//                     the residual route's look, which is the reported symptom.
+		BindResolve(8, baseline[slot].get(), smoothedNet.get(), baseline[slot].get(),
+			historyResidual[historyIndex].get(), net[slot].get());
+		const uint32_t smoothBound = static_cast<uint32_t>(std::clamp(
+			float(editBoundMilli) * std::clamp(settings.intensity, 0.0f, 2.0f), 0.0f, 1000.0f));
+		const UINT smoothDims[5]{ netWidth, netHeight, netWidth, netHeight, smoothBound };
+		DispatchSized(resolve.get(), 8, netWidth, netHeight, 10, smoothDims, 5);
+		Barrier(list.get(), smoothedNet.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			kStateShaderRead);
+		srcPicture = smoothedNet.get();
+	}
+
 	Barrier(list.get(), encoded.get(), kStateShaderRead,
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	if (encodeSteps >= 2) {
-		Bind(6, net[slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT, encoded.get(),
-			DXGI_FORMAT_R16G16B16A16_FLOAT);
+		Bind(6, srcPicture ? srcPicture : net[slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+			encoded.get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
 	}
 	if (encodeSteps >= 4) {
 		// The shoulder travels as the dispatch's own constants, not as a root value recorded
@@ -3008,13 +3879,22 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	// The phase the downsample was given, passed on so the upscaler can put this frame back on
 	// the grid it came from. Without it every frame looks like the same sample of the same
 	// place and accumulates into nothing.
-	reconstruction->SetJitter(frameJitterX, frameJitterY);
+	reconstruction->SetJitter(frameJitterX * jitterSign, frameJitterY * jitterSign);
+	// The flow is handed over on the network's grid but still in the captured resolution's
+	// pixels -- the resample above moves it, it does not rescale it. The temporal pass applies
+	// this same factor before it reprojects; the upscaler reprojects too and needs it just as
+	// much, or every region it accumulates lands at twice its true offset.
+	reconstruction->SetMotionScale(motionReady ? motionScaleX : 1.0f,
+		motionReady ? motionScaleY : 1.0f);
 
 	// The upscaler does its own copying, its own fences and its own barriers from here: it is
 	// handed the shared texture, not a command list.
 	const NativeEffectDrawContext hand{
 		.input = netShared11.get(),
-		.output = context.output,
+		// The upscaler's own target, not Magpie's texture: what it writes has to come back
+		// through this side to have the missing high frequencies added to it, and this side
+		// can only reach its own shared surface.
+		.output = sharedOut11.get(),
 		.frameId = context.frameId,
 		.inputRevision = context.inputRevision,
 		.frameGuidance = guidance,
@@ -3028,17 +3908,90 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 	if (!reconstruction->Draw(hand)) {
 		return fail("the upscaler returning false with a valid guide");
 	}
-	// Nothing to do afterwards. The upscaler wrote the display texture itself, which is what it
-	// is built to do -- in the chain its output is the next link's input, and here it is the
-	// frame.
+	// ---- the detail the reduced scale threw away ----
 	//
+	// At a reduced input scale the network sees a fraction of the frame's samples, and
+	// everything above that has to be invented. It cannot be, which is what the source grid
+	// left visible in the result is. The full-resolution frame is still here and its high
+	// frequencies are exactly the difference, so they are measured against a small blur of
+	// themselves and added back over the reconstructed picture.
+	//
+	// Only on the reconstruction route: the other one composites the edit onto the full-
+	// resolution frame already, and would be adding detail it never lost.
+	// Said once, because a pass that decides not to run and a pass that runs and changes
+	// nothing look exactly alike from the picture.
+	if (!detailLogged) {
+		detailLogged = true;
+		const char* what = detailStrengthMilli == 0 ? "off, strength is zero"
+			: (netWidth < width ? "on" : "off, nothing was downscaled");
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: detail restore {} -- strength {} milli, network {}x{}, output {}x{}",
+			what, detailStrengthMilli, netWidth, netHeight, width, height));
+	}
+	// Only at a reduced scale, and only when asked: at the source's own size nothing was
+	// discarded, so the same high frequencies are already in the reconstructed picture and
+	// adding them again is an over-sharpen rather than a restoration.
+	if (detailStrengthMilli != 0 && netWidth < width) {
+		// The upscaler copied its result into the shared surface on the other device's
+		// context. That copy is queued, not done, and this queue is about to read it -- so
+		// without a crossing this pass reads whatever was there before, which is the previous
+		// frame at best. Same fence pair and same direction as the input side, the other way
+		// round.
+		{
+			const uint64_t crossing = ++crossValue;
+			if (FAILED(context11->Signal(crossFence11.get(), crossing))) {
+				return fail("signalling the detail crossing");
+			}
+			queue->Wait(crossFence12.get(), crossing);
+		}
+		if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.get(), nullptr))) {
+			return fail("resetting the allocator for the detail pass");
+		}
+		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_COMMON, kStateShaderRead);
+		Barrier(list.get(), resolved.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		BindDetail(28, sharedOut12.get(), outputFormat, resolved.get(),
+			DXGI_FORMAT_R16G16B16A16_FLOAT, full[slot].get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
+		const UINT detailSettings[2]{ shoulderMilli, detailStrengthMilli };
+		DispatchSized(srgbInput ? detailRestoreSrgb.get() : detailRestore.get(),
+			28, width, height, 30, detailSettings, 2);
+		Barrier(list.get(), resolved.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			kStateShaderRead);
+		// Back out to the caller's format in one more pass. The plain output convert is a
+		// move and a format change and nothing else -- the encode has already happened, and
+		// running the display-referred one here would apply it a second time.
+		Barrier(list.get(), sharedOut12.get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		Bind(6, resolved.get(), DXGI_FORMAT_R16G16B16A16_FLOAT, sharedOut12.get(),
+			outputFormat);
+		DispatchSized(convertOut.get(), 6, width, height, 0);
+		Barrier(list.get(), sharedOut12.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			D3D12_RESOURCE_STATE_COMMON);
+		if (FAILED(list->Close())) return fail("closing the detail list");
+		ID3D12CommandList* detailLists[] = { list.get() };
+		SubmitTo(queue.get(), 1, detailLists);
+		const uint64_t detailDone = ++fenceValue;
+		queue->Signal(fence.get(), detailDone);
+		if (fence->GetCompletedValue() < detailDone) {
+			fence->SetEventOnCompletion(detailDone, fenceEvent.get());
+			if (WaitForSingleObject(fenceEvent.get(), 1000) != WAIT_OBJECT_0) {
+				return fail("waiting for the detail pass");
+			}
+		}
+	}
+	// Out to Magpie's own texture, whichever of the two produced what is in the shared one.
+	context11->CopyResource(context.output, sharedOut11.get());
 	// The reading is taken here, after both submissions, because measuring resets the
 	// allocator and re-records the list. Placed any earlier it discards the recording that is
 	// still open -- which is not a small mistake: it silently throws the encode away and the
 	// upscaler then reconstructs from a frame nothing wrote to.
 	// Not the first frame: the upscaler starts its history there and a sequence has to build
 	// before there is anything to measure. The hundred-and-twentieth is settled.
-	if (reconstructionDraws == 120) {
+	//
+	// And every three hundred after it, because one sample is not a reading. Two runs of the
+	// same configuration have come back 14% apart on `detail`, which is more than the effects
+	// being compared are worth, so a single number decides nothing.
+	if (reconstructionDraws == 120 || reconstructionDraws % 300 == 0) {
 		// Three points on one frame: what the network produced, what the upscaler was handed,
 		// and what came out. The encode is meant to lift the first into the second, and the
 		// third should land near the second -- a picture much darker than its own input is the
@@ -3051,11 +4004,20 @@ bool DlssnrAmdBackend::Impl::RunReconstruction(
 			: -1.0f;
 		float detail = -1.0f;
 		const float onScreen = MeanOfOutput(context.output, &detail);
+		// What the history gather believed, as a number. historyTrust holds 1 - trust per
+		// pixel, so the mean says how much of the frame the accumulation actually reached:
+		// near 1 means the gate rejected everything and the pass ran to no effect, which is
+		// what "optical-flow accumulation does not help" looks like from inside. Measured at
+		// this cadence because a readback costs a copy and a wait.
+		const float distrust = historyTrust
+			? Measure(historyTrust.get(), DXGI_FORMAT_R8_UNORM, kStateShaderRead)
+			: -1.0f;
 		Logger::Get().Info(fmt::format(
 			"DLSSNR AMD: settled reconstruction (frame {}) -- network {:.4f}, handed over "
-			"{:.4f}, on screen {:.4f}, detail {:.5f} (jitter {})",
+			"{:.4f}, on screen {:.4f}, detail {:.5f}, distrust {:.4f} (jitter {}, shape {})",
 			reconstructionDraws,
-			netMean, handedMean, onScreen, detail, jitterEnabled ? "on" : "off"));
+			netMean, handedMean, onScreen, detail, distrust, jitterEnabled ? "on" : "off",
+			pointSample ? "point sample" : "whole footprint"));
 	}
 	++reconstructionDraws;
 	if (reconstructionDraws == 1 || reconstructionDraws % 300 == 0) {
@@ -3095,6 +4057,9 @@ void DlssnrAmdBackend::Impl::ForgetHistory() noexcept {
 }
 
 void DlssnrAmdBackend::Impl::DestroySized() noexcept {
+	// Before the surfaces: the filter holds views of the output, the baseline and the
+	// reconstruction's answer, all of which are about to be replaced.
+	postTemporal.reset();
 	// Before the surfaces: the upscaler holds the shared texture it was given, and it has to
 	// let go of one that is about to be replaced.
 	reconstruction.reset();
@@ -3140,6 +4105,8 @@ void DlssnrAmdBackend::Impl::DestroySized() noexcept {
 		historyResidual[i] = nullptr;
 		historyGuide[i] = nullptr;
 	}
+	historyTrust = nullptr;
+	smoothedNet = nullptr;
 	// A new extent means the history describes the wrong geometry.
 	resetHistory = true;
 	temporalValid = false;
@@ -3171,6 +4138,17 @@ void DlssnrAmdBackend::Impl::Bind(
 	u.Format = uavFormat;
 	u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 	device12->CreateUnorderedAccessView(uav, nullptr, &u, Cpu(tableSlot + 1));
+}
+
+void DlssnrAmdBackend::Impl::BindSource(
+	uint32_t tableSlot, ID3D12Resource* srv, DXGI_FORMAT srvFormat
+) noexcept {
+	D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+	s.Format = srvFormat;
+	s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	s.Texture2D.MipLevels = 1;
+	device12->CreateShaderResourceView(srv, &s, Cpu(tableSlot));
 }
 
 void DlssnrAmdBackend::Impl::Dispatch(ID3D12PipelineState* pso, uint32_t tableSlot) noexcept {
@@ -3209,24 +4187,47 @@ void DlssnrAmdBackend::Impl::DispatchSized(ID3D12PipelineState* pso, uint32_t ta
 }
 
 void DlssnrAmdBackend::Impl::BindResolve(uint32_t tableSlot, ID3D12Resource* srv,
-	ID3D12Resource* uav, ID3D12Resource* baselineTexture, ID3D12Resource* edited
+	ID3D12Resource* uav, ID3D12Resource* baselineTexture, ID3D12Resource* edited,
+	ID3D12Resource* targetTexture
 ) noexcept {
 	// t0/u0 through the usual pair, then t1 and t2 sitting immediately after it so the
-	// resolve's second root table finds them two descriptors along.
+	// resolve's second root table finds them two descriptors along. t3 carries the base the
+	// edit is added onto, which is the same resource as t0 unless the caller says otherwise.
 	Bind(tableSlot, srv, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, DXGI_FORMAT_R16G16B16A16_FLOAT);
 
 	CreateSrv(baselineTexture, Cpu(tableSlot + 2));
 	CreateSrv(edited, Cpu(tableSlot + 3));
+	CreateSrv(targetTexture ? targetTexture : srv, Cpu(tableSlot + 4));
+}
+
+void DlssnrAmdBackend::Impl::BindDetail(uint32_t tableSlot, ID3D12Resource* base,
+	DXGI_FORMAT baseFormat, ID3D12Resource* dst, DXGI_FORMAT dstFormat,
+	ID3D12Resource* source, DXGI_FORMAT sourceFormat
+) noexcept {
+	// Same layout as every other pass: the pair at tableSlot, and the extra source in the
+	// table that follows.
+	Bind(tableSlot, base, baseFormat, dst, dstFormat);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+	s.Format = sourceFormat;
+	s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	s.Texture2D.MipLevels = 1;
+	device12->CreateShaderResourceView(source, &s, Cpu(tableSlot + 2));
 }
 
 void DlssnrAmdBackend::Impl::BindTemporal(uint32_t tableSlot, ID3D12Resource* edited,
-	ID3D12Resource* nextResidual, ID3D12Resource* nextGuide,
+	ID3D12Resource* nextResidual, ID3D12Resource* nextGuide, ID3D12Resource* nextTrust,
 	ID3D12Resource* baselineTexture, ID3D12Resource* historyResidualTexture,
 	ID3D12Resource* historyGuideTexture, ID3D12Resource* motionTexture
 ) noexcept {
-	// t0 and u0 through the usual pair, then u1 immediately after it, and the four sources
-	// from t1 in the table that follows -- which is why this pass's second table starts at
-	// tableSlot + 3 while the resolve's starts at tableSlot + 2.
+	// t0 and u0 through the usual pair, then u1 and u2 immediately after it, and the four
+	// sources from t1 in the table that follows -- which is why this pass's second table starts
+	// at tableSlot + 4 while the resolve's starts at tableSlot + 2.
+	//
+	// The table is walked per resource type, not per declaration order: SRVs in table order fill
+	// t0, t1, ..., and UAVs in table order fill u0, u1, .... So the three UAVs sit together and
+	// the four SRVs follow, and what the shader declares does not have to be interleaved here.
 	Bind(tableSlot, edited, DXGI_FORMAT_R16G16B16A16_FLOAT, nextResidual,
 		DXGI_FORMAT_R16G16B16A16_FLOAT);
 
@@ -3235,22 +4236,29 @@ void DlssnrAmdBackend::Impl::BindTemporal(uint32_t tableSlot, ID3D12Resource* ed
 	u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 	device12->CreateUnorderedAccessView(nextGuide, nullptr, &u, Cpu(tableSlot + 2));
 
-	CreateSrv(baselineTexture, Cpu(tableSlot + 3));
-	CreateSrv(historyResidualTexture, Cpu(tableSlot + 4));
-	CreateSrv(historyGuideTexture, Cpu(tableSlot + 5));
+	D3D12_UNORDERED_ACCESS_VIEW_DESC t{};
+	t.Format = DXGI_FORMAT_R8_UNORM;
+	t.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+	device12->CreateUnorderedAccessView(nextTrust, nullptr, &t, Cpu(tableSlot + 3));
+
+	CreateSrv(baselineTexture, Cpu(tableSlot + 4));
+	CreateSrv(historyResidualTexture, Cpu(tableSlot + 5));
+	CreateSrv(historyGuideTexture, Cpu(tableSlot + 6));
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC m{};
 	m.Format = DXGI_FORMAT_R16G16_FLOAT;
 	m.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	m.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	m.Texture2D.MipLevels = 1;
-	device12->CreateShaderResourceView(motionTexture, &m, Cpu(tableSlot + 6));
+	device12->CreateShaderResourceView(motionTexture, &m, Cpu(tableSlot + 7));
 }
 
 // The residual for this frame: what the network changed, at the resolution it ran at, with
 // earlier frames carried into it where the effect asked for them. Always runs on the
 // resolve path; with anti-flicker off it is a subtraction and nothing more.
-bool DlssnrAmdBackend::Impl::RunTemporal(const NativeEffectDrawContext& context) noexcept {
+bool DlssnrAmdBackend::Impl::RunTemporal(
+	const NativeEffectDrawContext& context, uint32_t sourceSlot
+) noexcept {
 	const uint32_t from = historyIndex;
 	const uint32_t to = 1 - historyIndex;
 
@@ -3262,9 +4270,35 @@ bool DlssnrAmdBackend::Impl::RunTemporal(const NativeEffectDrawContext& context)
 	if (hasHistory && !duplicate && context.frameId > lastFrameId &&
 		context.inputRevision == lastRevision && now > lastTimestamp) {
 		const double seconds = double(now - lastTimestamp) * 1e-3;
-		if (seconds <= 0.25) {
+		// The staleness cut tracks the constant: with a long tau a longer gap still carries
+		// useful history, so the two move together rather than the tau being capped at the
+		// fixed 0.25 s the 80 ms default implied.
+		const double tauSec = double(temporalTauMs) * 1e-3;
+		const double staleSec = tauSec * 3.125;
+		if (seconds <= staleSec) {
 			weightMilli = static_cast<uint32_t>(
-				std::clamp(std::exp(-seconds / 0.08), 0.0, 1.0) * 1000.0);
+				std::clamp(std::exp(-seconds / tauSec), 0.0, 1.0) * 1000.0);
+		}
+	}
+	// What the accumulation is actually doing, said once every two seconds. The whole point of
+	// this pass is that it blends a carried residual, and whether it blends is decided by four
+	// conditions above that are easy to read as "on" while one of them is never true. A number
+	// is the difference between knowing and assuming.
+	{
+		static uint32_t temporalCalls = 0;
+		static uint64_t temporalNextLog = 0;
+		++temporalCalls;
+		const uint64_t t = GetTickCount64();
+		if (!temporalNextLog) temporalNextLog = t + 2000;
+		if (t >= temporalNextLog) {
+			temporalNextLog = t + 2000;
+			Logger::Get().Info(fmt::format(
+				"DLSSNR AMD temporal: calls={} weight={}/1000 hasHistory={} valid={} "
+				"duplicate={} sameFrame={} sameRev={} dt={} mode={}",
+				temporalCalls, weightMilli, hasHistory, temporalValid, duplicate,
+				context.frameId == lastFrameId, context.inputRevision == lastRevision,
+				(lastTimestamp && now > lastTimestamp) ? int(now - lastTimestamp) : -1,
+				antiFlickerMode));
 		}
 	}
 
@@ -3272,30 +4306,39 @@ bool DlssnrAmdBackend::Impl::RunTemporal(const NativeEffectDrawContext& context)
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	Barrier(list.get(), historyGuide[to].get(), kStateShaderRead,
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	Barrier(list.get(), historyTrust.get(), kStateShaderRead,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	// The same generation the picture comes from: this pass reprojects a history against the
 	// frame the engine has finished, and pairing it with the frame still being recorded would
 	// align the past against something that does not exist yet.
-	const uint32_t sourceSlot = pictureSlot;
 	BindTemporal(12, net[sourceSlot].get(), historyResidual[to].get(), historyGuide[to].get(),
-		baseline[sourceSlot].get(), historyResidual[from].get(), historyGuide[from].get(),
-		motion[sourceSlot].get());
+		historyTrust.get(), baseline[sourceSlot].get(), historyResidual[from].get(),
+		historyGuide[from].get(), motion[sourceSlot].get());
 	// Modes two and above reproject the history with the flow; one is static accumulation.
 	const uint32_t useMotion =
 		antiFlickerMode >= 2 && motionReady ? 1u : 0u;
 	// The residual controls travel as the floats they are: the shader declares them float,
 	// so the bit pattern has to be forwarded rather than converted, which is what BitsOfFloat
 	// does and what every other float-carrying dispatch here already uses.
-	const UINT constants[12]{ netWidth, netHeight, weightMilli, hasHistory ? 1u : 0u,
+	const UINT constants[13]{ netWidth, netHeight, weightMilli, hasHistory ? 1u : 0u,
 		useMotion,
 		uint32_t(motionScaleX * 1000.0f), uint32_t(motionScaleY * 1000.0f),
 		BitsOfFloat(settings.residualMultiplier), BitsOfFloat(settings.residualSaturation),
 		BitsOfFloat(settings.residualLightness),
 		BitsOfFloat(settings.shadowStructureMultiplier),
-		BitsOfFloat(settings.reflectionGlowMultiplier) };
-	DispatchSized(temporal.get(), 12, netWidth, netHeight, 15, constants, 12);
+		BitsOfFloat(settings.reflectionGlowMultiplier),
+		clampHistory ? 1u : 0u };
+	// tableSlot is 12 and must match the BindTemporal above; the trailing 13 is the constant
+	// count, which grew by one for clampHistory. Changing the second argument instead binds a
+	// descriptor table holding nothing the shader expects, and the frame comes out white.
+	DispatchSized(temporal.get(), 12, netWidth, netHeight, 16, constants, 13);
 	Barrier(list.get(), historyResidual[to].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 		kStateShaderRead);
 	Barrier(list.get(), historyGuide[to].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		kStateShaderRead);
+	// Left readable: this map is the upscaler's reactive mask, handed over as a shared texture
+	// in CreateReconstruction.
+	Barrier(list.get(), historyTrust.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 		kStateShaderRead);
 
 	historyIndex = to;
@@ -3346,6 +4389,26 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 	// rather than the effect switched off and on. That is a real limitation, and it is worth
 	// far more than the bugcheck it replaces.
 	if (Engine().started) {
+		// One engine per process, and the model it was given at init is what it will run
+		// until Magpie itself is restarted. Adopting is the right answer for everything
+		// except the container; for that one, say so clearly and continue with the engine
+		// that is already up rather than refusing the whole effect.
+		if (!Engine().weightsInUse.empty() &&
+			Engine().weightsInUse != weightsPath.string()) {
+			// A user-visible warning, not a failure. The engine is process state and a second
+			// init faults the GPU, so the switch cannot take effect here -- but the effect can
+			// still run with the model it already has, which is strictly better than the NGX
+			// fallback and the MP-035 diagnostic that refusing produces. The session that asked
+			// for the other model is told plainly what happened and what to do about it.
+			Logger::Get().Warn(fmt::format(
+				"DLSSNR AMD: *** MODEL SWITCH NEEDS A RESTART *** this process initialised "
+				"the engine with {} but this session asked for {}; the engine cannot be "
+				"re-initialised (a second init faults the GPU), so it keeps running the model "
+				"it was given. Close and restart Magpie to switch models",
+				Engine().weightsInUse, weightsPath.string()));
+			engineUp = true;
+			return true;
+		}
 		Logger::Get().Info(
 			"DLSSNR AMD: the engine is already up in this process; adopting it rather than "
 			"initialising a second time");
@@ -3515,6 +4578,7 @@ bool DlssnrAmdBackend::Impl::InitEngine(const std::filesystem::path& weightsPath
 
 	At<uint8_t>(runtime, rva->initDone) = 1;
 	Engine().started = true;
+	Engine().weightsInUse = weightsPath.string();
 	engineUp = true;
 	return true;
 }
@@ -3848,9 +4912,71 @@ bool DlssnrAmdBackend::Impl::SubmitEngineJob() noexcept {
 	// No transitions here. The engine is handed shader-readable surfaces, exactly as the
 	// reference hands it shader-readable surfaces, and it deals with hazards itself.
 
-	if (!CallRecord(p.record, &packet) || At<uint8_t>(p.runtime, p.rva->statusFlag) != 0) {
+	// A refusal and a record failure are two different things, and only one of them is fatal.
+	//
+	// CallRecord returning false means the runtime faulted or rejected the packet outright. That
+	// is a failure of this session and nothing later can fix it.
+	//
+	// statusFlag != 0 means the runtime skipped this frame on purpose. The Vulkan path sets it
+	// while its network is still being built: PrepareFrame answers LMXXF_NR_UNAVAILABLE with
+	// "building the network (the first time takes about half a minute)" and the frame has to be
+	// shown untouched. Treating that as fatal is what kept the effect dead for the rest of the
+	// process -- `failed` is cleared only at construction, so the very first frame, which is
+	// always the one that starts the build, disabled it permanently. The frames after the build
+	// completes then never reached the runtime at all.
+	//
+	// Skipping is the behaviour the pak path already gets from its own status flag: it also
+	// refuses frames it cannot run (an extent it has no kernels for), and there the flag is set
+	// by the shim for the same reason. Both runtimes can therefore share one rule -- a refused
+	// frame is skipped and counted, only a record failure is fatal -- without changing what the
+	// pak path does on a frame it accepts.
+	const bool recorded = CallRecord(p.record, &packet);
+	if (!recorded) {
 		p.failed = true;
-		Logger::Get().Error("DLSSNR AMD: the engine refused the frame");
+		Logger::Get().Error("DLSSNR AMD: the engine failed to record the frame");
+		return false;
+	}
+	if (At<uint8_t>(p.runtime, p.rva->statusFlag) != 0) {
+		// Not fatal, but the command list still has to be closed.
+		//
+		// RecordInputs has already put work into it. An open list cannot be Reset, and Draw
+		// resets both the allocator and the list at the top of the next frame -- so returning
+		// with the list open turns one refused frame into a permanent failure: every later frame
+		// dies at that Reset, silently, before reaching the engine. That is exactly what the log
+		// showed: one PrepareFrame call, then "Native effect Draw failed" every frame with no
+		// DLSSNR AMD error of its own, because the failure path there logs nothing.
+		//
+		// Closed and executed rather than closed and discarded: the work recorded is only the
+		// runtime's own input copy, and dropping a closed list without executing it is legal but
+		// leaves the runtime's producer expecting a submission. Executing it costs one empty
+		// submission and keeps the two sides in step.
+		if (FAILED(p.list->Close())) {
+			p.failed = true;
+			Logger::Get().Error("DLSSNR AMD: the skipped frame's list would not close");
+			return false;
+		}
+		ID3D12CommandList* skippedLists[] = { p.list.get() };
+		p.SubmitTo(p.queue.get(), 1, skippedLists);
+
+		// Notify has to run even for a skipped frame, and this is the whole of the deadlock that
+		// cost the most time to find.
+		//
+		// The status flag is cleared inside Notify -- by the shim, at the top of the call. A
+		// backend that returns before calling it therefore never lets the flag go back to zero:
+		// the first frame (always the one whose network is still building) sets it, every later
+		// frame sees it set, and none of them ever reaches the runtime again. The effect sits at
+		// "skipped frame N" forever while the runtime reports its network ready and zero frames.
+		//
+		// The reference flow is Record -> submit -> Notify for every frame, and Notify is what
+		// advances the job counter that Drain polls. Skipping it for a frame breaks both.
+		CallNotify(p.notify, p.queue.get(), 1, skippedLists);
+
+		static int refused = 0;
+		if (++refused <= 5 || refused % 300 == 0) {
+			Logger::Get().Info(fmt::format(
+				"DLSSNR AMD: the engine skipped frame {} (status flag set; the network may still "
+				"be building)", refused));
+		}
 		return false;
 	}
 
@@ -3908,8 +5034,7 @@ DlssnrAmdBackend::~DlssnrAmdBackend() = default;
 bool DlssnrAmdBackend::IsAvailable() noexcept {
 	std::error_code ec;
 	const auto dir = ExeDirectory();
-	return std::filesystem::exists(dir / kRuntimeName, ec) &&
-		std::filesystem::exists(dir / kWeightsName, ec);
+	return std::filesystem::exists(dir / kRuntimeName, ec) && WeightsPresent(dir, ec);
 }
 
 bool DlssnrAmdBackend::Initialize(
@@ -3965,9 +5090,124 @@ bool DlssnrAmdBackend::Initialize(
 	//   [DlssNrOnAmd]   InputResolutionPercent=40
 	const int scaleFromIni = GetPrivateProfileIntW(L"DlssNrOnAmd", L"InputResolutionPercent",
 		0, (ExeDirectory() / kIniName).c_str());
-	p.modelScale = settings.enableInputResolutionScaling
+	// The network's size. The tier is an absolute height and it is the control: both runtimes
+	// rebuild their network for it -- the AMDNR pak through AMDNR_DEV_NETWORK_HEIGHT, the lmxxf
+	// 0.45 build through DLSS5_NETWORK_HEIGHT -- and the shim forwards both names, so one ini
+	// key drives either. Measured on this card with the shim's harness: 1080 gives
+	// net=1920x1080 proc=1920x1152 and 720 gives net=1280x720 proc=1280x768, for the 71-block
+	// schedule as well as the small one. The processing extent is the network's own geometry,
+	// which is what makes the tier worth having.
+	//
+	// The percentage below is the other lever and it is not this one. It hands the same network
+	// a smaller picture, so the work is unchanged and only detail is lost; that is the negative
+	// optimisation the interface used to expose. A tier supersedes it: when one is selected
+	// nothing is scaled here at all.
+	//
+	// The tier is the runtime's own, on whichever runtime is loaded. Both of them rebuild the
+	// network for it: the AMDNR pak through AMDNR_DEV_NETWORK_HEIGHT (its log says "the network
+	// is rebuilt (network tier %u -> %u)"), the lmxxf 0.45 build through DLSS5_NETWORK_HEIGHT.
+	// The shim forwards both names, so one ini key drives either.
+	const int tierHeight = settings.networkTier;
+	p.tierPixels = tierHeight;
+	p.tierRebuildsRuntime = tierHeight > 0;
+	p.requestedScale = settings.enableInputResolutionScaling
 		? float(std::clamp<uint32_t>(settings.inputResolutionPercent, 25, 100)) / 100.0f
 		: (scaleFromIni > 0 ? float(std::clamp(scaleFromIni, 25, 100)) / 100.0f : 1.0f);
+
+	// The network tier. Written into the ini rather than passed any other way because it is
+	// read exactly once -- the runtime takes AMDNR_DEV_NETWORK_HEIGHT in its Create call, and
+	// the shim forwards it there -- so it cannot follow the slider mid-session. Writing the
+	// selection out means the next start uses it, and means the file states what the last run
+	// was actually asked to do.
+	//
+	// The effect's option is the source: a value of 0 means "the runtime decides", anything
+	// else is one of the tiers the small model has kernels for. The ini key is the same one
+	// the shim reads, so a hand-edited file and the interface agree rather than fighting.
+	//
+	// Written for every model now, not just the small one. The vendored runtime ignores the
+	// key, but on that route the tier is applied as a ratio in CreateSized, so the file is the
+	// record of what was asked for either way -- and leaving it stale across a model switch
+	// would make the interface and the file disagree about the same run.
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		wchar_t current[32] = {};
+		GetPrivateProfileStringW(L"Lmxxf", L"NetworkHeight", L"", current, 32, iniPath.c_str());
+		const int saved = _wtoi(current);
+		if (saved != settings.networkTier) {
+			wchar_t value[16] = {};
+			swprintf_s(value, L"%d", settings.networkTier);
+			WritePrivateProfileStringW(L"Lmxxf", L"NetworkHeight", value, iniPath.c_str());
+			Logger::Get().Info(fmt::format(
+				"DLSSNR AMD: network tier {} -> {} ({})",
+				saved, settings.networkTier,
+				settings.runtimeChoice == 1
+					? "takes effect at the next start, the runtime reads it when it "
+					  "creates its session"
+					: "applied by this backend's downsample, no restart needed"));
+		}
+	}
+
+	// The runtime and the model, which only the locally built 0.45 runtime can honour.
+	//
+	// The AMDNR repackaging carries the 31-block network inside its pak and has no selector, so
+	// asking it for the 71-block one does nothing. The 0.45 build reads loose assets and keeps
+	// DLSS5_MULTI_PASS, where 0.5 is Small and 1 is the full 71-block network. Writing both keys
+	// here means the interface and the file agree, and the shim picks the runtime from the same
+	// place; a session that asks for Original on the AMDNR runtime is told so rather than
+	// silently running Small.
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		const int runtimeSel = settings.runtimeChoice;      // 0 = AMDNR, 1 = lmxxf 0.45
+		const int modelSel = settings.networkModel;         // 0 = Small, 1 = Original
+		auto writeIfChanged = [&](const wchar_t* section, const wchar_t* key, int want) {
+			wchar_t cur[32] = {};
+			GetPrivateProfileStringW(section, key, L"", cur, 32, iniPath.c_str());
+			if (_wtoi(cur) != want) {
+				wchar_t value[16] = {};
+				swprintf_s(value, L"%d", want);
+				WritePrivateProfileStringW(section, key, value, iniPath.c_str());
+				Logger::Get().Info(fmt::format("DLSSNR AMD: ini [{}] {} = {} (takes effect at "
+					"the next session)", "Lmxxf", StrHelper::UTF16ToUTF8(key), want));
+			}
+		};
+		writeIfChanged(L"Lmxxf", L"Runtime045", runtimeSel);
+		writeIfChanged(L"Lmxxf", L"MultiPass", modelSel == 1 ? 1 : 0);
+		// Which network the Vulkan runtime builds. It takes this from the environment at session
+		// creation, and the shim that sets it lives in another process image -- the ini is the
+		// only channel between them. Choice 0 and 1 are both the 31-block network (the choice
+		// there is which runtime runs it), 2 is the Original on the pak, so the Vulkan model is
+		// Original only when the panel asked for a Vulkan option with the Original network.
+		writeIfChanged(L"VulkanSmall", L"Model",
+			(settings.vulkanOriginalModel != 0) ? settings.vulkanOriginalModel : 0);
+		// The runtime's own temporal machinery. These are not Magpie's anti-flicker pass (which
+		// stays off): the runtime clamps the carried edit against what the current frame's
+		// neighbourhood can support, drops it where a surface comes back into view, and can hold
+		// or smooth the result -- all inside the network, on its own residual, which is why it
+		// costs a fraction of a percent instead of a whole-frame blend.
+		//
+		// Passed through the ini because that is where the pak shim reads its environment
+		// switches at session start; the panel is the source, the file is the transport, and the
+		// shim turns them into AMDNR_* variables before the runtime loads.
+		writeIfChanged(L"Lmxxf", L"RuntimeHistoryClamp", settings.temporalClamp ? 1 : 0);
+		writeIfChanged(L"Lmxxf", L"RuntimeHistoryClampMid", settings.temporalClampMid ? 1 : 0);
+		writeIfChanged(L"Lmxxf", L"RuntimeHistoryClampMidMotion",
+			settings.temporalClampMidMotion ? 1 : 0);
+		writeIfChanged(L"Lmxxf", L"RuntimeHistoryDisocc", settings.temporalDisocc ? 1 : 0);
+		writeIfChanged(L"Lmxxf", L"RuntimePassSmooth", settings.passSmooth ? 1 : 0);
+		writeIfChanged(L"Lmxxf", L"RuntimePassStill", settings.passStill ? 1 : 0);
+		// Both runtimes accept the key -- measured, not assumed. On the AMDNR pak the 1080 tier
+		// went 377.7 -> 239.1 ms/frame between MultiPass=0 and 1 in the shim's own harness, so
+		// the setting is doing something there; what it selects is not the plain 71-block
+		// schedule the lmxxf build runs, because the pak's startup line reports the same
+		// skip=42,43,46 in both. Said plainly rather than warned about: the setting is honoured
+		// on both, and only the exact block list differs.
+		if (modelSel == 1 && runtimeSel == 0) {
+			Logger::Get().Info(
+				"DLSSNR AMD: Model=Original on the AMDNR pak. The pak takes the key and its "
+				"schedule changes, but its startup line still reports skip=42,43,46, so it is "
+				"not the same block list the lmxxf 0.45 build runs for the full network.");
+		}
+	}
 
 	// Whether the frame goes to the engine as linear values or exactly as it arrives.
 	//
@@ -3991,10 +5231,24 @@ bool DlssnrAmdBackend::Initialize(
 		const auto iniPath = ExeDirectory() / kIniName;
 		p.encodeSteps = static_cast<int>(GetPrivateProfileIntW(L"DlssNrOnAmd",
 			L"EncodeSteps", 5, iniPath.c_str()));
+		// Off by default, and the shape follows it.
+		//
+		// The phase exists so a temporal upscaler can accumulate sub-pixel samples back into
+		// resolution, but the upscaler here reads the *network's* output, and the network is a
+		// denoiser: suppressing per-pixel high-frequency variation is what it is for, and the
+		// phase is exactly that. It does not survive, so what the jitter bought was nothing,
+		// while what it cost was real -- every frame a different sample pattern, so the detail
+		// the network adds flickers, and the whole-footprint branch turns into a loop whose trip
+		// count moves with the phase. Turning it off removed the flicker entirely and gained
+		// about 8% of frame rate. See the note on DetailStrength for what replaces it.
 		p.jitterEnabled = GetPrivateProfileIntW(L"DlssNrOnAmd",
-			L"Jitter", 1, iniPath.c_str()) != 0;
+			L"Jitter", 0, iniPath.c_str()) != 0;
 		p.pointSample = GetPrivateProfileIntW(L"DlssNrOnAmd",
-			L"JitterShape", 1, iniPath.c_str()) != 0;
+			L"JitterShape", 0, iniPath.c_str()) != 0;
+		p.jitterSign = GetPrivateProfileIntW(L"DlssNrOnAmd",
+			L"JitterSign", 1, iniPath.c_str()) < 0 ? -1.0f : 1.0f;
+		p.reactiveMaskEnabled = GetPrivateProfileIntW(L"DlssNrOnAmd",
+			L"ReactiveMask", 1, iniPath.c_str()) != 0;
 	}
 
 	// How much of the network's edit to apply, in thousandths. Read from the same ini; the
@@ -4006,11 +5260,38 @@ bool DlssnrAmdBackend::Initialize(
 			iniPath.c_str());
 		p.editBoundMilli = static_cast<uint32_t>(std::clamp(bound, 5, 1000));
 	}
+	// The temporal blend's time constant, in milliseconds. Upstream's 80 ms was picked when the
+	// engine ran faster than it does through this route; at 45-65 ms/frame the same constant
+	// leaves the carried residual in the minority of the blend, which reads as shadow flicker.
+	// A longer value carries more history and smooths more, at the cost of a change persisting
+	// longer on moving content -- the trailing-ghost trade. Range 20-500 ms.
+	{
+		const auto iniPath = ExeDirectory() / kIniName;
+		const int tau = GetPrivateProfileIntW(L"DlssNrOnAmd", L"TemporalTauMs", 80,
+			iniPath.c_str());
+		p.temporalTauMs = static_cast<uint32_t>(std::clamp(tau, 20, 500));
+		// A/B knob for the moving-edge over-sharpen: 1 keeps the neighbourhood-range clamp on
+		// the carried residual, 0 disables it (safe = old, unclamped). Disabling isolates
+		// whether the clamp is the source of the sharpening.
+		const int clampHist = GetPrivateProfileIntW(L"DlssNrOnAmd", L"HistoryClamp", 1,
+			iniPath.c_str());
+		p.clampHistory = clampHist != 0;
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: temporal time constant {} ms, history clamp {}", p.temporalTauMs,
+			p.clampHistory ? "on" : "OFF"));
+	}
 	{
 		const auto iniPath = ExeDirectory() / kIniName;
 		const int shoulder = GetPrivateProfileIntW(L"DlssNrOnAmd", L"HighlightShoulder",
 			850, iniPath.c_str());
 		p.shoulderMilli = static_cast<uint32_t>(std::clamp(shoulder, 50, 990));
+		// Defaults on at full strength, and it is the other half of turning the jitter off:
+		// the high frequencies it adds come from the full-resolution frame, which is real
+		// information rather than something inferable from a sub-pixel phase, so it is what
+		// restores at a reduced input scale what the downscale discarded.
+		const int detail = GetPrivateProfileIntW(L"DlssNrOnAmd", L"DetailStrength",
+			200, iniPath.c_str());
+		p.detailStrengthMilli = static_cast<uint32_t>(std::clamp(detail, 0, 200)) * 10u;
 	}
 	// The reconstruction route is an effect parameter rather than an ini key, so the app's own
 	// control reaches it and there is one source of truth for it. The ini key it was read from
@@ -4197,13 +5478,14 @@ bool DlssnrAmdBackend::Initialize(
 	// The motion guide's crossing from D3D11 to this device, the same boundary the NGX path
 	// uses. It is created once; each frame either updates it with this frame's guidance or
 	// leaves the engine on a zero field.
-#ifdef MP_ENABLE_AMD_OPTICAL_FLOW
+	// Whether to ask for motion, and it follows the session's request rather than a build-time
+	// macro. The macro says whether this translation unit was built with the provider's headers
+	// in scope, not whether the provider exists: the AMD provider is compiled into this binary
+	// and its per-frame timing lines appear in every session (AmdOpticalFlowProvider::BeginFrame),
+	// while MP_ENABLE_AMD_OPTICAL_FLOW was arriving undefined here. Guarding on it therefore
+	// turned a working optical flow field into a zero field, which is exactly the state the
+	// anti-flicker filter degrades on -- it reprojects a static accumulation along zero vectors.
 	p.wantMotion = settings.motionRequest.method != OpticalFlowMethod::None;
-#else
-	// The provider is compiled out of this build; the guidance service would fail the whole
-	// session if asked for it.
-	p.wantMotion = false;
-#endif
 	p.motionRequest = settings.motionRequest;
 	p.settings = settings;
 	// Measurement overrides for the residual controls, in the file the rest of this backend's
@@ -4231,7 +5513,7 @@ bool DlssnrAmdBackend::Initialize(
 		return false;
 	}
 
-	if (!p.LoadRuntime()) {
+	if (!p.LoadRuntime(settings.amdSmallModel)) {
 		return false;
 	}
 
@@ -4249,18 +5531,69 @@ bool DlssnrAmdBackend::Initialize(
 	// substitution was written to recover and it arrives without a single address this
 	// backend has to maintain.
 
-	if (!p.CreateHip() || !p.CreatePipeline()) {
+	// Each of these used to return false with nothing in the log, which made a session that
+	// never started look like one that never tried. The callers upstream report only that the
+	// backend declined, so this is the only place that knows which step did it.
+	if (!p.CreateHip()) {
+		Logger::Get().Error("DLSSNR AMD: CreateHip failed -- no HIP device matching the "
+			"render adapter");
+		return false;
+	}
+	if (!p.CreatePipeline()) {
+		Logger::Get().Error("DLSSNR AMD: CreatePipeline failed -- see the lines above for the "
+			"step that declined");
 		return false;
 	}
 	if (!p.CreateSized(inputDesc.Width, inputDesc.Height,
 			inputDesc.Format, outputDesc.Format)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR AMD: CreateSized failed for {}x{} {} -> {}", inputDesc.Width,
+			inputDesc.Height, (uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format));
 		return false;
 	}
 	if (!p.CreateReconstruction(resources, output)) {
+		Logger::Get().Error("DLSSNR AMD: CreateReconstruction failed -- the FSR upscaler or "
+			"its shared textures could not be built at this size");
 		return false;
 	}
-	if (!p.InitEngine(ExeDirectory() / kWeightsName)) {
-		return false;
+	// The model choice lands here and nowhere else: the engine takes one container path and
+	// reads it by record name. A missing container of the selected kind must say so, because
+	// IsAvailable only established that *some* container is present and the fallback behind
+	// a failed Initialize is the NGX path, which is the wrong network entirely.
+	{
+		const std::filesystem::path weightsPath = ExeDirectory() / WeightsNameFor(settings);
+		std::error_code ec;
+		if (!std::filesystem::exists(weightsPath, ec)) {
+			Logger::Get().Error(fmt::format(
+				"DLSSNR AMD: weights for the selected model are missing: {}",
+				weightsPath.string()));
+			return false;
+		}
+		Logger::Get().Info(fmt::format(
+			"DLSSNR AMD: model {}, {}",
+			settings.amdSmallModel ? "310.9.16 small (31 blocks)" : "310.8.0 (71 blocks)",
+			weightsPath.filename().string()));
+		if (!p.InitEngine(weightsPath)) {
+			return false;
+		}
+	}
+
+	// The anti-flicker filter, if one was asked for. It runs on the finished picture, so all
+	// four of its surfaces are the capture's size and live on this side of the crossing: what
+	// Magpie handed in, the shared copy the frame is converted into, the reconstruction's own
+	// answer for this frame, and the output texture.
+	//
+	// The third is sharedOut11 and not the network's surface: that one is built at the
+	// network's extent, which at any tier below 100% is smaller than the capture, and the
+	// filter refuses a set of inputs that are not all the same size.
+	if (antiFlickerMode > 0) {
+		p.postTemporal = std::make_unique<DLSSNRTemporal>();
+		if (!p.postTemporal->Initialize(resources, input, p.sharedIn11.get(),
+				p.sharedOut11.get(), output, antiFlickerMode, p.outputIsFp16)) {
+			Logger::Get().Error("DLSSNR AMD: the anti-flicker filter failed to initialise");
+			p.postTemporal.reset();
+			return false;
+		}
 	}
 
 	// The crossing, again, with the engine initialised and before a single frame has been drawn.
@@ -4274,14 +5607,28 @@ bool DlssnrAmdBackend::Initialize(
 	p.ready = true;
 	// The applied scale is printed alongside the requested one, because the floor can raise
 	// it and a setting that silently does nothing is worse than one that says so.
+	//
+	// The tier is named separately, and how it travelled: a runtime that takes a tier gets the
+	// capture at full size and resamples inside, so its ratio reads 1.00 and saying nothing
+	// more would look like the tier was ignored. `via` is what makes those two runs legible.
 	const float appliedScale = float(p.netWidth) / float(inputDesc.Width);
+	const char* tierVia = !p.tierRebuildsRuntime ? "not asked for"
+		: (p.modelScale < 1.0f ? "this backend's downsample" : "the runtime rebuilt its network");
+	// One line that says which of the two channels a session is on, so a log is enough to tell
+	// them apart. `ours` is the shim over LmxxfNrRuntime; the alternative is the vendored
+	// danielblnc image, which has no tier key and no small schedule.
 	Logger::Get().Info(fmt::format(
 		"DLSSNR AMD: engine up on HIP device {}; {}x{} {} -> {}, network at {}x{} "
-		"(requested {:.2f}, applied {:.2f}), anti-flicker={}, motion={}",
+		"(requested {:.2f}, applied {:.2f}), tier {} via {}, anti-flicker={}, motion={}, "
+		"channel={}",
 		p.hipDevice, inputDesc.Width, inputDesc.Height,
 		(uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format,
-		p.netWidth, p.netHeight, p.modelScale, appliedScale, p.antiFlickerMode,
-		p.wantMotion ? "optical-flow" : "none"));
+		p.netWidth, p.netHeight, p.modelScale, appliedScale,
+		p.tierPixels > 0 ? fmt::format("{}p", p.tierPixels) : std::string("auto"),
+		tierVia, p.antiFlickerMode, p.wantMotion ? "optical-flow" : "none",
+		p.oursRuntime
+			? (settings.amdSmallModel ? "shim/small (31 blocks)" : "shim/large (pak's 68-block schedule)")
+			: "vendored danielblnc (no tier key)"));
 
 	// What the chain hands this effect, which decides how the FSR3 route has to be built.
 	//
@@ -4573,24 +5920,34 @@ FrameGuidanceRequirements DlssnrAmdBackend::GetFrameGuidanceRequirements() const
 	if (!_impl || _impl->failed) {
 		return {};
 	}
-#ifdef MP_ENABLE_AMD_OPTICAL_FLOW
-	// The zero view too, the way upstream asks for it: the temporal pass wants a valid zero
-	// field to fall back to when the real one is not produced for a frame.
+	// Ask for motion, and for the zero view too, the way upstream does: the temporal pass wants
+	// a valid zero field to fall back to on a frame the provider does not produce.
+	//
+	// This used to be behind MP_ENABLE_AMD_OPTICAL_FLOW, on the reading that a build without it
+	// compiles the provider as a stub and asking would fail the guidance service. The macro was
+	// arriving undefined, so the effect asked for nothing, the renderer never handed this backend
+	// a motion field, and every consumer saw a zero field -- while the provider itself was
+	// compiled in and running (its per-frame timing lines are in the log). The guard cost the
+	// whole motion path on a build that had it.
 	FrameGuidanceRequirements result{ .zero = true };
 	result.Add(_impl->motionRequest);
 	return result;
-#else
-	// This build compiles the AMD optical flow provider as a stub, so asking for motion
-	// makes the renderer's guidance service fail its initialization and abort the whole
-	// scaling session. Asking for nothing keeps the session running exactly as it did
-	// before any of this existed.
-	return {};
-#endif
 }
 
 bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	auto& p = *_impl;
 	if (!p.ready || p.failed || !context.input || !context.output) {
+		// Which of these is false decides where to look next, and the difference is not visible
+		// from outside: all four produce the same "Draw failed" line in Magpie's log. Said once a
+		// second so a refusing route cannot fill the file.
+		static uint64_t lastLog = 0;
+		const uint64_t now = GetTickCount64();
+		if (now - lastLog > 1000) {
+			lastLog = now;
+			Logger::Get().Error(fmt::format(
+				"DLSSNR AMD: Draw declined -- ready={} failed={} hasInput={} hasOutput={}",
+				p.ready, p.failed, context.input != nullptr, context.output != nullptr));
+		}
 		return false;
 	}
 
@@ -4701,6 +6058,16 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	p.context11->Flush();
 
 	if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator.get(), nullptr))) {
+		// Said out loud, because this is the one failure in Draw that used to be silent. When it
+		// fires every frame the effect looks merely "off" in Magpie's log -- the caller prints
+		// "Native effect Draw failed" and nothing says why -- and the cause was always that the
+		// previous frame left the list open.
+		static int resetFailures = 0;
+		if (++resetFailures <= 5 || resetFailures % 300 == 0) {
+			Logger::Get().Error(fmt::format(
+				"DLSSNR AMD: the command list could not be reset ({} so far); the previous frame "
+				"left it open", resetFailures));
+		}
 		return false;
 	}
 
@@ -4760,17 +6127,49 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 			kStateShaderRead);
 		Barrier(p.list.get(), p.full[p.slot].get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
 			kStateShaderRead);
+	} else {
+		// Neither scaled nor downscaling: the network's extent is the capture's own, so there
+		// is no resample and no resolve -- and nothing above filled `net`.
+		//
+		// That gap was the same-resolution black screen. With anti-flicker off (as it is on the
+		// Vulkan path, where the runtime's own history made the picture worse) `scaled` is just
+		// `downscaling`, so a 1920x1080 capture against a 1920x1080 network entered neither
+		// branch: `net` stayed an untouched allocation, the engine read and wrote zeros, and the
+		// frame came out black while every stage reported success. A 2K or 4K capture always
+		// downsamples, which is why the fault only showed at matching sizes.
+		//
+		// The copy is the 1:1 case of what `else if (p.scaled)` does; it is separate rather than
+		// folded into it because `scaled` also gates the resolve and the baseline surfaces, and
+		// those must stay off here.
+		Barrier(p.list.get(), p.full[p.slot].get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_SOURCE);
+		Barrier(p.list.get(), p.net[p.slot].get(), kStateShaderRead,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		p.list->CopyResource(p.net[p.slot].get(), p.full[p.slot].get());
+		Barrier(p.list.get(), p.net[p.slot].get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			kStateShaderRead);
+		Barrier(p.list.get(), p.full[p.slot].get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+			kStateShaderRead);
 	}
 	if (p.scaled) {
-		Barrier(p.list.get(), p.net[p.slot].get(), kStateShaderRead,
-			D3D12_RESOURCE_STATE_COPY_SOURCE);
-		Barrier(p.list.get(), p.baseline[p.slot].get(), kStateShaderRead,
-			D3D12_RESOURCE_STATE_COPY_DEST);
-		p.list->CopyResource(p.baseline[p.slot].get(), p.net[p.slot].get());
-		Barrier(p.list.get(), p.baseline[p.slot].get(), D3D12_RESOURCE_STATE_COPY_DEST,
-			kStateShaderRead);
-		Barrier(p.list.get(), p.net[p.slot].get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-			kStateShaderRead);
+		// PERF A/B: this copy is 15.8 MB at 1080p and 63 MB at the capture's own size, and it
+		// runs on the GPU ahead of the network on every frame. Disabled from the ini to measure
+		// what it costs; the picture will be wrong while it is off (SkipBaselineCopy=1).
+		static const bool skipBaselineCopy = [] {
+			return GetPrivateProfileIntW(L"DlssNrOnAmd", L"SkipBaselineCopy", 0,
+				(ExeDirectory() / kIniName).c_str()) != 0;
+		}();
+		if (!skipBaselineCopy) {
+			Barrier(p.list.get(), p.net[p.slot].get(), kStateShaderRead,
+				D3D12_RESOURCE_STATE_COPY_SOURCE);
+			Barrier(p.list.get(), p.baseline[p.slot].get(), kStateShaderRead,
+				D3D12_RESOURCE_STATE_COPY_DEST);
+			p.list->CopyResource(p.baseline[p.slot].get(), p.net[p.slot].get());
+			Barrier(p.list.get(), p.baseline[p.slot].get(), D3D12_RESOURCE_STATE_COPY_DEST,
+				kStateShaderRead);
+			Barrier(p.list.get(), p.net[p.slot].get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+				kStateShaderRead);
+		}
 	}
 
 	phaseAt[1] = Impl::Qpc();
@@ -4796,10 +6195,15 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 				kStateShaderRead);
 			Barrier(p.list.get(), p.motion[p.slot].get(), kStateShaderRead,
 				D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+			// t0 and u0 through the usual pair, then the depth as t1 at tableSlot + 5 -- the
+			// second table starts after the three UAVs the root signature reserves, so the
+			// first SRV of that table sits at +5 even though this shader declares only one.
+			// Binding it at +1 would land in the UAV range and read whatever view lives there.
 			p.Bind(20, p.guidanceInterop->Motion(), DXGI_FORMAT_R16G16_FLOAT,
 				p.motion[p.slot].get(), DXGI_FORMAT_R16G16_FLOAT);
+			p.BindSource(25, p.guidanceInterop->Depth(), DXGI_FORMAT_R32_FLOAT);
 			const UINT dims[4]{ p.netWidth, p.netHeight, sourceW, sourceH };
-			p.DispatchSized(p.motionResample.get(), 20, p.netWidth, p.netHeight, 0, dims);
+			p.DispatchSized(p.motionResample.get(), 20, p.netWidth, p.netHeight, 25, dims);
 			Barrier(p.list.get(), p.motion[p.slot].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 				kStateShaderRead);
 			p.guidanceInterop->Transition(p.list.get(), kStateShaderRead,
@@ -5045,7 +6449,7 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		// residual in place, which is what the resolve reads.
 		if (p.pictureSlot != p.temporalSourceSlot) {
 			const uint64_t temporalAt = Impl::Qpc();
-			if (!p.RunTemporal(context)) {
+			if (!p.RunTemporal(context, p.pictureSlot)) {
 				Logger::Get().Error("DLSSNR AMD: the temporal pass stopped");
 				p.failed = true;
 				return true;
@@ -5252,7 +6656,15 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 		p.guidanceInterop->MarkSubmitted(signal2);
 	}
 
-	p.context11->CopyResource(context.output, p.sharedOut11.get());
+	// The anti-flicker filter writes the output texture itself, so it replaces the copy rather
+	// than following it: it reads the reconstruction's answer and produces the picture Magpie
+	// presents. When it declines -- a frame whose guidance does not describe this extent, a
+	// duplicate, a history reset -- the copy is the frame, unchanged.
+	if (p.postTemporal && p.postTemporal->Draw(context)) {
+		// Written by the filter.
+	} else {
+		p.context11->CopyResource(context.output, p.sharedOut11.get());
+	}
 
 	// ---- where the frame went ----
 	// Averaged over a window and printed at the optical-flow provider's cadence, so the two
@@ -5332,8 +6744,11 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 }
 
 bool DlssnrAmdBackend::IsHealthy() const noexcept {
-	// The frame-level failure flag. Draw clears it at entry and sets it wherever a stage
-	// cannot complete; a chain reads it after Draw to decide whether to composite.
+	// The frame-level failure flag, latched rather than per-frame. Draw reads it in its guard
+	// and sets it wherever a stage cannot complete, and nothing clears it: every site sets it
+	// after something the backend cannot undo (a removed device, a list that will not reset,
+	// the engine refusing to record, a fence past its timeout), and the surfaces then hold
+	// whatever they held. A chain reads this after Draw to decide whether to composite.
 	return _impl && !_impl->failed;
 }
 

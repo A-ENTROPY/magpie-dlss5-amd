@@ -72,6 +72,11 @@ public:
 		ID3D11Texture2D* output
 	) noexcept = 0;
 
+	// Whether the last Draw produced a valid result. A chain of backends uses this to reject
+	// a whole frame rather than composite a broken layer on top of good ones. Default true:
+	// a backend with no notion of failure is healthy by construction.
+	virtual bool IsHealthy() const noexcept { return true; }
+
 	virtual bool Draw(const NativeEffectDrawContext& context) noexcept = 0;
 
 protected:

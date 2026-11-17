@@ -54,6 +54,7 @@ public:
 	) noexcept override;
 
 	bool Draw(const NativeEffectDrawContext& context) noexcept override;
+	bool IsHealthy() const noexcept override;
 	bool Drain() noexcept override;
 
 private:

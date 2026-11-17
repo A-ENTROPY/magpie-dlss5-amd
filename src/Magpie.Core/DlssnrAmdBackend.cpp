@@ -5331,6 +5331,12 @@ bool DlssnrAmdBackend::Draw(const NativeEffectDrawContext& context) noexcept {
 	return true;
 }
 
+bool DlssnrAmdBackend::IsHealthy() const noexcept {
+	// The frame-level failure flag. Draw clears it at entry and sets it wherever a stage
+	// cannot complete; a chain reads it after Draw to decide whether to composite.
+	return _impl && !_impl->failed;
+}
+
 // Magpie calls this before it lets go of the surfaces and before another session may start,
 // and it has to be a real quiescence point. Two things make the stub that used to be here
 // unsafe, and both end in a removed device rather than in a lost frame.

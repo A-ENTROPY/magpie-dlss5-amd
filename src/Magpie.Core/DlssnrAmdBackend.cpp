@@ -5686,8 +5686,19 @@ bool DlssnrAmdBackend::Initialize(
 		p.netWidth, p.netHeight, p.modelScale, appliedScale,
 		p.tierPixels > 0 ? fmt::format("{}p", p.tierPixels) : std::string("auto"),
 		tierVia, p.antiFlickerMode, p.wantMotion ? "optical-flow" : "none",
+		// The channel line named the network by `amdSmallModel` alone, which is the *pak* shim's
+		// split. On the Vulkan path both networks are served by the same shim and the choice
+		// travels as a frame flag (`vulkanOriginalModel`), so option 4 -- the 71-block Vulkan
+		// network -- was reported as "shim/small (31 blocks)" while `glsl_vk_shim.log` said
+		// `Original 71-block` two lines later. The two logs disagreed about which network ran,
+		// which is worse than either being vague.
 		p.oursRuntime
-			? (settings.amdSmallModel ? "shim/small (31 blocks)" : "shim/large (pak's 68-block schedule)")
+			? (p.vulkanRuntime
+				? (settings.vulkanOriginalModel == 2 ? "shim/vulkan (71 blocks, int4)"
+					: settings.vulkanOriginalModel == 1 ? "shim/vulkan (71 blocks)"
+					: "shim/vulkan (31 blocks)")
+				: (settings.amdSmallModel ? "shim/pak (small schedule)"
+					: "shim/pak (pak's 68-block schedule)"))
 			: "vendored danielblnc (no tier key)"));
 
 	// What the chain hands this effect, which decides how the FSR3 route has to be built.

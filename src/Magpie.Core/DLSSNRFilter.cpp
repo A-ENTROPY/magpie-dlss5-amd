@@ -1,4 +1,4 @@
-#include "pch.h"
+﻿#include "pch.h"
 #include "NgxRuntimeGuard.h"
 #include "DLSSNRFilter.h"
 #include "DeviceResources.h"
@@ -24,7 +24,7 @@ DLSSNRSettings ParseDLSSNRSettings(const EffectOption& option, bool hdrEnabled) 
 		return std::clamp(getParameter(name, defaultValue), minimum, maximum);
 	};
 	// The caller supplies the resolved automatic boundary, never a saved UI choice.
-	return DLSSNRSettings{
+	DLSSNRSettings request{
 		.enableInputResolutionScaling =
 			getParameter("enableInputResolutionScaling", 0.0f) >= 0.5f,
 		.inputResolutionPercent = static_cast<uint32_t>(std::clamp(
@@ -40,7 +40,10 @@ DLSSNRSettings ParseDLSSNRSettings(const EffectOption& option, bool hdrEnabled) 
 		.style = std::clamp(static_cast<int>(std::lround(
 			getParameter("style", 0.0f))), 0, 2),
 		.intensity = getClamped("intensity", 1.0f, 0.0f, 2.0f),
-		.localToneStrength = getClamped("localToneStrength", 0.0f, 0.0f, 2.0f),
+		// 1, matching the effect's own DEFAULT. The two disagreeing is what made the pak path
+		// look dead after a config rewrite dropped the key: tone 0 and structure 1.25 give the
+		// shim strength 0.000/1.000, and the network's edit is scaled to nothing.
+		.localToneStrength = getClamped("localToneStrength", 1.0f, 0.0f, 2.0f),
 		.localStructureStrength = getClamped(
 			"localStructureStrength", 1.0f, 0.0f, 2.0f),
 		.skinStructureStrength = getClamped(
@@ -52,10 +55,72 @@ DLSSNRSettings ParseDLSSNRSettings(const EffectOption& option, bool hdrEnabled) 
 			getParameter("amdToneChannels", 0.0f))), 0, 2),
 		.amdUseDepth = getParameter("amdUseDepth", 0.0f) >= 0.5f ? 1 : 0,
 		.amdUseFsrInputs = getParameter("amdUseFsrInputs", 1.0f) >= 0.5f ? 1 : 0,
-		.amdReconstruct = getParameter("amdReconstruct", 0.0f) >= 0.5f ? 1 : 0,
+		// The fallback has to be the value the effect declares, or a profile that predates the
+		// parameter silently runs the other branch: this said 0.0f while the effect said
+		// DEFAULT 1, so a first-run chain reconstructed with the resolve path while the picker
+		// showed FSR 4.1.1 upscale selected.
+		.amdReconstruct = getParameter("amdReconstruct", 1.0f) >= 0.5f ? 1 : 0,
+		// Only the tiers the small model actually has kernels for. Anything else is dropped to
+		// 0 (the runtime's own choice) rather than passed through: the runtime clamps an unknown
+		// height to its automatic tier with a log line, which would make a saved 1440 silently
+		// mean something else on this GPU.
+		.amdSmallModel = 1,
+		.networkTier = [&]() noexcept {
+			const int t = static_cast<int>(std::lround(getParameter("networkTier", 0.0f)));
+			// 2160 is the capture size on a 4K display and costs 62.6 ms a frame on this card --
+			// offered because it is the sharpest this path can be, not because it is fast. 1440
+			// exists for the same reason one step down. Everything else is a tier the pak also
+			// has kernels for.
+			return (t == 360 || t == 576 || t == 720 || t == 900 || t == 1080 ||
+				t == 1440 || t == 2160) ? t : 0;
+		}(),
+		.networkChoice = std::clamp(static_cast<int>(std::lround(
+			getParameter("networkModel", 0.0f))), 0, 5),
+		.networkModel = 0,
+		.runtimeChoice = 0,
+		.wantVulkanShim = 1,
+		// The runtime's temporal machinery. Defaults match the effect's own: the four clamps on,
+		// the two output stages off. A profile that predates these parameters therefore keeps
+		// behaving as it did, and only a deliberate change turns the softening ones on.
+		.temporalClamp = getParameter("temporalClamp", 1.0f) >= 0.5f ? 1 : 0,
+		.temporalClampMid = getParameter("temporalClampMid", 1.0f) >= 0.5f ? 1 : 0,
+		.temporalClampMidMotion = getParameter("temporalClampMidMotion", 1.0f) >= 0.5f ? 1 : 0,
+		.temporalDisocc = getParameter("temporalDisocc", 1.0f) >= 0.5f ? 1 : 0,
+		.passSmooth = getParameter("passSmooth", 0.0f) >= 0.5f ? 1 : 0,
+		.passStill = getParameter("passStill", 0.0f) >= 0.5f ? 1 : 0,
 		.motionRequest = ParseDlssOpticalFlowRequest(option),
 		.experimentalHdr = DlssnrExperimentProtocol{ .enabled = hdrEnabled, .scale = 1.0f }
 	};
+	{
+		// Resolve the choice into the fields the backend and the shim read.
+		//
+		//   0  Small 31-block, Vulkan      amdSmallModel=1, VulkanShim=1, VulkanModel=0
+		//   4  Large 71-block, Vulkan      amdSmallModel=1, VulkanShim=1, VulkanModel=1
+		//   5  same as 4 with int4         VulkanModel=2
+		//
+		// The pak and vendored routes are no longer offered. They ran the same network through
+		// a different runtime and are the only choices whose temporal history this build cannot
+		// steady: the zero-displacement trick that removed the shimmer lives in glsl_vk_shim,
+		// and neither of those runtimes goes through it. Their code stays -- the backends still
+		// exist and a profile that names them still resolves -- but the effect no longer offers
+		// them, so a new configuration cannot land on a route that shimmers and has no way to
+		// say why. A profile written before the change that still holds 1, 2 or 3 is mapped onto
+		// the closest Vulkan route rather than onto the withdrawn one.
+		//
+		// The Vulkan runtime carries both networks in one DLL and picks between them from
+		// DLSSNR_MODEL at session creation, so 0, 4 and 5 all take the same runtime and differ
+		// only in that value. That is also why 4 and 5 keep amdSmallModel=1: the flag means "the
+		// small runtime", not "the small network", and the network is decided by the model key.
+		int choice = request.networkChoice;
+		if (choice == 1) choice = 0;        // small pak    -> small Vulkan
+		else if (choice == 2 || choice == 3) choice = 4;  // large pak/vendored -> large Vulkan
+		const bool vulkan = (choice == 0 || choice == 4 || choice == 5);
+		request.amdSmallModel = 1;
+		request.wantVulkanShim = vulkan ? 1 : 0;
+		request.vulkanOriginalModel = (choice == 4) ? 1 : (choice == 5) ? 2 : 0;
+		request.networkModel = 0;
+	}
+	return request;
 }
 
 }
@@ -591,9 +656,12 @@ struct DLSSNRFilter::Impl {
 	using CreateFeatureFn = NVSDK_NGX_Result(NVSDK_CONV*)(
 		ID3D12GraphicsCommandList*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*,
 		NVSDK_NGX_Handle**);
+	// The parameter is non-const in the NGX header this checkout carries (2018-2022 SDK);
+	// matching it by value here is what makes &NVSDK_NGX_D3D12_EvaluateFeature a valid value of
+	// this type. The AMD path never reaches this pointer.
 	using EvaluateFeatureFn = NVSDK_NGX_Result(NVSDK_CONV*)(
 		ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*,
-		const NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
+		NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
 	using ReleaseFeatureFn = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Handle*);
 	using ShutdownFn = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D12Device*);
 	using GetModuleFileNameWFn = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
@@ -722,7 +790,7 @@ NVSDK_NGX_Result CallEvaluateFeatureSafely(
 	DLSSNRFilter::Impl::EvaluateFeatureFn function,
 	ID3D12GraphicsCommandList* commandList,
 	const NVSDK_NGX_Handle* feature,
-	const NVSDK_NGX_Parameter* parameters,
+	NVSDK_NGX_Parameter* parameters,
 	DWORD* sehCode
 ) noexcept {
 	return NgxRuntimeGuard::Invoke([&]() {
@@ -981,7 +1049,9 @@ static bool WaitForQueue(DLSSNRFilter::Impl& impl) noexcept {
 	return WaitForFence(impl, value);
 }
 
-static void CollectGpuTiming(
+// Unreferenced when MP_ENABLE_NATIVE_BACKEND_TIMING is off; the project treats C4505 as an
+// error, and this file has to compile in both configurations.
+[[maybe_unused]] static void CollectGpuTiming(
 	DLSSNRFilter::Impl& impl,
 	DLSSNRFilter::Impl::CommandSlot& slot
 ) noexcept {
@@ -1009,7 +1079,7 @@ static void CollectGpuTiming(
 	slot.timestampPending = false;
 }
 
-static std::string FormatTimingSummary(
+[[maybe_unused]] static std::string FormatTimingSummary(
 	std::string_view name,
 	const TimingSummary& value
 ) {

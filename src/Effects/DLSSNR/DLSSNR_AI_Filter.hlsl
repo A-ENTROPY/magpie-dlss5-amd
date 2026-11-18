@@ -1,16 +1,18 @@
 // Experimental NVIDIA DLSS neural same-resolution filter. The native D3D12
 // backend replaces this pass and uses shared optical flow with zero depth.
 //
-// Network options 0, 4 and 5 run on the Vulkan runtime. Two things about it are
-// expected rather than broken:
+// Both networks run on the Vulkan runtime. Two things about it are expected rather than
+// broken:
 //   * The picture goes black for a moment when scaling starts. The runtime builds its
 //     network on first use and refuses frames until it is ready; those frames are
 //     skipped, so the screen shows the desktop or a frozen frame rather than the game.
 //     The first run also compiles 109 pipelines, which takes about a minute, and it is
 //     cached afterwards.
-//   * The network runs as a pure spatial filter: no temporal accumulation is applied
-//     here, because on this path the history is fed estimated flow rather than the
-//     game's motion vectors and carries more error than it removes.
+//   * Temporal history is on, and it is fed zero displacement. The vectors Magpie can
+//     supply are an 8x8 block field at an eighth of the resolution, and warping history
+//     along them folds their error into the picture as colour patches. Held still, the
+//     network's own per-pixel blend logit decides how much history each pixel keeps, and
+//     that alone removes the shimmer. Do not "fix" this by turning motion back on.
 //!MAGPIE EFFECT
 //!VERSION 4
 //!SORT_NAME DLSSNR AI Filter (Experimental)
@@ -201,14 +203,11 @@ int amdReconstruct;
 
 //!PARAMETER
 //!GROUP DLSSNR · Model
-//!LABEL Network\n(runtime + block count; changing it rebuilds the session)
+//!LABEL Network\n(block count; changing it rebuilds the session)
 //!DEFAULT 0
-//!OPTION 0 Small 31-block - Vulkan (fastest)
-//!OPTION 1 Small 31-block - pak
-//!OPTION 2 Large 68-block - pak
-//!OPTION 3 Large 71-block - vendored (~13 fps at 4K)
-//!OPTION 4 Large 71-block - Vulkan
-//!OPTION 5 Large 71-block - Vulkan, int4 weights
+//!OPTION 0 Small 31-block (fastest)
+//!OPTION 4 Large 71-block (more detail, about 1.7x the time)
+//!OPTION 5 Large 71-block, int4 weights (needs RDNA4)
 int networkModel;
 
 //!PARAMETER
